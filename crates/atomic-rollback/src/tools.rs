@@ -74,6 +74,9 @@ pub struct DevicePath(String);
 impl DevicePath {
     pub fn new(s: String) -> Self { Self(s) }
     pub fn as_str(&self) -> &str { &self.0 }
+    pub fn into_device_spec(self) -> DeviceSpec {
+        DeviceSpec::Path(self.0)
+    }
 }
 
 /// Btrfs subvolume name (e.g., "root", "home", "var", "root.pre-update").
@@ -194,9 +197,8 @@ pub fn parse_fstype(name: &str) -> FsType {
     }
 }
 
-/// Returns the filesystem type for a UUID.
-pub fn blkid_fstype(uuid: &BareUuid) -> Result<FsType, String> {
-    let device = blkid_device_for_uuid(uuid)?;
+/// Returns the filesystem type on a block device.
+pub fn blkid_fstype(device: &DevicePath) -> Result<FsType, String> {
     let name = run_stdout("blkid", &["-s", "TYPE", "-o", "value", device.as_str()])?;
     Ok(parse_fstype(&name))
 }
@@ -359,13 +361,11 @@ pub fn mount_subvolid(device: &DevicePath, target: &str, subvolid: u64) -> Resul
     run_ok("mount", &["-o", &format!("subvolid={subvolid}"), device.as_str(), target])
 }
 
-/// Mounts the top-level subvolume (subvolid=5) of the Btrfs filesystem
-/// with this UUID read-only at a temporary mount point, apart from
-/// TOPLEVEL_MOUNT.
+/// Mounts the top-level subvolume (subvolid=5) of the Btrfs filesystem on
+/// device read-only at a temporary mount point, apart from TOPLEVEL_MOUNT.
 /// Unmounted when the MountPoint drops.
-pub fn mount_toplevel_ro(uuid: &BareUuid) -> Result<MountPoint, String> {
-    let device = blkid_device_for_uuid(uuid)?;
-    mount_temporary(&device, &format!("ro,subvolid={BTRFS_TOPLEVEL_SUBVOLID}"))
+pub fn mount_toplevel_ro(device: &DevicePath) -> Result<MountPoint, String> {
+    mount_temporary(device, &format!("ro,subvolid={BTRFS_TOPLEVEL_SUBVOLID}"))
 }
 
 /// Mounts device with the given options at a new temporary mount point.
