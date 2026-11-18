@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::grub::{Base, GrubContext, GrubContextError};
+use crate::grub::{StartingLookupDir, GrubContext, GrubContextError};
 use crate::parse;
 use crate::platform::FEDORA as P;
 use crate::tools;
@@ -67,7 +67,7 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
              Ensure {}/grub.cfg exists and the root filesystem is mounted.", P.esp_dir
         )]),
     };
-    println!("  GRUB resolves paths from {}", grub.base.describe());
+    println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
 
     evaluate_checks(vec![
         ("EFI boot files", check_esp(root)),
@@ -79,7 +79,7 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
 }
 
 /// Skips ESP checks (vfat, external to the btrfs snapshot) and
-/// default subvol match (set-default comes after the swap).
+/// default subvol match (set-default comes after the exchange).
 /// root is the snapshot's directory under the top-level subvolume mount,
 /// as rollback lays it out.
 pub fn verify_snapshot_bootable(root: &Path) -> BootStatus {
@@ -94,7 +94,7 @@ pub fn verify_snapshot_bootable(root: &Path) -> BootStatus {
              Ensure {}/grub.cfg exists.", P.esp_dir
         )]),
     };
-    println!("  GRUB resolves paths from {}", grub.base.describe());
+    println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
 
     evaluate_checks(vec![
         ("GRUB configuration", check_snapshot_grub_config(&grub)),
@@ -178,7 +178,7 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
 
     // The ESP stub runs configfile $prefix/grub.cfg, and GRUB resolves the
     // prefix like every other path.
-    let grub_path = grub.prefix_path("grub.cfg");
+    let grub_path = grub.grub_dir_file("grub.cfg");
     let grub_cfg = grub.resolve(&grub_path);
     let grub_cfg_path = format!("{}/grub.cfg", P.grub_dir);
     results.push(check_file_exists_nonempty(&grub_cfg).map_err(|fact|
@@ -191,7 +191,7 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
          Kernel boot entries will not appear in the GRUB menu. \
          Regenerate with: sudo grub2-mkconfig -o {grub_cfg_path}")));
 
-    if let Base::BtrfsDefaultSubvol(default_subvol) = &grub.base {
+    if let StartingLookupDir::BtrfsDefaultSubvol(default_subvol) = &grub.starting_lookup_dir {
         results.push(check_default_subvol_matches_root(&default_subvol.to_string_lossy(), root));
     }
 
@@ -201,7 +201,7 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
 /// The grub.cfg GRUB loads after rollback: the snapshot's on Btrfs, the
 /// live boot filesystem's otherwise.
 fn check_snapshot_grub_config(grub: &GrubContext) -> Vec<CheckResult> {
-    let grub_path = grub.prefix_path("grub.cfg");
+    let grub_path = grub.grub_dir_file("grub.cfg");
     let grub_cfg = grub.resolve(&grub_path);
     vec![
         check_file_exists_nonempty(&grub_cfg).map_err(|fact|
@@ -250,7 +250,7 @@ fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckRes
 // --- Kernel boot entry ---
 
 fn check_bls_entries(grub: &GrubContext) -> Vec<CheckResult> {
-    let entries_dir = match grub.bls_dir() {
+    let entries_dir = match grub.blsdir() {
         Ok(dir) => dir,
         Err(e) => return vec![Err(format!("{e}. GRUB will show an empty menu."))],
     };
@@ -533,7 +533,7 @@ pub fn print_rollback_scope(fstab: &str) {
 
 /// The root= UUID of the first boot entry GRUB reads.
 fn extract_root_uuid(grub: &GrubContext) -> Option<tools::BareUuid> {
-    let entries_dir = grub.bls_dir().ok()?;
+    let entries_dir = grub.blsdir().ok()?;
     for entry in fs::read_dir(&entries_dir).ok()?.flatten() {
         if entry.path().extension().is_some_and(|ext| ext == "conf") {
             let content = fs::read_to_string(entry.path()).ok()?;
@@ -602,7 +602,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     // Each scratch directory stands in for the directory GRUB starts from
     // (the mounted top-level subvolume, or the boot partition's root).
 
-    use crate::grub::PendingSwap;
+    use crate::grub::RenameExchange;
     use std::path::PathBuf;
 
     const KVER: &str = "6.19.9-200.fc45.x86_64";
@@ -664,18 +664,18 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     /// GRUB's view of a Btrfs filesystem whose top level is visible at top
     /// and whose default subvolume is root, selected as from_system selects.
     fn btrfs_context(top: &Path, btrfs_relative: bool, prefix: &str) -> GrubContext {
-        let base = Base::select(&tools::FsType::Btrfs, btrfs_relative, top.to_path_buf(),
+        let starting_lookup_dir = StartingLookupDir::select(&tools::FsType::Btrfs, btrfs_relative, top.to_path_buf(),
             || Ok("root".into())).unwrap();
-        GrubContext::new(base, prefix.into())
+        GrubContext::new(starting_lookup_dir, prefix.into())
     }
 
     fn snapshot_context(top: &Path, snapshot: &str) -> GrubContext {
-        let swap = PendingSwap {
+        let exchange = RenameExchange {
             root: tools::SubvolName::new("root".into()),
             snapshot: tools::SubvolName::new(snapshot.into()),
         };
-        let base = Base::BtrfsTopLevel { toplevel: top.to_path_buf(), swap: Some(swap) };
-        GrubContext::new(base, "/root/boot/grub2".into())
+        let starting_lookup_dir = StartingLookupDir::BtrfsTopLevel { toplevel: top.to_path_buf(), exchange: Some(exchange) };
+        GrubContext::new(starting_lookup_dir, "/root/boot/grub2".into())
     }
 
     fn passes(results: &[CheckResult]) -> bool {
@@ -786,9 +786,9 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
         put(&boot.join(format!("loader/entries/{KVER}.conf")), &entry_from_root_subvol());
         // Fedora cloud images set btrfs_relative_path on an ext4 /boot.
-        let base = Base::select(&tools::FsType::Ext4, true, boot.clone(),
+        let starting_lookup_dir = StartingLookupDir::select(&tools::FsType::Ext4, true, boot.clone(),
             || panic!("no default subvolume off Btrfs")).unwrap();
-        let grub = GrubContext::new(base, "/grub2".into());
+        let grub = GrubContext::new(starting_lookup_dir, "/grub2".into());
 
         assert!(passes(&check_grub_config(&boot, &grub)));
         assert!(passes(&check_bls_entries(&grub)));
@@ -796,10 +796,10 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     }
 
     // Rollback renames the snapshot to the root subvolume's name, so a
-    // path through /root/ reaches the snapshot after the swap.
+    // path through /root/ reaches the snapshot after the exchange.
     #[test]
     fn snapshot_check_follows_root_paths_into_the_snapshot() {
-        let top = scratch("grub-snapshot-swap");
+        let top = scratch("grub-snapshot-exchange");
         install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
         install_subvol(&top, "snap1", BLSDIR_TOP_LEVEL, &entry_from_top_level());
         let grub = snapshot_context(&top, "snap1");
@@ -845,9 +845,9 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         fs::create_dir_all(snapshot.join("boot")).unwrap();
         put(&snapshot.join("etc/fstab"), "UUID=3f2a9c41 / btrfs subvol=root 0 0\n");
 
-        let base = Base::after_rollback(&tools::FsType::Ext4, false, boot.clone(), &snapshot,
+        let starting_lookup_dir = StartingLookupDir::after_rollback(&tools::FsType::Ext4, false, boot.clone(), &snapshot,
             || panic!("the root subvolume's name matters only from the top level")).unwrap();
-        let grub = GrubContext::new(base, "/grub2".into());
+        let grub = GrubContext::new(starting_lookup_dir, "/grub2".into());
 
         assert!(passes(&check_snapshot_grub_config(&grub)), "{:?}", check_snapshot_grub_config(&grub));
         assert!(passes(&check_bls_entries(&grub)), "{:?}", check_bls_entries(&grub));

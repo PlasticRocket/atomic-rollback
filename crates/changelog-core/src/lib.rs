@@ -222,8 +222,8 @@ fragments! {
     LegacyRootPreUpdateRenamed,
     CheckResolvesPathsLikeGrub,
     SnapshotCheckReadsSeparateBootPartition,
-    CheckRefusesEspSubvolumeOverride,
-    ProbeMountsInFreshRunDirectory,
+    CheckRefusesBtrfsSubvolVariables,
+    TemporaryMountsInUniqueRunDirectory,
 }
 
 impl Fragment {
@@ -500,11 +500,11 @@ impl Fragment {
                 section: Section::Fixed,
                 text: "On systems set up with `setup` only, `/boot` is a separate partition that rollback leaves unchanged, and the boot chain check before `rollback` now reads `grub.cfg`, the boot entries, and their kernels and initramfs there instead of inside the snapshot. The root filesystem checks still examine the snapshot.",
             },
-            Self::CheckRefusesEspSubvolumeOverride => Status::Unreleased {
+            Self::CheckRefusesBtrfsSubvolVariables => Status::Unreleased {
                 section: Section::Changed,
                 text: "`check` fails when the ESP `grub.cfg` sets `btrfs_subvol` or `btrfs_subvolid`, naming the variable. Neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.",
             },
-            Self::ProbeMountsInFreshRunDirectory => Status::Unreleased {
+            Self::TemporaryMountsInUniqueRunDirectory => Status::Unreleased {
                 section: Section::Security,
                 text: "The boot chain check run by `check`, `rollback`, `migrate` and the kernel hook makes its temporary read-only mounts in a new directory created by `mkdtemp` under `/run`, which only root can write to. It previously mounted at a predictable path under `/tmp`, which any local user could create beforehand, for example as a symlink, to choose where root mounted and later unmounted a filesystem.",
             },
