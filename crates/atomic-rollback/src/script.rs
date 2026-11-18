@@ -270,6 +270,11 @@ pub struct Reader {
 }
 
 impl Reader {
+    /// Whether the next line is in the body of a menu entry or function.
+    pub fn in_body(&self) -> bool {
+        !self.bodies.is_empty()
+    }
+
     /// The commands line runs where it stands, in order. Err says why
     /// check cannot tell what the line does.
     pub fn line(&mut self, line: &str) -> Result<Vec<Command>, String> {

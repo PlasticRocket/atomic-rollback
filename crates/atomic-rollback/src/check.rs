@@ -749,6 +749,21 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         format!("# GRUB Environment Block\n{vars}{}", "#".repeat(256))
     }
 
+    /// The lines of Fedora's generated grub.cfg that load grubenv
+    /// (util/grub.d/00_header.in:56-60).
+    const LOAD_GRUBENV: &str = "\
+if [ -f ${config_directory}/grubenv ]; then
+  load_env -f ${config_directory}/grubenv
+elif [ -s $prefix/grubenv ]; then
+  load_env
+fi
+";
+
+    /// A grub.cfg that loads grubenv, then lists the boot entries.
+    fn grub_cfg() -> String {
+        format!("{LOAD_GRUBENV}insmod blscfg\nblscfg\n")
+    }
+
     fn bls_entry(linux: &str, initrds: &[&str]) -> String {
         let mut entry = format!("title Fedora Linux ({KVER})\nversion {KVER}\nlinux {linux}\n");
         for initrd in initrds {
@@ -778,7 +793,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         put(&dir.join(format!("boot/initramfs-{KVER}.img")), "initramfs");
         std::os::unix::fs::symlink(format!("boot/vmlinuz-{KVER}"), dir.join(format!("vmlinuz-{KVER}"))).unwrap();
         std::os::unix::fs::symlink(format!("boot/initramfs-{KVER}.img"), dir.join(format!("initramfs-{KVER}.img"))).unwrap();
-        put(&dir.join("boot/grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&dir.join("boot/grub2/grub.cfg"), &grub_cfg());
         put(&dir.join("boot/grub2/grubenv"), &grubenv(grubenv_vars));
         put(&dir.join(format!("boot/loader/entries/{KVER}.conf")), entry);
     }
@@ -1077,6 +1092,35 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         results
     }
 
+    // grubenv sets variables only where grub.cfg loads it, which Fedora's
+    // generated header does before blscfg (util/grub.d/00_header.in:56-60).
+    #[test]
+    fn grubenv_applies_only_where_grub_cfg_loads_it() {
+        let top = scratch("grubenv-where-loaded");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub_cfg_path = top.join("root/boot/grub2/grub.cfg");
+        for script in ["insmod blscfg\nblscfg\n".to_string(), format!("insmod blscfg\nblscfg\n{LOAD_GRUBENV}")] {
+            put(&grub_cfg_path, &script);
+            let results = bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX));
+            assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{script}: {results:?}");
+        }
+        put(&grub_cfg_path, &grub_cfg());
+        assert!(passes(&bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX))));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The header loads env_block where it sets it, after grubenv
+    // (00_header.in:62-70).
+    #[test]
+    fn env_block_applies_only_where_grub_cfg_loads_it() {
+        let (top, _) = generated_layout("env-block-where-loaded", "env_block=/root/boot/grub2/envblock\n", &entry_from_top_level());
+        put(&top.join("root/boot/grub2/envblock"), &grubenv(BLSDIR_TOP_LEVEL));
+        put(&top.join("root/boot/grub2/grub.cfg"), &grub_cfg());
+        let results = bls_entries(&context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap());
+        assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // load_env applies each assignment in turn, so the last one holds
     // (grub-core/lib/envblk.c, grub_envblk_iterate).
     #[test]
@@ -1276,6 +1320,22 @@ blscfg
         }
     }
 
+    // env_block and dev name where the header loads env_block, prefix where
+    // 01_users reads user.cfg, and config_directory where the header reads
+    // grubenv (00_header.in:56-70, 01_users.in:3-4), so grub.cfg setting one
+    // before blscfg moves a load check follows.
+    #[test]
+    fn grub_cfg_setting_where_variables_load_from_before_blscfg_cannot_be_verified() {
+        for variable in ["env_block", "dev", "prefix", "config_directory"] {
+            let top = scratch(&format!("phase-script-{variable}"));
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("set {variable}=x\n{}", grub_cfg()));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+            assert!(cannot_verify_naming(grub, variable), "{variable}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
     // GRUB sets a variable only through a command that assigns it
     // (kern/corecmd.c, set and unset; script/execute.c, NAME=VALUE), so a
     // line that only expands a lookup variable leaves it as it is, and the
@@ -1289,7 +1349,7 @@ blscfg
         ] {
             let top = scratch("phase-script-read");
             install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
-            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{script}\ninsmod blscfg\nblscfg\n"));
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{LOAD_GRUBENV}{script}\ninsmod blscfg\nblscfg\n"));
             let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
             assert!(grub.is_ok(), "{script}: {:?}", grub.as_ref().err());
             assert!(passes(&bls_entries(&grub.unwrap())), "{script}");

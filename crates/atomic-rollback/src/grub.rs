@@ -634,58 +634,170 @@ impl GrubVariables {
     }
 }
 
-/// The lines of Fedora's generated grub.cfg before blscfg that load
-/// variables, which check follows: 00_header's load_env of grubenv and of
-/// env_block (util/grub.d/00_header.in:57, 59 and 69).
-const HEADER_LOAD_ENV: [&str; 3] = ["load_env -f ${config_directory}/grubenv", "load_env", "load_env -f \"${env_block}\""];
+/// What a GRUB script file does that check follows, in the order it does
+/// it.
+enum Step {
+    /// 00_header's load_env of grubenv from the GRUB directory, which is
+    /// grub.cfg's config_directory (normal/main.c, read_config_file) and
+    /// the prefix (util/grub.d/00_header.in:56-60).
+    LoadGrubenv,
+    /// 00_header's load_env of env_block, when it is set, on the device the
+    /// stub's search left in dev (00_header.in:62-70).
+    LoadEnvBlock,
+    /// 01_users's source of user.cfg from the prefix (util/grub.d/01_users.in:3-4).
+    SourceUserCfg,
+    /// Any other command, where it stands.
+    Run(script::Command),
+}
 
-/// 01_users's source of user.cfg, before blscfg (util/grub.d/01_users.in:4).
-const USERS_SOURCE: &str = "source ${prefix}/user.cfg";
+/// The step a line of Fedora's generated grub.cfg is, for the lines check
+/// follows as steps of their own; Some(None) for 00_header's lines that put
+/// the device in front of env_block, which LoadEnvBlock models.
+fn generated_step(line: &str) -> Option<Option<Step>> {
+    Some(match line {
+        "load_env -f ${config_directory}/grubenv" | "load_env" => Some(Step::LoadGrubenv),
+        "set env_block=\"(${dev})${env_block}\"" | "set env_block=\"(${root})${env_block}\"" => None,
+        "load_env -f \"${env_block}\"" => Some(Step::LoadEnvBlock),
+        "source ${prefix}/user.cfg" => Some(Step::SourceUserCfg),
+        _ => return None,
+    })
+}
 
-/// Reads script, the text of the GRUB script file, up to its blscfg
-/// command, and says whether it sources user.cfg as 01_users generates it.
-/// A command that sets a lookup variable, or that can set any variable,
-/// such as a load of variables other than as the generated lines load them,
-/// makes where GRUB looks the boot entries up unknown, since check does not
-/// interpret GRUB script; a command that only reads one does not.
-/// generated says whether the generated lines may appear in file.
-fn script_before_blscfg(script: &str, file: &str, generated: bool) -> Result<bool, GrubContextError> {
-    let mut sources_user_cfg = false;
+/// The steps of the GRUB script file script, named file, up to and
+/// including its blscfg command. generated says whether Fedora's generated
+/// lines may appear in it. A line check cannot read leaves where GRUB looks
+/// the boot entries up unknown.
+fn steps(script: &str, file: &str, generated: bool) -> Result<Vec<Step>, GrubContextError> {
+    let mut steps = Vec::new();
     let mut reader = script::Reader::default();
     for line in script.lines() {
         let trimmed = line.trim();
-        if generated && HEADER_LOAD_ENV.contains(&trimmed) {
-            continue;
-        }
-        if generated && trimmed == USERS_SOURCE {
-            sources_user_cfg = true;
+        if generated && !reader.in_body() && let Some(step) = generated_step(trimmed) {
+            steps.extend(step);
             continue;
         }
         let commands = reader.line(line).map_err(|why| GrubContextError::CannotVerify(format!(
             "{file} has the line '{trimmed}' before blscfg, which check cannot read: {why}")))?;
         for command in commands {
-            if is_blscfg(&command) {
-                if command.words.len() > 1 {
-                    return Err(GrubContextError::CannotVerify(format!(
-                        "{file} runs '{}', whose argument chooses the entries blscfg lists or where it reads them, \
-                         which check does not model", command.line.trim())));
-                }
-                return Ok(sources_user_cfg);
-            }
-            let names = match script::sets(&command.words) {
-                script::Sets::Names(names) => names,
-                script::Sets::Any => return Err(GrubContextError::CannotVerify(format!(
-                    "{file} runs '{}' before blscfg, which can set where GRUB looks the boot entries up, \
-                     and check does not interpret GRUB script", command.line.trim()))),
-            };
-            if let Some(variable) = LOOKUP_VARIABLES.into_iter().find(|v| names.iter().any(|n| n == v)) {
-                return Err(GrubContextError::CannotVerify(format!(
-                    "{file} sets {variable} before blscfg in '{}', and check does not interpret GRUB script",
-                    command.line.trim())));
+            let blscfg = is_blscfg(&command);
+            steps.push(Step::Run(command));
+            if blscfg {
+                return Ok(steps);
             }
         }
     }
-    Ok(sources_user_cfg)
+    Ok(steps)
+}
+
+/// The variables, besides the lookup variables, that a script line before
+/// blscfg must not set: those naming where grub.cfg reads more variables,
+/// and config_directory, where it reads grubenv (00_header.in:56-57).
+const SCRIPT_LOADING_VARIABLES: [&str; 4] = ["env_block", "dev", "prefix", "config_directory"];
+
+/// GRUB running grub.cfg as check follows it (normal/main.c,
+/// grub_normal_execute): the variables in force, and where GRUB starts its
+/// lookups with them.
+struct ConfigRun<'a, F> {
+    variables: GrubVariables,
+    lookup_dirs: LookupDirs<F>,
+    fstype: &'a tools::FsType,
+    partition: &'a Path,
+    grub_dir: &'a str,
+    /// Where blscfg starts its lookups, and the blsdir variable, once
+    /// grub.cfg runs it.
+    at_blscfg: Option<(StartingLookupDir, Option<String>)>,
+}
+
+impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
+    /// Where GRUB starts a lookup with the variables in force.
+    fn starting_lookup_dir(&mut self) -> Result<StartingLookupDir, GrubContextError> {
+        Ok(self.lookup_dirs.for_setting(self.variables.btrfs_relative())?)
+    }
+
+    fn step(&mut self, step: Step, file: &str) -> Result<(), GrubContextError> {
+        match step {
+            Step::LoadGrubenv => {
+                let at = self.starting_lookup_dir()?;
+                if let Some(block) = read_if_found(&at, &grub_dir_file(self.grub_dir, "grubenv"))? {
+                    self.variables.load(&block, GRUBENV)?;
+                }
+                reject_btrfs_subvol_variables(&self.variables, self.fstype)?;
+            }
+            Step::LoadEnvBlock => {
+                let Some(env_block) = self.variables.get("env_block").filter(|value| !value.is_empty()).map(str::to_string) else {
+                    return Ok(());
+                };
+                if let Some(source) = self.variables.source("dev") {
+                    return Err(GrubContextError::CannotVerify(format!(
+                        "{source} sets dev, which names the device GRUB reads env_block from")));
+                }
+                // A name that does not start with '/' is a block list of the
+                // device (kern/file.c, grub_file_open), as grub2-editenv
+                // writes env_block on Btrfs.
+                let block = if env_block.starts_with('/') {
+                    let at = self.starting_lookup_dir()?;
+                    read_if_found(&at, &env_block)?
+                } else {
+                    read_blocklist(self.partition, &env_block)?
+                };
+                if let Some(block) = block {
+                    self.variables.load(&block, ENV_BLOCK)?;
+                }
+                reject_btrfs_subvol_variables(&self.variables, self.fstype)?;
+            }
+            Step::SourceUserCfg => {
+                if let Some(source) = self.variables.source("prefix") {
+                    return Err(GrubContextError::CannotVerify(format!(
+                        "{source} sets prefix, which names the directory GRUB reads user.cfg from")));
+                }
+                let at = self.starting_lookup_dir()?;
+                if let Some(script) = read_if_found(&at, &grub_dir_file(self.grub_dir, "user.cfg"))? {
+                    for step in steps(&String::from_utf8_lossy(&script), "user.cfg", false)? {
+                        self.step(step, "user.cfg")?;
+                    }
+                }
+            }
+            Step::Run(command) => self.run(&command, file)?,
+        }
+        Ok(())
+    }
+
+    /// Follows command, a command of file that check follows as no step of
+    /// its own. Before blscfg, a command that sets a lookup variable or a
+    /// variable naming where variables are loaded from, or that can set any
+    /// variable, such as a load of variables other than as the generated
+    /// lines load them, makes where GRUB looks the boot entries up unknown,
+    /// since check does not interpret GRUB script; a command that only reads
+    /// one does not.
+    fn run(&mut self, command: &script::Command, file: &str) -> Result<(), GrubContextError> {
+        let line = command.line.trim();
+        if self.at_blscfg.is_some() {
+            return Ok(());
+        }
+        if is_blscfg(command) {
+            if command.words.len() > 1 {
+                return Err(GrubContextError::CannotVerify(format!(
+                    "{file} runs '{line}', whose argument chooses the entries blscfg lists or where it reads them, \
+                     which check does not model")));
+            }
+            let at = self.starting_lookup_dir()?;
+            self.at_blscfg = Some((at, self.variables.get("blsdir").map(str::to_string)));
+            return Ok(());
+        }
+        let names = match script::sets(&command.words) {
+            script::Sets::Names(names) => names,
+            script::Sets::Any => return Err(GrubContextError::CannotVerify(format!(
+                "{file} runs '{line}' before blscfg, which can set where GRUB looks the boot entries up, \
+                 and check does not interpret GRUB script"))),
+        };
+        if let Some(variable) = LOOKUP_VARIABLES.into_iter().chain(SCRIPT_LOADING_VARIABLES)
+            .find(|v| names.iter().any(|n| n == v))
+        {
+            return Err(GrubContextError::CannotVerify(format!(
+                "{file} sets {variable} before blscfg in '{line}', and check does not interpret GRUB script")));
+        }
+        Ok(())
+    }
 }
 
 /// The names blscfg.c registers its command under (GRUB_MOD_INIT): the
@@ -954,7 +1066,8 @@ impl GrubContext {
     /// generated header loads grubenv and env_block with load_env
     /// (util/grub.d/00_header.in:56-70), and 01_users sources user.cfg
     /// (util/grub.d/01_users.in:3-4), before blscfg (util/grub.d/10_linux.in:
-    /// 282-283) lists the entries with the values they leave.
+    /// 282-283) lists the entries with the values they leave. Each applies
+    /// where grub.cfg runs it, and not at all where grub.cfg does not.
     pub fn build(
         stub_text: &str,
         stub: tools::EspStub,
@@ -964,63 +1077,32 @@ impl GrubContext {
         select: impl FnMut(bool) -> Result<StartingLookupDir, String>,
         mount: Option<tools::MountPoint>,
     ) -> Result<Self, GrubContextError> {
-        let mut lookup_dirs = LookupDirs { select, selected: [None, None] };
-        let grub_dir = stub.grub_dir;
         let mut variables = GrubVariables::default();
         if let Some(data) = grub_env {
             variables.load_grub_env(data)?;
         }
         variables.apply_stub(stub_text);
         reject_btrfs_subvol_variables(&variables, fstype)?;
-        let at_configfile = lookup_dirs.for_setting(variables.btrfs_relative())?;
-
-        let sources_user_cfg = match read_if_found(&at_configfile, &grub_dir_file(&grub_dir, "grub.cfg"))? {
-            Some(script) => script_before_blscfg(&String::from_utf8_lossy(&script), "grub.cfg", true)?,
-            None => false,
+        let mut run = ConfigRun {
+            variables,
+            lookup_dirs: LookupDirs { select, selected: [None, None] },
+            fstype,
+            partition,
+            grub_dir: &stub.grub_dir,
+            at_blscfg: None,
         };
+        let at_configfile = run.starting_lookup_dir()?;
 
-        // grubenv in the GRUB directory, which is grub.cfg's
-        // config_directory (normal/main.c, read_config_file), looked up as
-        // grub.cfg is.
-        if let Some(block) = read_if_found(&at_configfile, &grub_dir_file(&grub_dir, "grubenv"))? {
-            variables.load(&block, GRUBENV)?;
-        }
-        reject_btrfs_subvol_variables(&variables, fstype)?;
-
-        // env_block, when set, on the device the stub's search left in dev.
-        if let Some(env_block) = variables.get("env_block").filter(|value| !value.is_empty()).map(str::to_string) {
-            if let Some(source) = variables.source("dev") {
-                return Err(GrubContextError::CannotVerify(format!(
-                    "{source} sets dev, which names the device GRUB reads env_block from")));
-            }
-            // A name that does not start with '/' is a block list of the
-            // device (kern/file.c, grub_file_open), as grub2-editenv writes
-            // env_block on Btrfs.
-            let block = if env_block.starts_with('/') {
-                let at_env_block = lookup_dirs.for_setting(variables.btrfs_relative())?;
-                read_if_found(&at_env_block, &env_block)?
-            } else {
-                read_blocklist(partition, &env_block)?
-            };
-            if let Some(block) = block {
-                variables.load(&block, ENV_BLOCK)?;
-            }
-            reject_btrfs_subvol_variables(&variables, fstype)?;
-        }
-        let at_blscfg = lookup_dirs.for_setting(variables.btrfs_relative())?;
-
-        if sources_user_cfg {
-            if let Some(source) = variables.source("prefix") {
-                return Err(GrubContextError::CannotVerify(format!(
-                    "{source} sets prefix, which names the directory GRUB reads user.cfg from")));
-            }
-            if let Some(script) = read_if_found(&at_blscfg, &grub_dir_file(&grub_dir, "user.cfg"))? {
-                script_before_blscfg(&String::from_utf8_lossy(&script), "user.cfg", false)?;
+        if let Some(script) = read_if_found(&at_configfile, &grub_dir_file(&stub.grub_dir, "grub.cfg"))? {
+            for step in steps(&String::from_utf8_lossy(&script), "grub.cfg", true)? {
+                run.step(step, "grub.cfg")?;
             }
         }
-
-        let blsdir = variables.get("blsdir").map(str::to_string);
-        Ok(Self { at_configfile, at_blscfg, blsdir, grub_dir, _mount: mount })
+        let (at_blscfg, blsdir) = match run.at_blscfg.take() {
+            Some(at_blscfg) => at_blscfg,
+            None => (run.starting_lookup_dir()?, run.variables.get("blsdir").map(str::to_string)),
+        };
+        Ok(Self { at_configfile, at_blscfg, blsdir, grub_dir: stub.grub_dir, _mount: mount })
     }
 
     /// GRUB path of a file in the stub's GRUB directory.
