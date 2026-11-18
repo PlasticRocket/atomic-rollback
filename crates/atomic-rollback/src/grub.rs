@@ -42,6 +42,53 @@ impl From<String> for GrubContextError {
     fn from(s: String) -> Self { GrubContextError::Other(s) }
 }
 
+/// Why GRUB's lookup of a path fails.
+#[derive(Debug, PartialEq)]
+pub enum LookupFailure {
+    /// GRUB reports file `PATH' not found.
+    FileNotFound,
+}
+
+impl LookupFailure {
+    /// The failure for grub_path, in GRUB's words.
+    fn message(&self, grub_path: &str) -> String {
+        match self {
+            LookupFailure::FileNotFound => format!("file `{grub_path}' not found"),
+        }
+    }
+}
+
+/// A failed lookup, named by the GRUB path and where GRUB starts it, never
+/// by a Linux path: a mount check made may be gone when the user reads the
+/// report.
+#[derive(Debug)]
+pub struct LookupError {
+    pub grub_path: String,
+    pub failure: LookupFailure,
+    starting_lookup_dir: &'static str,
+}
+
+impl std::fmt::Display for LookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; GRUB starts the lookup at {}", self.failure.message(&self.grub_path), self.starting_lookup_dir)
+    }
+}
+
+/// The directory blscfg reads boot entries from.
+pub struct BlsDir {
+    /// The directory as GRUB names it.
+    pub grub_path: String,
+    /// The Linux path where it is visible.
+    pub linux: PathBuf,
+}
+
+impl BlsDir {
+    /// The GRUB path of the entry named file, as blscfg opens it.
+    pub fn entry(&self, file: &str) -> String {
+        format!("{}/{file}", self.grub_path.trim_end_matches('/'))
+    }
+}
+
 /// Where GRUB starts resolving an absolute path, and the Linux directory
 /// where that starting point is visible.
 pub enum StartingLookupDir {
@@ -226,22 +273,36 @@ impl GrubContext {
         Ok(Self { starting_lookup_dir, grub_dir: stub.grub_dir, _mount: mount })
     }
 
-    pub fn resolve(&self, grub_path: &str) -> PathBuf {
-        self.starting_lookup_dir.resolve(grub_path)
-    }
-
     /// GRUB path of a file in the stub's GRUB directory.
     pub fn grub_dir_file(&self, file: &str) -> String {
         format!("{}/{file}", self.grub_dir.trim_end_matches('/'))
     }
 
-    /// Returns Ok if the GRUB path resolves to an existing file on disk.
-    pub fn check_path_exists(&self, grub_path: &str) -> Result<(), String> {
-        let linux_path = self.resolve(grub_path);
+    /// The Linux path of the file GRUB opens at grub_path.
+    pub fn find_file(&self, grub_path: &str) -> Result<PathBuf, LookupError> {
+        let linux_path = self.starting_lookup_dir.resolve(grub_path);
         if linux_path.exists() {
-            Ok(())
+            Ok(linux_path)
         } else {
-            Err(format!("'{grub_path}' resolves to '{}', not found", linux_path.display()))
+            Err(self.lookup_error(grub_path, LookupFailure::FileNotFound))
+        }
+    }
+
+    /// The Linux path of the directory GRUB lists at grub_path.
+    fn find_dir(&self, grub_path: &str) -> Result<PathBuf, LookupError> {
+        let linux_path = self.starting_lookup_dir.resolve(grub_path);
+        if fs::read_dir(&linux_path).is_ok() {
+            Ok(linux_path)
+        } else {
+            Err(self.lookup_error(grub_path, LookupFailure::FileNotFound))
+        }
+    }
+
+    fn lookup_error(&self, grub_path: &str, failure: LookupFailure) -> LookupError {
+        LookupError {
+            grub_path: grub_path.to_string(),
+            failure,
+            starting_lookup_dir: self.starting_lookup_dir.describe(),
         }
     }
 
@@ -249,22 +310,23 @@ impl GrubContext {
     /// blscfg scans the blsdir variable, which grub.cfg loads from
     /// $prefix/grubenv (util/grub.d/00_header.in), or BLS_CONFIG_PATH when
     /// it is unset, then BOOT_BLS_CONFIG_PATH if listing that fails.
-    pub fn blsdir(&self) -> Result<PathBuf, String> {
+    pub fn blsdir(&self) -> Result<BlsDir, String> {
         // A grubenv GRUB cannot read loads nothing, as when it is absent.
-        let grubenv = fs::read_to_string(self.resolve(&self.grub_dir_file("grubenv"))).ok();
+        let grubenv = self.find_file(&self.grub_dir_file("grubenv")).ok()
+            .and_then(|path| fs::read_to_string(path).ok());
         let blsdir = grubenv.as_deref()
             .and_then(|env| grubenv_value(env, "blsdir"))
             .unwrap_or(BLS_CONFIG_PATH);
 
         let mut tried = Vec::new();
         for dir in [blsdir, BOOT_BLS_CONFIG_PATH] {
-            let linux_path = self.resolve(dir);
-            if fs::read_dir(&linux_path).is_ok() {
-                return Ok(linux_path);
+            match self.find_dir(dir) {
+                Ok(linux) => return Ok(BlsDir { grub_path: dir.to_string(), linux }),
+                Err(e) => tried.push(e.failure.message(dir)),
             }
-            tried.push(format!("'{dir}' (resolves to '{}')", linux_path.display()));
         }
-        Err(format!("GRUB finds no boot entry directory: tried {}", tried.join(" and ")))
+        Err(format!("GRUB finds no boot entry directory: {}; GRUB starts the lookup at {}",
+            tried.join(", then "), self.starting_lookup_dir.describe()))
     }
 }
 
