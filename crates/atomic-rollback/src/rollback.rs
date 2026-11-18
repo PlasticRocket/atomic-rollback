@@ -1,18 +1,22 @@
-//! Rollback: verify boot chain for snapshot, swap root subvolume names
-//! via RENAME_EXCHANGE, update default subvolume. Undoes the swap
-//! if set-default fails.
+//! Rollback: verify boot chain for snapshot, exchange root subvolume
+//! names via RENAME_EXCHANGE, update default subvolume. Undoes the
+//! exchange if set-default fails.
 
 use std::path::Path;
 
 use crate::consts::{BTRFS_TOPLEVEL_SUBVOLID, TOPLEVEL_MOUNT};
+use crate::swap::RenameExchange;
 use crate::{check, swap, tools};
 
-/// Cannot use with_toplevel because the undo path needs to swap back
+/// Cannot use with_toplevel because the undo path needs to exchange back
 /// if set-default fails, which requires the mount to stay alive.
 pub fn rollback(snapshot_name: &str) -> Result<(), String> {
     let toplevel = TOPLEVEL_MOUNT;
     let (device, fstab) = tools::root_device()?;
-    let root_subvol = tools::root_subvol_name(&fstab)?;
+    let exchange = RenameExchange {
+        root: tools::root_subvol_name(&fstab)?,
+        snapshot: tools::SubvolName::new(snapshot_name.to_string()),
+    };
 
     std::fs::create_dir_all(toplevel)
         .map_err(|e| format!("mkdir {toplevel}: {e}"))?;
@@ -26,7 +30,7 @@ pub fn rollback(snapshot_name: &str) -> Result<(), String> {
     }
 
     println!("\n  Verifying boot chain for snapshot '{snapshot_name}'...");
-    match check::verify_snapshot_bootable(Path::new(&snapshot_path)) {
+    match check::verify_snapshot_bootable(Path::new(toplevel), &exchange) {
         check::BootStatus::Pass | check::BootStatus::Warn => {
             println!("  Snapshot verified.\n");
         }
@@ -53,19 +57,18 @@ pub fn rollback(snapshot_name: &str) -> Result<(), String> {
 
     check::print_rollback_scope(&fstab);
 
-    // RENAME_EXCHANGE: root_subvol <-> snapshot
-    println!("  RENAME_EXCHANGE: {root_subvol} <-> {snapshot_name}");
-    swap::rename_exchange(Path::new(toplevel), root_subvol.as_str(), snapshot_name)?;
+    println!("  RENAME_EXCHANGE: {} <-> {}", exchange.root, exchange.snapshot);
+    swap::rename_exchange(Path::new(toplevel), exchange.root.as_str(), exchange.snapshot.as_str())?;
 
     // Update default subvolume to match the new root.
-    // If this fails, UNDO the swap so the system is unchanged.
+    // If this fails, UNDO the exchange so the system is unchanged.
     // The model treats rollback as atomic: both happen or neither.
-    let new_root_id = match tools::btrfs_subvol_id_by_name(toplevel, &root_subvol) {
+    let new_root_id = match tools::btrfs_subvol_id_by_name(toplevel, &exchange.root) {
         Ok(id) => id,
         Err(e) => {
-            eprintln!("  set-default failed; undoing swap to restore original state");
-            if let Err(undo_err) = swap::rename_exchange(Path::new(toplevel), root_subvol.as_str(), snapshot_name) {
-                eprintln!("  CRITICAL: undo swap also failed: {undo_err}");
+            eprintln!("  set-default failed; undoing the exchange to restore original state");
+            if let Err(undo_err) = swap::rename_exchange(Path::new(toplevel), exchange.root.as_str(), exchange.snapshot.as_str()) {
+                eprintln!("  CRITICAL: undoing the exchange also failed: {undo_err}");
                 eprintln!("  System is in an inconsistent state. Manual recovery required.");
             }
             tools::umount(toplevel)?;
@@ -75,9 +78,9 @@ pub fn rollback(snapshot_name: &str) -> Result<(), String> {
     };
     println!("  set-default: ID {new_root_id}");
     if let Err(e) = tools::btrfs_subvol_set_default(new_root_id, toplevel) {
-        eprintln!("  set-default failed; undoing swap to restore original state");
-        if let Err(undo_err) = swap::rename_exchange(Path::new(toplevel), root_subvol.as_str(), snapshot_name) {
-            eprintln!("  CRITICAL: undo swap also failed: {undo_err}");
+        eprintln!("  set-default failed; undoing the exchange to restore original state");
+        if let Err(undo_err) = swap::rename_exchange(Path::new(toplevel), exchange.root.as_str(), exchange.snapshot.as_str()) {
+            eprintln!("  CRITICAL: undoing the exchange also failed: {undo_err}");
             eprintln!("  System is in an inconsistent state. Manual recovery required.");
         }
         tools::umount(toplevel)?;
@@ -85,7 +88,7 @@ pub fn rollback(snapshot_name: &str) -> Result<(), String> {
         return Err(format!("rollback aborted: set-default failed: {e}"));
     }
 
-    // Swap and set-default are in the btrfs in-memory journal only.
+    // The exchange and set-default are in the btrfs in-memory journal only.
     tools::sync_filesystem(toplevel)?;
 
     // Rollback succeeded. Cleanup is best-effort; a stale mount

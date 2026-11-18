@@ -13,8 +13,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::consts::TOPLEVEL_MOUNT;
 use crate::platform::FEDORA as P;
+use crate::swap::RenameExchange;
 use crate::tools;
 
 /// BLS directory blscfg scans when the blsdir variable is unset
@@ -38,27 +38,6 @@ pub enum GrubContextError {
 
 impl From<String> for GrubContextError {
     fn from(s: String) -> Self { GrubContextError::Other(s) }
-}
-
-/// The rename a pending rollback performs: RENAME_EXCHANGE gives the
-/// snapshot the root subvolume's name, so after the exchange GRUB reaches
-/// the snapshot through every path that starts with the root subvolume.
-pub struct RenameExchange {
-    pub root: tools::SubvolName,
-    pub snapshot: tools::SubvolName,
-}
-
-impl RenameExchange {
-    /// Maps a path relative to the top-level subvolume, as GRUB will walk
-    /// it after the exchange, to the path naming the same file before it.
-    fn before_exchange(&self, path: &str) -> String {
-        let root = self.root.as_str().trim_matches('/');
-        let snapshot = self.snapshot.as_str().trim_matches('/');
-        match path.strip_prefix(root) {
-            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{snapshot}{rest}"),
-            _ => path.to_string(),
-        }
-    }
 }
 
 /// Where GRUB starts resolving an absolute path, and the Linux directory
@@ -88,51 +67,40 @@ impl StartingLookupDir {
         default_subvol: impl FnOnce() -> Result<String, String>,
     ) -> Result<Self, String> {
         Ok(match fstype {
-            tools::FsType::Btrfs if btrfs_relative => StartingLookupDir::BtrfsDefaultSubvol(fs_root.join(default_subvol()?)),
-            tools::FsType::Btrfs => StartingLookupDir::BtrfsTopLevel { toplevel: fs_root, exchange: None },
-            _ => StartingLookupDir::FilesystemRoot(fs_root),
+            tools::FsType::Btrfs if btrfs_relative => Self::BtrfsDefaultSubvol(fs_root.join(default_subvol()?)),
+            tools::FsType::Btrfs => Self::BtrfsTopLevel { toplevel: fs_root, exchange: None },
+            _ => Self::FilesystemRoot(fs_root),
         })
     }
 
-    /// Selects GRUB's starting point as it will be once rollback has
-    /// exchanged in the snapshot at snapshot_root. fs_root is where the root
-    /// of the filesystem the ESP stub names is mounted; on Btrfs that is
-    /// the top-level subvolume, and snapshot_root lies below it.
-    /// root_subvol yields the name fstab mounts as /, which the snapshot
-    /// takes in the exchange; it is called only when GRUB starts at the top
-    /// level, where paths name subvolumes.
+    /// Selects GRUB's starting point as it will be once rollback has made
+    /// the exchange. fs_root is where the root of the filesystem the ESP
+    /// stub names is mounted; on Btrfs that is the top-level subvolume, in
+    /// which the exchange renames the root subvolume and the snapshot.
     pub fn after_rollback(
         fstype: &tools::FsType,
         btrfs_relative: bool,
         fs_root: PathBuf,
-        snapshot_root: &Path,
-        root_subvol: impl FnOnce() -> Result<tools::SubvolName, String>,
-    ) -> Result<Self, String> {
-        Ok(match fstype {
-            // After the exchange, rollback sets the snapshot as the default subvolume.
-            tools::FsType::Btrfs if btrfs_relative => StartingLookupDir::BtrfsDefaultSubvol(snapshot_root.to_path_buf()),
-            tools::FsType::Btrfs => {
-                let snapshot = snapshot_root.strip_prefix(&fs_root).map_err(|_| format!(
-                    "snapshot {} is not under the top-level subvolume mount {}",
-                    snapshot_root.display(), fs_root.display()))?;
-                let exchange = RenameExchange {
-                    root: root_subvol()?,
-                    snapshot: tools::SubvolName::new(snapshot.to_string_lossy().into_owned()),
-                };
-                StartingLookupDir::BtrfsTopLevel { toplevel: fs_root, exchange: Some(exchange) }
-            }
+        exchange: &RenameExchange,
+    ) -> Self {
+        match fstype {
+            // After the exchange, rollback sets the subvolume then named as
+            // the root subvolume, which is the snapshot, as the default.
+            tools::FsType::Btrfs if btrfs_relative =>
+                Self::BtrfsDefaultSubvol(fs_root.join(exchange.before_exchange(exchange.root.as_str()))),
+            tools::FsType::Btrfs => Self::BtrfsTopLevel { toplevel: fs_root, exchange: Some(exchange.clone()) },
             // A separate boot filesystem is outside the snapshot, and
             // rollback leaves it as it is.
-            _ => StartingLookupDir::FilesystemRoot(fs_root),
-        })
+            _ => Self::FilesystemRoot(fs_root),
+        }
     }
 
     /// Names the starting point for check's output.
     pub fn describe(&self) -> &'static str {
         match self {
-            StartingLookupDir::FilesystemRoot(_) => "the root of the boot filesystem (not Btrfs)",
-            StartingLookupDir::BtrfsTopLevel { .. } => "the Btrfs top-level subvolume (btrfs_relative_path not set)",
-            StartingLookupDir::BtrfsDefaultSubvol(_) => "the Btrfs default subvolume (btrfs_relative_path set)",
+            Self::FilesystemRoot(_) => "the root of the boot filesystem (not Btrfs)",
+            Self::BtrfsTopLevel { .. } => "the Btrfs top-level subvolume (btrfs_relative_path not set)",
+            Self::BtrfsDefaultSubvol(_) => "the Btrfs default subvolume (btrfs_relative_path set)",
         }
     }
 
@@ -141,9 +109,9 @@ impl StartingLookupDir {
     pub fn resolve(&self, grub_path: &str) -> PathBuf {
         let path = grub_path.trim_start_matches('/');
         match self {
-            StartingLookupDir::FilesystemRoot(dir) | StartingLookupDir::BtrfsDefaultSubvol(dir) => dir.join(path),
-            StartingLookupDir::BtrfsTopLevel { toplevel, exchange: None } => toplevel.join(path),
-            StartingLookupDir::BtrfsTopLevel { toplevel, exchange: Some(exchange) } => toplevel.join(exchange.before_exchange(path)),
+            Self::FilesystemRoot(dir) | Self::BtrfsDefaultSubvol(dir) => dir.join(path),
+            Self::BtrfsTopLevel { toplevel, exchange: None } => toplevel.join(path),
+            Self::BtrfsTopLevel { toplevel, exchange: Some(exchange) } => toplevel.join(exchange.before_exchange(path)),
         }
     }
 }
@@ -222,14 +190,13 @@ impl GrubContext {
         Ok(Self { starting_lookup_dir, grub_dir: stub.grub_dir, _mount: Some(mount) })
     }
 
-    /// Builds a context for verifying a snapshot before rollback. Reads the
-    /// ESP config from the live system (the ESP is vfat, not in the
-    /// snapshot). snapshot_root is the snapshot's directory under the
-    /// top-level subvolume, which rollback has mounted at TOPLEVEL_MOUNT.
-    /// A boot filesystem other than Btrfs is outside the snapshot, so its
-    /// live mount point is used, mounting it at a temporary mount point if
-    /// needed.
-    pub fn for_snapshot(snapshot_root: &Path) -> Result<Self, GrubContextError> {
+    /// Builds a context for verifying a snapshot before rollback makes the
+    /// exchange. Reads the ESP config from the live system (the ESP is vfat,
+    /// not in the snapshot). toplevel is where rollback mounted the Btrfs
+    /// top-level subvolume. A boot filesystem other than Btrfs is outside
+    /// the snapshot, so its live mount point is used, mounting it at a
+    /// temporary mount point if needed.
+    pub fn for_snapshot(toplevel: &Path, exchange: &RenameExchange) -> Result<Self, GrubContextError> {
         let stub = read_esp_stub(&Path::new(P.esp_dir).join("grub.cfg"))?;
         let fstype = boot_fstype(&stub)?;
 
@@ -238,11 +205,9 @@ impl GrubContext {
         } else {
             Some(tools::get_mount_point(&stub.boot_uuid.clone().into_device_spec())?)
         };
-        let fs_root = mount.as_ref()
-            .map_or_else(|| PathBuf::from(TOPLEVEL_MOUNT), |m| PathBuf::from(m.path()));
+        let fs_root = mount.as_ref().map_or_else(|| toplevel.to_path_buf(), |m| PathBuf::from(m.path()));
 
-        let starting_lookup_dir = StartingLookupDir::after_rollback(&fstype, stub.btrfs_relative, fs_root, snapshot_root,
-            live_root_subvol)?;
+        let starting_lookup_dir = StartingLookupDir::after_rollback(&fstype, stub.btrfs_relative, fs_root, exchange);
 
         Ok(Self { starting_lookup_dir, grub_dir: stub.grub_dir, _mount: mount })
     }
@@ -294,14 +259,6 @@ impl GrubContext {
 fn boot_fstype(stub: &tools::EspStub) -> Result<tools::FsType, String> {
     tools::blkid_fstype(&stub.boot_uuid).map_err(|e| format!(
         "cannot determine the filesystem type of UUID={}: {e}", stub.boot_uuid.as_str()))
-}
-
-/// The subvolume the live fstab mounts as /, whose name rollback gives
-/// the snapshot.
-fn live_root_subvol() -> Result<tools::SubvolName, String> {
-    let fstab = fs::read_to_string("/etc/fstab")
-        .map_err(|e| format!("Cannot read /etc/fstab: {e}"))?;
-    tools::root_subvol_name(&fstab)
 }
 
 /// Value of a variable in a GRUB environment block (grub-core/lib/envblk.c:
@@ -414,14 +371,12 @@ configfile $prefix/grub.cfg
 
     // --- snapshot before rollback ---
 
+    fn exchange_of_root_and(snapshot: &str) -> RenameExchange {
+        RenameExchange { root: SubvolName::new("root".into()), snapshot: SubvolName::new(snapshot.into()) }
+    }
+
     fn exchange_to(snapshot: &str) -> StartingLookupDir {
-        StartingLookupDir::BtrfsTopLevel {
-            toplevel: top(),
-            exchange: Some(RenameExchange {
-                root: SubvolName::new("root".into()),
-                snapshot: SubvolName::new(snapshot.into()),
-            }),
-        }
+        StartingLookupDir::BtrfsTopLevel { toplevel: top(), exchange: Some(exchange_of_root_and(snapshot)) }
     }
 
     #[test]
@@ -453,31 +408,18 @@ configfile $prefix/grub.cfg
             Path::new("/top/2025-01-02_03-04-05/boot/vmlinuz-6.19.9"));
     }
 
-    fn live_root_is_root() -> Result<SubvolName, String> { Ok(SubvolName::new("root".into())) }
-
-    fn live_root_unread() -> Result<SubvolName, String> {
-        panic!("the root subvolume's name matters only from the top level")
-    }
-
     #[test]
     fn after_rollback_from_top_level_exchanges_in_the_snapshot() {
-        let starting_lookup_dir = StartingLookupDir::after_rollback(&FsType::Btrfs, false, top(), Path::new("/top/snap1"),
-            live_root_is_root).unwrap();
+        let starting_lookup_dir = StartingLookupDir::after_rollback(&FsType::Btrfs, false, top(),
+            &exchange_of_root_and("snap1"));
         assert_eq!(starting_lookup_dir.resolve("/root/boot/vmlinuz-6.19.9"), Path::new("/top/snap1/boot/vmlinuz-6.19.9"));
         assert_eq!(starting_lookup_dir.resolve("/home/user"), Path::new("/top/home/user"));
     }
 
     #[test]
-    fn after_rollback_refuses_snapshot_outside_the_top_level() {
-        let starting_lookup_dir = StartingLookupDir::after_rollback(&FsType::Btrfs, false, top(), Path::new("/elsewhere/snap1"),
-            live_root_is_root);
-        assert!(starting_lookup_dir.is_err());
-    }
-
-    #[test]
     fn after_rollback_from_default_subvol_resolves_inside_the_snapshot() {
-        let starting_lookup_dir = StartingLookupDir::after_rollback(&FsType::Btrfs, true, top(), Path::new("/top/snap1"),
-            live_root_unread).unwrap();
+        let starting_lookup_dir = StartingLookupDir::after_rollback(&FsType::Btrfs, true, top(),
+            &exchange_of_root_and("snap1"));
         assert_eq!(starting_lookup_dir.resolve("/vmlinuz-6.19.9"), Path::new("/top/snap1/vmlinuz-6.19.9"));
     }
 
@@ -486,7 +428,7 @@ configfile $prefix/grub.cfg
     #[test]
     fn after_rollback_off_btrfs_resolves_on_the_live_boot_filesystem() {
         let starting_lookup_dir = StartingLookupDir::after_rollback(&FsType::Ext4, false, PathBuf::from("/boot"),
-            Path::new("/top/snap1"), live_root_unread).unwrap();
+            &exchange_of_root_and("snap1"));
         assert_eq!(starting_lookup_dir.resolve("/vmlinuz-6.19.9"), Path::new("/boot/vmlinuz-6.19.9"));
         assert_eq!(starting_lookup_dir.resolve("/grub2/grub.cfg"), Path::new("/boot/grub2/grub.cfg"));
     }
