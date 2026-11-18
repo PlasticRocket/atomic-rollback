@@ -6,13 +6,13 @@
 use std::fs;
 use std::path::Path;
 
-use crate::grub::{BlsDir, StartingLookupDir, GrubContext, GrubContextError};
+use crate::grub::{BlsDir, Finding, StartingLookupDir, GrubContext, GrubContextError};
 use crate::parse;
 use crate::platform::FEDORA as P;
 use crate::swap::RenameExchange;
 use crate::tools;
 
-type CheckResult = Result<(), String>;
+type CheckResult = Result<(), Finding>;
 
 /// Result of the BOOTS predicate evaluation.
 pub enum BootStatus {
@@ -26,27 +26,45 @@ pub enum BootStatus {
     Inaccessible { reason: String, hint: String },
 }
 
+/// A failure in any group fails the boot chain. Otherwise a group check
+/// cannot verify leaves the boot chain unverified, since it may be valid.
 fn evaluate_checks(checks: Vec<(&str, Vec<CheckResult>)>) -> BootStatus {
     let mut all_failures = Vec::new();
+    let mut all_unverified = Vec::new();
     let mut warned = false;
     for (name, results) in &checks {
         if results.is_empty() {
             warned = true; // Check group handled its own WARN display
             continue;
         }
-        let failures: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
-        if failures.is_empty() {
-            println!("  PASS  {name}");
-        } else {
+        let failures: Vec<&String> = results.iter()
+            .filter_map(|r| match r { Err(Finding::Fails(f)) => Some(f), _ => None }).collect();
+        let unverified: Vec<&String> = results.iter()
+            .filter_map(|r| match r { Err(Finding::CannotVerify(f)) => Some(f), _ => None }).collect();
+        if !failures.is_empty() {
             println!("  FAIL  {name}");
-            for f in &failures {
-                println!("        {f}");
-                all_failures.push(format!("{name}: {f}"));
-            }
+        } else if !unverified.is_empty() {
+            println!("  CANNOT VERIFY  {name}");
+        } else {
+            println!("  PASS  {name}");
+        }
+        for f in &failures {
+            println!("        {f}");
+            all_failures.push(format!("{name}: {f}"));
+        }
+        for f in &unverified {
+            println!("        {f}");
+            all_unverified.push(format!("{name}: {f}"));
         }
     }
     if !all_failures.is_empty() {
         BootStatus::Fail(all_failures)
+    } else if !all_unverified.is_empty() {
+        BootStatus::Inaccessible {
+            reason: all_unverified.join("; "),
+            hint: "check could not read a file GRUB reads, so the boot chain may still be valid. \
+                   Fix the error above and run check again.".into(),
+        }
     } else if warned {
         BootStatus::Warn
     } else {
@@ -161,7 +179,7 @@ fn check_esp(root: &Path) -> Vec<CheckResult> {
         results.push(check_file_exists_nonempty(&path).map_err(|_|
             format!("{name} is missing from the EFI partition. \
                      The system cannot boot without it. \
-                     Reinstall the grub2-efi package: sudo dnf reinstall grub2-efi-{s}")
+                     Reinstall the grub2-efi package: sudo dnf reinstall grub2-efi-{s}").into()
         ));
     }
 
@@ -169,7 +187,7 @@ fn check_esp(root: &Path) -> Vec<CheckResult> {
     results.push(check_file_exists_nonempty(&grub_cfg).map_err(|_|
         format!("EFI grub.cfg is missing at {}. \
                  GRUB will drop to a rescue shell on next boot. \
-                 Reinstall: sudo dnf reinstall grub2-efi-{s}", grub_cfg.display())
+                 Reinstall: sudo dnf reinstall grub2-efi-{s}", grub_cfg.display()).into()
     ));
     results.push(check_file_contains(&grub_cfg, "--fs-uuid",
         "EFI grub.cfg does not contain a filesystem search directive. \
@@ -204,28 +222,33 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
 fn check_grub_cfg(grub: &GrubContext, remedy: Option<&str>) -> Vec<CheckResult> {
     let remedy = remedy.map(|r| format!(" {r}")).unwrap_or_default();
     let grub_path = grub.grub_dir_file("grub.cfg");
-    let grub_cfg = read_grub_file(grub, &grub_path);
+    let content = match read_grub_file(grub, &grub_path) {
+        Ok(content) => content,
+        Err(finding) => return vec![Err(finding.map_fails(|fact| format!(
+            "GRUB loads its configuration from '{grub_path}': {fact}. \
+             GRUB will drop to a rescue shell on next boot.{remedy}")))],
+    };
     vec![
-        match &grub_cfg {
-            Ok(content) if !content.is_empty() => Ok(()),
-            Ok(_) => Err(format!("GRUB loads its configuration from '{grub_path}', which is empty. \
-                                  GRUB will drop to a rescue shell on next boot.{remedy}")),
-            Err(fact) => Err(format!("GRUB loads its configuration from '{grub_path}': {fact}. \
-                                      GRUB will drop to a rescue shell on next boot.{remedy}")),
+        if content.is_empty() {
+            Err(format!("GRUB loads its configuration from '{grub_path}', which is empty. \
+                         GRUB will drop to a rescue shell on next boot.{remedy}").into())
+        } else {
+            Ok(())
         },
-        match &grub_cfg {
-            Ok(content) if content.contains("blscfg") => Ok(()),
-            Ok(_) => Err(format!("GRUB configuration does not use Boot Loader Specification entries. \
-                                  Kernel boot entries will not appear in the GRUB menu.{remedy}")),
-            Err(fact) => Err(format!("Cannot read the GRUB configuration: {fact}")),
+        if content.contains("blscfg") {
+            Ok(())
+        } else {
+            Err(format!("GRUB configuration does not use Boot Loader Specification entries. \
+                         Kernel boot entries will not appear in the GRUB menu.{remedy}").into())
         },
     ]
 }
 
-/// The content of the file GRUB opens at grub_path.
-fn read_grub_file(grub: &GrubContext, grub_path: &str) -> Result<String, String> {
-    let path = grub.find_file(grub_path).map_err(|e| e.to_string())?;
-    fs::read_to_string(path).map_err(|e| format!("cannot read '{grub_path}': {e}"))
+/// The content of the file GRUB opens at grub_path. A Linux error reading
+/// it says nothing about GRUB, so check cannot verify past it.
+fn read_grub_file(grub: &GrubContext, grub_path: &str) -> Result<String, Finding> {
+    let path = grub.find_file(grub_path)?;
+    fs::read_to_string(path).map_err(|e| Finding::CannotVerify(format!("cannot verify '{grub_path}': {e}")))
 }
 
 fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckResult {
@@ -254,7 +277,7 @@ fn default_subvol_is_root(default_id: u64, root_subvol_name: &tools::SubvolName,
              but the subvolume '{root_subvol_name}' (mounted as /) has ID {root_subvol_id}. \
              The system will not boot correctly. \
              Fix: sudo btrfs subvolume set-default {root_subvol_id} /"
-        ))
+        ).into())
     }
 }
 
@@ -262,20 +285,16 @@ fn default_subvol_is_root(default_id: u64, root_subvol_name: &tools::SubvolName,
 
 /// blsdir is the directory blscfg reads boot entries from, as
 /// GrubContext::blsdir finds it.
-fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, String>) -> Vec<CheckResult> {
+fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Vec<CheckResult> {
     let blsdir = match blsdir {
         Ok(dir) => dir,
-        Err(e) => return vec![Err(format!("{e}. GRUB will show an empty menu."))],
+        Err(finding) => return vec![Err(finding.clone().map_fails(|e| format!("{e}. GRUB will show an empty menu.")))],
     };
 
     let confs = match bls_entry_paths(blsdir) {
         Ok(confs) => confs,
-        Err(e) => {
-            return vec![Err(format!(
-                "Cannot read boot entries in '{}': {e}. \
-                 GRUB will show an empty menu.",
-                blsdir.grub_path))];
-        }
+        Err(e) => return vec![Err(Finding::CannotVerify(format!(
+            "cannot verify the boot entries in '{}': {e}", blsdir.grub_path)))],
     };
 
     if confs.is_empty() {
@@ -283,16 +302,18 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, String>) -> Vec
             "No boot entries found in '{}'. \
              GRUB will show an empty menu with no kernels to boot. \
              Reinstall the kernel: sudo dnf reinstall kernel-core",
-            blsdir.grub_path))];
+            blsdir.grub_path).into())];
     }
 
     // Validate ALL entries, not just until the first valid one
     let mut valid = 0;
     let mut failures: Vec<String> = Vec::new();
+    let mut unverified: Vec<String> = Vec::new();
     for conf in &confs {
         match validate_bls_entry(grub, conf) {
             Ok(()) => valid += 1,
-            Err(e) => failures.push(e),
+            Err(Finding::Fails(e)) => failures.push(e),
+            Err(Finding::CannotVerify(e)) => unverified.push(e),
         }
     }
 
@@ -303,40 +324,50 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, String>) -> Vec
     }
 
     if valid > 0 {
-        // System boots but some entries are broken. WARN, not PASS.
-        // Print here; return empty so evaluate_checks skips this group.
+        // System boots but some entries are broken or unverified. WARN,
+        // not PASS. Print here; return empty so evaluate_checks skips this
+        // group.
         println!("  WARN  Kernel boot entry ({valid} of {total} valid)");
-        for f in &failures {
+        for f in failures.iter().chain(&unverified) {
             println!("        {f}");
         }
         return vec![];
     }
 
-    let mut results: Vec<CheckResult> = failures.into_iter().map(Err).collect();
+    // No entry is valid, but one check cannot verify may be: whether GRUB
+    // boots is unknown, and the broken entries are listed with it.
+    if !unverified.is_empty() {
+        return unverified.into_iter().chain(failures).map(|e| Err(Finding::CannotVerify(e))).collect();
+    }
+
+    let mut results: Vec<CheckResult> = failures.into_iter().map(|e| Err(Finding::Fails(e))).collect();
     results.push(Err(
         "No boot entry has a valid kernel, initramfs, and root parameter. \
          The system cannot boot. \
-         Rebuild the boot entry: sudo kernel-install add $(uname -r) /lib/modules/$(uname -r)/vmlinuz".into()));
+         Rebuild the boot entry: sudo kernel-install add $(uname -r) /lib/modules/$(uname -r)/vmlinuz".to_string().into()));
     results
 }
 
 /// The GRUB paths of the boot entries in blsdir.
 fn bls_entry_paths(blsdir: &BlsDir) -> std::io::Result<Vec<String>> {
-    Ok(fs::read_dir(&blsdir.linux)?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "conf"))
-        .map(|name| blsdir.entry(&name))
-        .collect())
+    let mut confs = Vec::new();
+    for entry in fs::read_dir(&blsdir.linux)? {
+        if let Ok(name) = entry?.file_name().into_string() {
+            if Path::new(&name).extension().is_some_and(|ext| ext == "conf") {
+                confs.push(blsdir.entry(&name));
+            }
+        }
+    }
+    Ok(confs)
 }
 
 // BLS fields may contain GRUB variables after the file path:
 //   initrd /initramfs-6.19.9.img $tuned_initrd
 // Only the first token is a file path. The rest is GRUB's concern.
 // conf is the entry's GRUB path.
-fn validate_bls_entry(grub: &GrubContext, conf: &str) -> Result<(), String> {
+fn validate_bls_entry(grub: &GrubContext, conf: &str) -> CheckResult {
     let content = read_grub_file(grub, conf)
-        .map_err(|e| format!("Cannot read boot entry: {e}"))?;
+        .map_err(|finding| finding.map_fails(|e| format!("Cannot read boot entry: {e}")))?;
 
     let linux = parse::bls_field(&content, "linux")
         .ok_or_else(|| format!(
@@ -347,9 +378,9 @@ fn validate_bls_entry(grub: &GrubContext, conf: &str) -> Result<(), String> {
             "Boot entry '{conf}' has no 'options' field. \
              The kernel will not know which root filesystem to mount."))?;
 
-    grub.find_file(linux).map_err(|fact| format!(
+    grub.find_file(linux).map_err(|e| Finding::from(e).map_fails(|fact| format!(
         "GRUB cannot find the kernel ({fact}). \
-         The system will not boot with this entry."))?;
+         The system will not boot with this entry.")))?;
 
     // initrd may appear on multiple lines (BLS spec). Each value may contain
     // GRUB variables ($tuned_initrd) which are resolved at boot, not checkable here.
@@ -358,14 +389,14 @@ fn validate_bls_entry(grub: &GrubContext, conf: &str) -> Result<(), String> {
     if initrd_values.is_empty() {
         return Err(format!(
             "Boot entry '{conf}' has no 'initrd' field. \
-             The kernel will panic without an initial ramdisk."));
+             The kernel will panic without an initial ramdisk.").into());
     }
     for initrd_val in &initrd_values {
         for path in initrd_val.split_whitespace() {
             if path.starts_with('$') { continue; } // GRUB variable
-            grub.find_file(path).map_err(|fact| format!(
+            grub.find_file(path).map_err(|e| Finding::from(e).map_fails(|fact| format!(
                 "GRUB cannot find the initial ramdisk ({fact}). \
-                 The kernel will panic during boot."))?;
+                 The kernel will panic during boot.")))?;
         }
     }
 
@@ -374,7 +405,7 @@ fn validate_bls_entry(grub: &GrubContext, conf: &str) -> Result<(), String> {
     if !options.contains("root=") {
         return Err(format!(
             "Boot entry '{conf}' does not specify a root filesystem (missing root= parameter). \
-             The kernel will not know what to mount."));
+             The kernel will not know what to mount.").into());
     }
 
     Ok(())
@@ -382,30 +413,34 @@ fn validate_bls_entry(grub: &GrubContext, conf: &str) -> Result<(), String> {
 
 // --- Root filesystem ---
 
-fn check_root_mountable(root: &Path, grub: &GrubContext, blsdir: &Result<BlsDir, String>) -> Vec<CheckResult> {
+fn check_root_mountable(root: &Path, grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
     let root_uuid = match extract_root_uuid(grub, blsdir) {
-        Some(uuid) => uuid,
-        None => {
+        Ok(Some(uuid)) => uuid,
+        Ok(None) => {
             results.push(Err(
                 "Cannot determine root filesystem UUID from boot entries. \
                  No boot entry specifies root=UUID=. \
-                 The system may not boot.".into()));
+                 The system may not boot.".to_string().into()));
+            return results;
+        }
+        Err(finding) => {
+            results.push(Err(finding));
             return results;
         }
     };
 
-    results.push(check_blkid_uuid_fstype(&root_uuid, tools::FsType::Btrfs).map_err(|e| format!(
+    results.push(check_blkid_uuid_fstype(&root_uuid, tools::FsType::Btrfs).map_err(|e| e.map(|e| format!(
         "Root filesystem UUID {} is not a Btrfs partition: {e}. \
-         This tool requires Btrfs as the root filesystem.", root_uuid.as_str())));
+         This tool requires Btrfs as the root filesystem.", root_uuid.as_str()))));
 
     let fstab_content = match fs::read_to_string(root.join("etc/fstab")) {
         Ok(c) => c,
         Err(e) => {
             results.push(Err(format!(
                 "Cannot read /etc/fstab to determine root subvolume: {e}. \
-                 The system may not boot.")));
+                 The system may not boot.").into()));
             return results;
         }
     };
@@ -414,21 +449,21 @@ fn check_root_mountable(root: &Path, grub: &GrubContext, blsdir: &Result<BlsDir,
         Ok(name) => name,
         Err(e) => {
             results.push(Err(format!(
-                "{e}. The fstab entry for / must include subvol=<name>.")));
+                "{e}. The fstab entry for / must include subvol=<name>.").into()));
             return results;
         }
     };
 
     let root_device = root_uuid.clone().into_device_spec();
-    results.push(check_btrfs_subvol_exists(&root_device, &root_subvol_name).map_err(|e| format!(
+    results.push(check_btrfs_subvol_exists(&root_device, &root_subvol_name).map_err(|e| e.map(|e| format!(
         "Btrfs subvolume '{root_subvol_name}' not found: {e}. \
          The kernel expects to mount subvol={root_subvol_name} as /. \
-         Without it, the system drops to an emergency shell.")));
+         Without it, the system drops to an emergency shell."))));
 
     results.push(check_file_exists_nonempty(&root.join(&P.systemd_path[1..])).map_err(|_|
         format!("systemd (PID 1) is missing at {}. \
          The kernel will panic after mounting root. \
-         Reinstall: sudo dnf reinstall systemd", P.systemd_path)));
+         Reinstall: sudo dnf reinstall systemd", P.systemd_path).into()));
 
     results
 }
@@ -440,7 +475,7 @@ fn check_fstab_mounts(root: &Path) -> Vec<CheckResult> {
         Ok(c) => c,
         Err(e) => return vec![Err(format!(
             "Cannot read /etc/fstab: {e}. \
-             systemd will not mount any filesystems."))],
+             systemd will not mount any filesystems.").into())],
     };
 
     let lines = tools::parse_fstab(&content);
@@ -468,7 +503,7 @@ fn check_fstab_entry(device: &tools::DeviceSpec, mount_point: &str, fstype: &too
                 .map_err(|_| format!(
                     "Mount {mount_point}: Btrfs subvolume '{subvol}' does not exist. \
                      systemd will fail to mount it and the system may hang at boot. \
-                     Create the subvolume or remove the fstab entry."));
+                     Create the subvolume or remove the fstab entry.").into());
         }
     }
 
@@ -480,23 +515,23 @@ fn check_fstab_entry(device: &tools::DeviceSpec, mount_point: &str, fstype: &too
 fn check_file_exists_nonempty(path: &Path) -> CheckResult {
     match fs::metadata(path) {
         Ok(meta) if meta.len() > 0 => Ok(()),
-        Ok(_) => Err(format!("{} exists but is empty", path.display())),
-        Err(_) => Err(format!("{} does not exist", path.display())),
+        Ok(_) => Err(format!("{} exists but is empty", path.display()).into()),
+        Err(_) => Err(format!("{} does not exist", path.display()).into()),
     }
 }
 
 fn check_file_contains(path: &Path, needle: &str, msg: &str) -> CheckResult {
     match fs::read_to_string(path) {
         Ok(content) if content.contains(needle) => Ok(()),
-        Ok(_) => Err(msg.to_string()),
-        Err(e) => Err(format!("Cannot read {}: {e}", path.display())),
+        Ok(_) => Err(msg.to_string().into()),
+        Err(e) => Err(format!("Cannot read {}: {e}", path.display()).into()),
     }
 }
 
 fn check_blkid_uuid_fstype(uuid: &tools::BareUuid, expected: tools::FsType) -> CheckResult {
     let fstype = tools::blkid_fstype(&tools::blkid_device_for_uuid(uuid)?)?;
     if fstype == expected { Ok(()) } else {
-        Err(format!("UUID={} has unexpected filesystem type", uuid.as_str()))
+        Err(format!("UUID={} has unexpected filesystem type", uuid.as_str()).into())
     }
 }
 
@@ -506,7 +541,7 @@ fn check_btrfs_subvol_exists(device_spec: &tools::DeviceSpec, name: &tools::Subv
     if entries.iter().any(|e| e.path == name.as_str()) {
         Ok(())
     } else {
-        Err(format!("subvolume '{name}' not found on {device_spec}"))
+        Err(format!("subvolume '{name}' not found on {device_spec}").into())
     }
 }
 
@@ -551,14 +586,25 @@ pub fn print_rollback_scope(fstab: &str) {
 }
 
 /// The root= UUID of the first boot entry GRUB reads.
-fn extract_root_uuid(grub: &GrubContext, blsdir: &Result<BlsDir, String>) -> Option<tools::BareUuid> {
-    for conf in bls_entry_paths(blsdir.as_ref().ok()?).ok()? {
-        let content = read_grub_file(grub, &conf).ok()?;
+fn extract_root_uuid(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Result<Option<tools::BareUuid>, Finding> {
+    let blsdir = match blsdir {
+        Ok(dir) => dir,
+        Err(Finding::Fails(_)) => return Ok(None),
+        Err(unverified) => return Err(unverified.clone()),
+    };
+    let confs = bls_entry_paths(blsdir).map_err(|e| Finding::CannotVerify(format!(
+        "cannot verify the boot entries in '{}': {e}", blsdir.grub_path)))?;
+    for conf in confs {
+        let content = match read_grub_file(grub, &conf) {
+            Ok(content) => content,
+            Err(Finding::Fails(_)) => return Ok(None),
+            Err(unverified) => return Err(unverified),
+        };
         if let Some(options) = parse::bls_field(&content, "options") {
-            return parse::extract_root_uuid_from_options(options);
+            return Ok(parse::extract_root_uuid_from_options(options));
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -722,12 +768,12 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
 
     fn fails_with(results: &[CheckResult], needle: &str) -> bool {
         !results.is_empty()
-            && results.iter().all(|r| r.is_err())
-            && results.iter().any(|r| r.as_ref().err().is_some_and(|e| e.contains(needle)))
+            && results.iter().all(|r| matches!(r, Err(Finding::Fails(_))))
+            && results.iter().any(|r| matches!(r, Err(Finding::Fails(e)) if e.contains(needle)))
     }
 
     fn refuses(results: &[CheckResult], needle: &str) -> bool {
-        results.iter().any(|r| r.as_ref().err().is_some_and(|e| e.contains(needle)))
+        results.iter().any(|r| matches!(r, Err(Finding::Fails(e)) if e.contains(needle)))
     }
 
     /// A system set up without migrate: /boot is ext4, outside the root
@@ -901,7 +947,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
 
         assert!(passes(&check_grub_cfg(&grub, None)), "{:?}", check_grub_cfg(&grub, None));
         assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
-        assert_eq!(extract_root_uuid(&grub, &grub.blsdir()).map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
+        assert_eq!(extract_root_uuid(&grub, &grub.blsdir()).unwrap().map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
         fs::remove_dir_all(&scratch_dir).unwrap();
     }
 
@@ -977,8 +1023,38 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         assert!(default_subvol_is_root(256, &root, 256).is_ok());
 
         let err = default_subvol_is_root(5, &root, 256).unwrap_err();
-        assert!(err.contains("GRUB and Linux see different root filesystems"), "{err}");
-        assert!(err.contains("set-default 256"), "{err}");
+        assert!(err.message().contains("GRUB and Linux see different root filesystems"), "{err}");
+        assert!(err.message().contains("set-default 256"), "{err}");
+    }
+
+    // --- what Linux will not let check read ---
+
+    // A directory check cannot read is no finding about GRUB: the boot
+    // chain may be valid, and check says it cannot verify it.
+    #[test]
+    fn an_unreadable_boot_entry_directory_cannot_be_verified() {
+        use std::os::unix::fs::PermissionsExt;
+        let top = scratch("unreadable-entries");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+        let locked = top.join("root/boot/loader");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::symlink_metadata(locked.join("entries")).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: this process reads directories without permission");
+            return;
+        }
+
+        let status = evaluate_checks(vec![("Kernel boot entry", bls_entries(&grub))]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        match status {
+            BootStatus::Inaccessible { reason, .. } => {
+                assert!(reason.contains("ermission denied") && !reason.contains("not found"), "{reason}");
+            }
+            BootStatus::Fail(failures) => panic!("reported as a failure: {failures:?}"),
+            _ => panic!("reported as verified"),
+        }
+        fs::remove_dir_all(&top).unwrap();
     }
 
     // --- what a failure names ---
@@ -989,7 +1065,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
 
     fn names_grub_path_not_mount(results: &[CheckResult], grub: &GrubContext, top: &Path, grub_path: &str) {
         let top = top.to_str().unwrap();
-        let errors: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        let errors: Vec<&str> = results.iter().filter_map(|r| r.as_ref().err()).map(Finding::message).collect();
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains(grub_path)), "{errors:?}");
         assert!(errors.iter().any(|e| e.contains(grub.starting_lookup_dir.describe())), "{errors:?}");
@@ -1035,7 +1111,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let results = bls_entries(&grub);
         let entry = format!("'/root/boot/loader/entries/{KVER}.conf'");
         assert!(fails_with(&results, &entry), "{results:?}");
-        assert!(results.iter().all(|r| r.as_ref().err().is_none_or(|e| !e.contains(top.to_str().unwrap()))), "{results:?}");
+        assert!(results.iter().all(|r| r.as_ref().err().is_none_or(|e| !e.message().contains(top.to_str().unwrap()))), "{results:?}");
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -1060,16 +1136,16 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
 
         put(&conf, &bls_entry(&linux, &[&initramfs, "/root/boot/absent.img"]));
         let err = validate_bls_entry(&grub, entry).unwrap_err();
-        assert!(err.contains("`/root/boot/absent.img'"), "{err}");
+        assert!(err.message().contains("`/root/boot/absent.img'"), "{err}");
 
         put(&conf, &bls_entry(&linux, &[&format!("{initramfs} /root/boot/absent.img $tuned_initrd")]));
         let err = validate_bls_entry(&grub, entry).unwrap_err();
-        assert!(err.contains("`/root/boot/absent.img'"), "{err}");
+        assert!(err.message().contains("`/root/boot/absent.img'"), "{err}");
 
         // The Fedora 44 failure reaches initrd too.
         put(&conf, &bls_entry(&linux, &[&format!("/initramfs-{KVER}.img")]));
         let err = validate_bls_entry(&grub, entry).unwrap_err();
-        assert!(err.contains(&format!("`/initramfs-{KVER}.img'")), "{err}");
+        assert!(err.message().contains(&format!("`/initramfs-{KVER}.img'")), "{err}");
 
         fs::remove_dir_all(&top).unwrap();
     }
