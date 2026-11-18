@@ -131,29 +131,45 @@ pub struct GrubContext {
     _mount: Option<tools::MountPoint>,
 }
 
-fn read_esp_stub(path: &Path) -> Result<tools::EspStub, GrubContextError> {
-    let content = fs::read_to_string(path).map_err(|e| match e.kind() {
+/// The text of the ESP stub, the grub.cfg GRUB runs first.
+fn read_esp_stub(path: &Path) -> Result<String, GrubContextError> {
+    fs::read_to_string(path).map_err(|e| match e.kind() {
         io::ErrorKind::PermissionDenied => GrubContextError::EspUnreadable { path: path.to_path_buf() },
         _ => GrubContextError::Other(format!("cannot read ESP grub.cfg: {e}")),
-    })?;
-    reject_btrfs_subvol_variables(&content)?;
-    Ok(tools::parse_esp_stub(&content)?)
+    })
+}
+
+/// The stub's contract values, with the block device holding the
+/// filesystem it names and that filesystem's type. Refuses a stub whose
+/// resolution check does not model.
+fn boot_filesystem(content: &str) -> Result<(tools::EspStub, tools::DevicePath, tools::FsType), String> {
+    let stub = tools::parse_esp_stub(content)?;
+    let (device, fstype) = boot_device(&stub)?;
+    reject_btrfs_subvol_variables(content, &stub, &fstype)?;
+    Ok((stub, device, fstype))
 }
 
 /// Variables that point GRUB's Btrfs driver at a named subvolume
-/// (grub-core/fs/btrfs.c, btrfs_handle_subvol). Neither Fedora's
-/// gen_grub_cfgstub nor migrate writes them.
+/// (Fedora's grub2 2.12 patches, grub-core/fs/btrfs.c,
+/// btrfs_handle_subvol). Neither Fedora's gen_grub_cfgstub nor migrate
+/// writes them.
 const BTRFS_SUBVOL_VARIABLES: [&str; 2] = ["btrfs_subvol", "btrfs_subvolid"];
 
-/// Refuses a stub that sets btrfs_subvol or btrfs_subvolid: check does not
-/// model where GRUB resolves paths under either.
-fn reject_btrfs_subvol_variables(content: &str) -> Result<(), String> {
+/// Refuses a stub that sets btrfs_subvol or btrfs_subvolid where GRUB reads
+/// them: on Btrfs, with btrfs_relative_path set, before configfile hands
+/// over (Fedora's grub2 2.12 patches, grub-core/fs/btrfs.c,
+/// grub_btrfs_mount and find_path). check does not model where GRUB
+/// resolves paths under either.
+fn reject_btrfs_subvol_variables(content: &str, stub: &tools::EspStub, fstype: &tools::FsType) -> Result<(), String> {
+    if *fstype != tools::FsType::Btrfs || !stub.btrfs_relative {
+        return Ok(());
+    }
     match BTRFS_SUBVOL_VARIABLES.into_iter()
-        .find(|name| content.lines().any(|line| tools::grub_assignment(line, name).is_some()))
+        .find(|name| tools::before_configfile(content).any(|line| tools::grub_assignment(line, name).is_some()))
     {
         Some(name) => Err(format!(
-            "ESP grub.cfg sets {name}, which neither Fedora nor atomic-rollback writes. \
-             check cannot tell which subvolume GRUB resolves paths from")),
+            "ESP grub.cfg sets {name}, which neither Fedora nor atomic-rollback writes, \
+             with btrfs_relative_path. check cannot tell which subvolume GRUB resolves paths from")),
         None => Ok(()),
     }
 }
@@ -170,8 +186,8 @@ impl GrubContext {
     /// otherwise uses the filesystem's mount point, mounting it at a
     /// temporary mount point if needed.
     pub fn from_system(root: &Path) -> Result<Self, GrubContextError> {
-        let stub = read_esp_stub(&root.join(&P.esp_dir[1..]).join("grub.cfg"))?;
-        let (device, fstype) = boot_device(&stub)?;
+        let content = read_esp_stub(&root.join(&P.esp_dir[1..]).join("grub.cfg"))?;
+        let (stub, device, fstype) = boot_filesystem(&content)?;
 
         let mount = if fstype == tools::FsType::Btrfs {
             if !tools::is_root() {
@@ -195,8 +211,8 @@ impl GrubContext {
     /// the snapshot, so its live mount point is used, mounting it at a
     /// temporary mount point if needed.
     pub fn for_snapshot(toplevel: &Path, exchange: &RenameExchange) -> Result<Self, GrubContextError> {
-        let stub = read_esp_stub(&Path::new(P.esp_dir).join("grub.cfg"))?;
-        let (device, fstype) = boot_device(&stub)?;
+        let content = read_esp_stub(&Path::new(P.esp_dir).join("grub.cfg"))?;
+        let (stub, device, fstype) = boot_filesystem(&content)?;
 
         let mount = if fstype == tools::FsType::Btrfs {
             None
@@ -444,34 +460,56 @@ configfile $prefix/grub.cfg
 
     // --- btrfs_subvol variables in the stub ---
 
-    fn read_stub(name: &str, content: &str) -> Result<tools::EspStub, GrubContextError> {
-        let path = std::env::temp_dir().join(format!("atomic-rollback-test-stub-{name}.cfg"));
-        fs::write(&path, content).unwrap();
-        let stub = read_esp_stub(&path);
-        fs::remove_file(&path).unwrap();
-        stub
+    /// check's verdict on the stub content, on a boot filesystem of type
+    /// fstype.
+    fn btrfs_subvol_verdict(content: &str, fstype: FsType) -> Result<(), String> {
+        reject_btrfs_subvol_variables(content, &tools::parse_esp_stub(content).unwrap(), &fstype)
     }
 
-    fn refused_naming(stub: Result<tools::EspStub, GrubContextError>, variable: &str) -> bool {
-        matches!(stub, Err(GrubContextError::Other(msg)) if msg.contains(&format!("sets {variable},")))
+    fn refused_naming(verdict: Result<(), String>, variable: &str) -> bool {
+        verdict.is_err_and(|msg| msg.contains(&format!("sets {variable},")))
+    }
+
+    const BTRFS_SUBVOL: &str = "set btrfs_subvol=\"@/.snapshots/1/snapshot\"\n";
+    const BTRFS_SUBVOLID: &str = "btrfs_subvolid=256\n";
+
+    #[test]
+    fn btrfs_subvol_with_btrfs_relative_path_is_refused() {
+        let stub = format!("{BTRFS_SUBVOL}{STUB_MIGRATED}");
+        assert!(refused_naming(btrfs_subvol_verdict(&stub, FsType::Btrfs), "btrfs_subvol"));
     }
 
     #[test]
-    fn stub_setting_btrfs_subvol_is_refused() {
-        let stub = STUB_MIGRATED.replacen("search", "set btrfs_subvol=\"@/.snapshots/1/snapshot\"\nsearch", 1);
-        assert!(refused_naming(read_stub("subvol", &stub), "btrfs_subvol"));
+    fn btrfs_subvolid_with_btrfs_relative_path_is_refused() {
+        let stub = format!("{BTRFS_SUBVOLID}{STUB_MIGRATED}");
+        assert!(refused_naming(btrfs_subvol_verdict(&stub, FsType::Btrfs), "btrfs_subvolid"));
+    }
+
+    // GRUB's Btrfs driver reads btrfs_subvol and btrfs_subvolid only when
+    // btrfs_relative_path is set (Fedora's grub2 2.12 patches,
+    // grub-core/fs/btrfs.c, grub_btrfs_mount and find_path).
+    #[test]
+    fn btrfs_subvol_variables_without_btrfs_relative_path_are_ignored() {
+        let stub = format!("{BTRFS_SUBVOL}{BTRFS_SUBVOLID}{STUB_FEDORA}");
+        assert_eq!(btrfs_subvol_verdict(&stub, FsType::Btrfs), Ok(()));
     }
 
     #[test]
-    fn stub_setting_btrfs_subvolid_is_refused() {
-        let stub = STUB_FEDORA.replacen("search", "btrfs_subvolid=256\nsearch", 1);
-        assert!(refused_naming(read_stub("subvolid", &stub), "btrfs_subvolid"));
+    fn btrfs_subvol_variables_off_btrfs_are_ignored() {
+        let stub = format!("{BTRFS_SUBVOL}{BTRFS_SUBVOLID}{STUB_MIGRATED}");
+        assert_eq!(btrfs_subvol_verdict(&stub, FsType::Ext4), Ok(()));
     }
 
     #[test]
-    fn stubs_fedora_and_migrate_write_are_read() {
-        assert!(read_stub("fedora", STUB_FEDORA).is_ok());
-        assert!(read_stub("migrated", STUB_MIGRATED).is_ok());
+    fn btrfs_subvol_variables_after_configfile_are_ignored() {
+        let stub = format!("{STUB_MIGRATED}{BTRFS_SUBVOL}{BTRFS_SUBVOLID}");
+        assert_eq!(btrfs_subvol_verdict(&stub, FsType::Btrfs), Ok(()));
+    }
+
+    #[test]
+    fn stubs_fedora_and_migrate_write_are_accepted() {
+        assert_eq!(btrfs_subvol_verdict(STUB_FEDORA, FsType::Btrfs), Ok(()));
+        assert_eq!(btrfs_subvol_verdict(STUB_MIGRATED, FsType::Btrfs), Ok(()));
     }
 
     // --- grubenv ---
