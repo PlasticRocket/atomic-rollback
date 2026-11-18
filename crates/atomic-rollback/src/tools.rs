@@ -273,6 +273,42 @@ pub fn btrfs_subvol_list(mount_point: &str) -> Result<Vec<SubvolEntry>, String> 
         .collect()
 }
 
+/// A subvolume with its origin generation (ogen): the filesystem
+/// generation in which the subvolume was created (btrfs-subvolume(8),
+/// list -c). Creation order is ogen order; btrfs promises no order of IDs.
+/// Output grammar of `btrfs subvolume list -c`:
+///   "ID " u64 " gen " u64 " cgen " u64 " top level " u64 " path " string "\n"
+pub struct SubvolOgen {
+    pub id: u64,
+    pub ogen: u64,
+    pub path: String,
+}
+
+/// Parses one line of `btrfs subvolume list -c` output. Sentinel-based
+/// like parse_subvol_line, because the path can contain spaces.
+fn parse_subvol_ogen_line(line: &str) -> Option<SubvolOgen> {
+    let rest = line.strip_prefix("ID ")?;
+    let (id_str, rest) = rest.split_once(" gen ")?;
+    let (_gen_str, rest) = rest.split_once(" cgen ")?;
+    let (ogen_str, rest) = rest.split_once(" top level ")?;
+    let (_top_str, path) = rest.split_once(" path ")?;
+    Some(SubvolOgen {
+        id: id_str.parse().ok()?,
+        ogen: ogen_str.parse().ok()?,
+        path: path.to_string(),
+    })
+}
+
+/// Lists all subvolumes on the filesystem containing mount_point, with
+/// their origin generations.
+pub fn btrfs_subvol_list_ogen(mount_point: &str) -> Result<Vec<SubvolOgen>, String> {
+    let out = run_stdout("btrfs", &["subvolume", "list", "-c", mount_point])?;
+    out.lines()
+        .map(|line| parse_subvol_ogen_line(line)
+            .ok_or_else(|| format!("cannot parse subvol line: {line}")))
+        .collect()
+}
+
 /// The default subvolume, as btrfs subvolume get-default reports it.
 pub enum DefaultSubvol {
     /// The top-level subvolume itself.
@@ -345,6 +381,65 @@ pub fn is_btrfs_subvolume_root(path: &Path) -> std::io::Result<bool> {
 #[cfg(not(target_os = "linux"))]
 pub fn is_btrfs_subvolume_root(_path: &Path) -> std::io::Result<bool> {
     Ok(false)
+}
+
+// Btrfs ioctls (include/uapi/linux/btrfs.h). Request numbers are built as
+// include/uapi/asm-generic/ioctl.h builds them, which x86_64 and aarch64,
+// the architectures the package is built for, both use.
+#[cfg(target_os = "linux")]
+const BTRFS_IOCTL_MAGIC: u64 = 0x94;
+#[cfg(target_os = "linux")]
+const IOC_WRITE: u64 = 1;
+#[cfg(target_os = "linux")]
+const IOC_READ: u64 = 2;
+
+#[cfg(target_os = "linux")]
+const fn ioc(dir: u64, nr: u64, size: usize) -> u64 {
+    (dir << 30) | ((size as u64) << 16) | (BTRFS_IOCTL_MAGIC << 8) | nr
+}
+
+// struct btrfs_ioctl_ino_lookup_args.
+#[cfg(target_os = "linux")]
+const BTRFS_INO_LOOKUP_PATH_MAX: usize = 4080;
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct BtrfsIoctlInoLookupArgs {
+    treeid: u64,
+    objectid: u64,
+    _name: [u8; BTRFS_INO_LOOKUP_PATH_MAX],
+}
+#[cfg(target_os = "linux")]
+const BTRFS_IOC_INO_LOOKUP: u64 =
+    ioc(IOC_READ | IOC_WRITE, 18, std::mem::size_of::<BtrfsIoctlInoLookupArgs>());
+
+/// The ID of the subvolume containing path, as libbtrfsutil's
+/// btrfs_util_subvolume_id_fd finds it (btrfs-progs
+/// libbtrfsutil/subvolume.c): BTRFS_IOC_INO_LOOKUP of the subvolume's root
+/// directory (BTRFS_FIRST_FREE_OBJECTID) with treeid 0, which the kernel
+/// fills with the subvolume's ID.
+#[cfg(target_os = "linux")]
+pub fn btrfs_subvolume_id(path: &str) -> Result<u64, String> {
+    use std::os::fd::AsRawFd;
+    use crate::consts::BTRFS_FIRST_FREE_OBJECTID;
+
+    let dir = fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    let mut args = BtrfsIoctlInoLookupArgs {
+        treeid: 0,
+        objectid: BTRFS_FIRST_FREE_OBJECTID,
+        _name: [0; BTRFS_INO_LOOKUP_PATH_MAX],
+    };
+    // SAFETY: args is a btrfs_ioctl_ino_lookup_args, the size the request
+    // number encodes, and the kernel writes only within it.
+    let ret = unsafe { libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_INO_LOOKUP as libc::Ioctl, &mut args) };
+    if ret != 0 {
+        return Err(format!("BTRFS_IOC_INO_LOOKUP {path}: {}", std::io::Error::last_os_error()));
+    }
+    Ok(args.treeid)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn btrfs_subvolume_id(_path: &str) -> Result<u64, String> {
+    unreachable!("atomic-rollback is a Linux-only tool")
 }
 
 /// Sets the default subvolume for the filesystem at mount_point.
@@ -891,6 +986,23 @@ mod tests {
     #[test]
     fn default_subvol_rejects_other_output() {
         assert!(parse_default_subvol("ERROR: not a btrfs filesystem").is_none());
+    }
+
+    // Lines as btrfs-progs 7.1 prints them for `btrfs subvolume list -c`.
+    #[test]
+    fn subvol_ogen_reads_the_creation_generation() {
+        let entry = parse_subvol_ogen_line("ID 256 gen 362 cgen 9 top level 5 path root").unwrap();
+        assert_eq!((entry.id, entry.ogen, entry.path.as_str()), (256, 9, "root"));
+
+        let entry = parse_subvol_ogen_line(
+            "ID 290 gen 374098 cgen 374097 top level 5 path my snapshot").unwrap();
+        assert_eq!((entry.id, entry.ogen, entry.path.as_str()), (290, 374097, "my snapshot"));
+    }
+
+    #[test]
+    fn subvol_ogen_rejects_a_line_without_cgen() {
+        assert!(parse_subvol_ogen_line("ID 256 gen 362 top level 5 path root").is_none());
+        assert!(parse_subvol_ogen_line("ID 256 gen 362 cgen x top level 5 path root").is_none());
     }
 
     fn stub_with(assignment: &str) -> bool {
