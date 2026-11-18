@@ -28,9 +28,9 @@ with Fedora 44, including on the upgrade from 43.
   `set btrfs_relative_path=1`, press Enter, then press Esc and choose your entry. This is needed
   on each boot until the fix is released.
 
-`atomic-rollback check` now detects this: it resolves boot paths the way GRUB does, so it
-reports each menu entry GRUB cannot find. Fixes for both are in progress, and Fedora 44
-and 45 builds will follow them.
+From the next release, `atomic-rollback check` detects this: it resolves boot paths the way
+GRUB does, so it reports each menu entry GRUB cannot find. A fix for the GRUB updates
+themselves is in progress, and Fedora 44 and 45 builds will follow it.
 
 ## Install
 
