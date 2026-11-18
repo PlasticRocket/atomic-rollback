@@ -432,10 +432,11 @@ impl GrubContext {
         })
     }
 
-    /// The Linux path of the directory blscfg reads boot entries from.
-    /// blscfg scans the blsdir variable, which grub.cfg loads from
-    /// $prefix/grubenv (util/grub.d/00_header.in), or BLS_CONFIG_PATH when
-    /// it is unset, then BOOT_BLS_CONFIG_PATH if listing that fails.
+    /// The directory blscfg reads boot entries from. blscfg (Fedora's grub2
+    /// 2.12 patches, grub-core/commands/blscfg.c, find_entry) lists the
+    /// blsdir variable, which grub.cfg loads from $prefix/grubenv
+    /// (util/grub.d/00_header.in), or BLS_CONFIG_PATH when it is unset, then
+    /// BOOT_BLS_CONFIG_PATH if listing that fails.
     pub fn blsdir(&self) -> Result<BlsDir, String> {
         // A grubenv GRUB cannot read loads nothing, as when it is absent.
         let grubenv = self.find_file(&self.grub_dir_file("grubenv")).ok()
