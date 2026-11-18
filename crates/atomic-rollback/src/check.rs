@@ -54,19 +54,32 @@ fn evaluate_checks(checks: Vec<(&str, Vec<CheckResult>)>) -> BootStatus {
     }
 }
 
+/// The status when check cannot build the GrubContext. A cause that needs
+/// root is inaccessible, with the hint for that cause; command is the
+/// atomic-rollback command to run as root. Any other cause is a failure,
+/// described by describe.
+fn context_unavailable(e: GrubContextError, command: &str, describe: impl FnOnce(String) -> String) -> BootStatus {
+    match e {
+        GrubContextError::EspUnreadable { path } => BootStatus::Inaccessible {
+            reason: format!("permission denied reading {}", path.display()),
+            hint: format!("The ESP grub.cfg is readable only by root on Fedora. \
+                           Run: sudo atomic-rollback {command}"),
+        },
+        GrubContextError::MountNotPermitted => BootStatus::Inaccessible {
+            reason: "mounting the Btrfs top-level subvolume requires root".into(),
+            hint: format!("check mounts the Btrfs top-level subvolume read-only to read the files GRUB reads. \
+                           Run: sudo atomic-rollback {command}"),
+        },
+        GrubContextError::Other(msg) => BootStatus::Fail(vec![describe(msg)]),
+    }
+}
+
 pub fn verify_bootable(root: &Path) -> BootStatus {
     let grub = match GrubContext::from_system(root) {
         Ok(g) => g,
-        Err(GrubContextError::PermissionDenied { reason }) => return BootStatus::Inaccessible {
-            reason,
-            hint: "check reads the ESP grub.cfg, which is root-readable only on Fedora, \
-                   and mounts the Btrfs top-level subvolume read-only. \
-                   Run: sudo atomic-rollback check".into(),
-        },
-        Err(GrubContextError::Other(msg)) => return BootStatus::Fail(vec![format!(
+        Err(e) => return context_unavailable(e, "check", |msg| format!(
             "Cannot determine how GRUB boots this system: {msg}. \
-             Ensure {}/grub.cfg exists and the root filesystem is mounted.", P.esp_dir
-        )]),
+             Ensure {}/grub.cfg exists and the root filesystem is mounted.", P.esp_dir)),
     };
     println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
 
@@ -86,14 +99,9 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
 pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> BootStatus {
     let grub = match GrubContext::for_snapshot(toplevel, exchange) {
         Ok(g) => g,
-        Err(GrubContextError::PermissionDenied { reason }) => return BootStatus::Inaccessible {
-            reason,
-            hint: "The ESP grub.cfg is root-readable only on Fedora. Run as root.".into(),
-        },
-        Err(GrubContextError::Other(msg)) => return BootStatus::Fail(vec![format!(
+        Err(e) => return context_unavailable(e, "rollback", |msg| format!(
             "Cannot determine boot configuration: {msg}. \
-             Ensure {}/grub.cfg exists.", P.esp_dir
-        )]),
+             Ensure {}/grub.cfg exists.", P.esp_dir)),
     };
     println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
 
@@ -551,6 +559,27 @@ fn extract_root_uuid(grub: &GrubContext) -> Option<tools::BareUuid> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
+
+    fn hint(status: BootStatus) -> String {
+        match status {
+            BootStatus::Inaccessible { hint, .. } => hint,
+            _ => panic!("a cause that needs root is reported as inaccessible"),
+        }
+    }
+
+    // A non-root check on a system whose /boot is ext4 stops at the ESP
+    // grub.cfg; its hint names only that file.
+    #[test]
+    fn each_cause_that_needs_root_has_its_own_hint() {
+        let esp = hint(context_unavailable(
+            GrubContextError::EspUnreadable { path: PathBuf::from("/boot/efi/EFI/fedora/grub.cfg") },
+            "check", |msg| msg));
+        assert!(esp.contains("ESP grub.cfg") && !esp.contains("mount"), "{esp}");
+
+        let mount = hint(context_unavailable(GrubContextError::MountNotPermitted, "check", |msg| msg));
+        assert!(mount.contains("mounts the Btrfs top-level subvolume") && !mount.contains("ESP"), "{mount}");
+    }
 
     #[test]
     fn check_esp_uses_arch_correct_filenames() {
@@ -603,8 +632,6 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     //
     // Each scratch directory stands in for the directory GRUB starts from
     // (the mounted top-level subvolume, or the boot partition's root).
-
-    use std::path::PathBuf;
 
     const KVER: &str = "6.19.9-200.fc45.x86_64";
 
