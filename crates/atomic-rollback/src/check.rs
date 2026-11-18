@@ -7,7 +7,8 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::grub::{BlsDir, Finding, StartingLookupDir, GrubContext, GrubContextError};
+use crate::grub::{self, BlsDir, Finding, StartingLookupDir, GrubContext, GrubContextError};
+use crate::menu;
 use crate::parse;
 use crate::platform::FEDORA as P;
 use crate::swap::RenameExchange;
@@ -27,27 +28,55 @@ pub enum BootStatus {
     Inaccessible { reason: String, hint: String },
 }
 
+/// What a group of checks found: the results its verdict rests on, what
+/// that verdict counted, and warnings, which do not decide it.
+#[derive(Default)]
+struct Group {
+    results: Vec<CheckResult>,
+    counted: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl From<Vec<CheckResult>> for Group {
+    fn from(results: Vec<CheckResult>) -> Self {
+        Group { results, ..Group::default() }
+    }
+}
+
 /// A failure in any group fails the boot chain. Otherwise a group check
 /// cannot verify leaves the boot chain unverified, since it may be valid.
-fn evaluate_checks(checks: Vec<(&str, Vec<CheckResult>)>) -> BootStatus {
+/// A warning makes a valid boot chain one with warnings.
+fn evaluate_checks(checks: Vec<(&str, Group)>) -> BootStatus {
     let mut all_failures = Vec::new();
     let mut all_unverified = Vec::new();
+    let (mut unread, mut unevaluated) = (false, false);
     let mut warned = false;
-    for (name, results) in &checks {
-        if results.is_empty() {
-            warned = true; // Check group handled its own WARN display
-            continue;
-        }
-        let failures: Vec<&String> = results.iter()
+    for (name, group) in &checks {
+        let failures: Vec<&String> = group.results.iter()
             .filter_map(|r| match r { Err(Finding::Fails(f)) => Some(f), _ => None }).collect();
-        let unverified: Vec<&String> = results.iter()
-            .filter_map(|r| match r { Err(Finding::CannotVerify(f)) => Some(f), _ => None }).collect();
+        let unverified: Vec<&String> = group.results.iter()
+            .filter_map(|r| match r {
+                Err(Finding::CannotVerify(f)) => {
+                    unread = true;
+                    Some(f)
+                }
+                Err(Finding::NotEvaluated(f)) => {
+                    unevaluated = true;
+                    Some(f)
+                }
+                _ => None,
+            }).collect();
         if !failures.is_empty() {
             println!("  FAIL  {name}");
         } else if !unverified.is_empty() {
             println!("  CANNOT VERIFY  {name}");
+        } else if !group.warnings.is_empty() {
+            println!("  WARN  {name}");
         } else {
             println!("  PASS  {name}");
+        }
+        for line in &group.counted {
+            println!("        {line}");
         }
         for f in &failures {
             println!("        {f}");
@@ -57,15 +86,24 @@ fn evaluate_checks(checks: Vec<(&str, Vec<CheckResult>)>) -> BootStatus {
             println!("        {f}");
             all_unverified.push(format!("{name}: {f}"));
         }
+        for warning in &group.warnings {
+            println!("        {warning}");
+        }
+        warned |= !group.warnings.is_empty();
     }
     if !all_failures.is_empty() {
         BootStatus::Fail(all_failures)
     } else if !all_unverified.is_empty() {
-        BootStatus::Inaccessible {
-            reason: all_unverified.join("; "),
-            hint: "check could not read a file GRUB reads, so the boot chain may still be valid. \
-                   Fix the error above and run check again.".into(),
+        let mut hint = Vec::new();
+        if unread {
+            hint.push("check could not read a file GRUB reads, so the boot chain may still be valid. \
+                       Fix the error above and run check again.");
         }
+        if unevaluated {
+            hint.push("check does not evaluate what GRUB does at the point named above, \
+                       so the boot chain may still be valid.");
+        }
+        BootStatus::Inaccessible { reason: all_unverified.join("; "), hint: hint.join(" ") }
     } else if warned {
         BootStatus::Warn
     } else {
@@ -108,11 +146,11 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
 
     let blsdir = grub.blsdir();
     evaluate_checks(vec![
-        ("EFI boot files", check_esp(root)),
-        ("GRUB configuration", check_grub_config(root, &grub)),
+        ("EFI boot files", check_esp(root).into()),
+        ("GRUB configuration", check_grub_config(root, &grub).into()),
         ("Kernel boot entry", check_bls_entries(&grub, &blsdir)),
-        ("Root filesystem", check_root_mountable(root, &grub, &blsdir)),
-        ("System mounts", check_fstab_mounts(root)),
+        ("Root filesystem", check_root_mountable(root, &grub, &blsdir).into()),
+        ("System mounts", check_fstab_mounts(root).into()),
     ])
 }
 
@@ -132,10 +170,10 @@ pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> B
     let snapshot = toplevel.join(exchange.snapshot.as_str());
     let blsdir = grub.blsdir();
     evaluate_checks(vec![
-        ("GRUB configuration", check_grub_cfg(&grub, None)),
+        ("GRUB configuration", check_grub_cfg(&grub, None).into()),
         ("Kernel boot entry", check_bls_entries(&grub, &blsdir)),
-        ("Root filesystem", check_root_mountable(&snapshot, &grub, &blsdir)),
-        ("System mounts", check_fstab_mounts(&snapshot)),
+        ("Root filesystem", check_root_mountable(&snapshot, &grub, &blsdir).into()),
+        ("System mounts", check_fstab_mounts(&snapshot).into()),
     ])
 }
 
@@ -256,11 +294,12 @@ fn check_grub_cfg(grub: &GrubContext, remedy: Option<&str>) -> Vec<CheckResult> 
         } else {
             Ok(())
         },
-        if content.contains("blscfg") {
-            Ok(())
-        } else {
-            Err(format!("GRUB configuration does not use Boot Loader Specification entries. \
-                         Kernel boot entries will not appear in the GRUB menu.{remedy}").into())
+        match grub::runs_blscfg(&content) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!("GRUB configuration does not use Boot Loader Specification entries: \
+                                      '{grub_path}' runs no blscfg command. \
+                                      Kernel boot entries will not appear in the GRUB menu.{remedy}").into()),
+            Err(why) => Err(Finding::NotEvaluated(why)),
         },
     ]
 }
@@ -304,97 +343,248 @@ fn default_subvol_is_root(default_id: u64, root_subvol_name: &tools::SubvolName,
 
 // --- Kernel boot entry ---
 
+/// A menu entry blscfg adds, and whether GRUB finds its kernel and
+/// initramfs.
+struct MenuEntry {
+    conf: String,
+    item: menu::MenuItem,
+    verdict: CheckResult,
+}
+
+impl MenuEntry {
+    /// The entry as check's output names it: its title, its GRUB path and
+    /// its place in the menu.
+    fn describe(&self, index: usize) -> String {
+        format!("'{}' ('{}', entry {} of the menu)", self.item.title, self.conf, index + 1)
+    }
+}
+
 /// blsdir is the directory blscfg reads boot entries from, as
-/// GrubContext::blsdir finds it.
-fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Vec<CheckResult> {
+/// GrubContext::blsdir finds it. The verdict rests on the entry GRUB boots
+/// when no key is pressed: the one normal mode picks from default when the
+/// menu runs (grub-core/normal/menu.c, run_menu). Another menu entry that
+/// does not resolve is a warning.
+fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Group {
     let blsdir = match blsdir {
         Ok(dir) => dir,
-        Err(finding) => return vec![Err(finding.clone().map_fails(|e| format!("{e}. GRUB will show an empty menu.")))],
+        Err(finding) => return vec![Err(finding.clone().map_fails(|e| format!("{e}. GRUB will show an empty menu.")))].into(),
     };
 
-    let confs = match bls_entry_paths(blsdir) {
-        Ok(confs) => confs,
-        Err(finding) => return vec![Err(finding)],
+    let entries = match blscfg_entries(grub, blsdir) {
+        Ok(entries) => entries,
+        Err(finding) => return vec![Err(finding)].into(),
     };
 
-    // Validate ALL entries, not just until the first valid one
-    let mut valid = 0;
-    let mut failures: Vec<String> = Vec::new();
-    let mut unverified: Vec<String> = Vec::new();
-    for conf in &confs {
-        let content = match read_grub_file(&grub.at_blscfg, conf) {
+    let mut menu = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
+    let mut left_out: Vec<String> = Vec::new();
+    for entry in &entries {
+        let content = match &entry.content {
             Ok(content) => content,
-            // blscfg skips a file it cannot open (Fedora's grub2 2.12
-            // patches, grub-core/commands/blscfg.c, read_entry).
-            Err(Finding::Fails(_)) => continue,
-            Err(Finding::CannotVerify(e)) => {
-                unverified.push(e);
+            Err(e) => {
+                unread.push(e.clone());
                 continue;
             }
         };
-        match validate_bls_entry(grub, conf, &content) {
-            Ok(()) => valid += 1,
-            Err(Finding::Fails(e)) => failures.push(e),
-            Err(Finding::CannotVerify(e)) => unverified.push(e),
-        }
+        // create_entry leaves an entry without linux out of the menu, and
+        // titles one without a title by its linux value (Fedora's grub2
+        // 2.12 patches, grub-core/commands/blscfg.c).
+        let Some(linux) = parse::bls_field(content, "linux") else {
+            left_out.push(format!("'{}', which has no linux line", entry.conf));
+            continue;
+        };
+        let Some(id) = menu::bls_menu_id(&entry.name) else {
+            return vec![Err(format!(
+                "GRUB never shows its menu: blscfg's create_entry loops forever stripping \".conf\" from \
+                 the name of '{}', which without its final \".conf\" still holds \".conf\" before its end. \
+                 Rename the entry.", entry.conf).into())].into();
+        };
+        menu.push(MenuEntry {
+            conf: entry.conf.clone(),
+            item: menu::MenuItem { id: id.to_string(), title: parse::bls_field(content, "title").unwrap_or(linux).to_string() },
+            verdict: validate_bls_entry(grub, &entry.conf, content, linux),
+        });
     }
 
-    let total = valid + failures.len() + unverified.len();
+    let not_booted_by_default = |picked: &[usize]| -> Vec<String> {
+        menu.iter().enumerate()
+            .filter(|(i, _)| !picked.contains(i))
+            .filter_map(|(i, entry)| entry.verdict.as_ref().err()
+                .map(|finding| format!("{}, which GRUB does not boot by default: {finding}", entry.describe(i))))
+            .collect()
+    };
 
-    if total == 0 {
+    if !unread.is_empty() {
+        // An entry check cannot read may stand anywhere in the menu.
+        return Group {
+            results: unread.into_iter().map(|e| Err(Finding::CannotVerify(e))).collect(),
+            warnings: not_booted_by_default(&[]),
+            ..Group::default()
+        };
+    }
+
+    if menu.is_empty() {
+        let left_out = if left_out.is_empty() { String::new() } else {
+            format!(" blscfg leaves out {}.", left_out.join("; "))
+        };
         return vec![Err(format!(
-            "No boot entries found in '{}'. \
+            "No boot entries found in '{}'.{left_out} \
              GRUB will show an empty menu with no kernels to boot. \
              Reinstall the kernel: sudo dnf reinstall kernel-core",
-            blsdir.grub_path).into())];
+            blsdir.grub_path).into())].into();
     }
 
-    if valid == total {
-        return vec![Ok(())];
-    }
-
-    if valid > 0 {
-        // System boots but some entries are broken or unverified. WARN,
-        // not PASS. Print here; return empty so evaluate_checks skips this
-        // group.
-        println!("  WARN  Kernel boot entry ({valid} of {total} valid)");
-        for f in failures.iter().chain(&unverified) {
-            println!("        {f}");
+    let config = &grub.menu;
+    let items: Vec<menu::MenuItem> = menu.iter().map(|entry| entry.item.clone()).collect();
+    let (picks, chosen) = match &config.default {
+        Ok(default) => (
+            menu::default_picks(default.as_ref().map(|d| d.value.as_str()), &items, &config.added),
+            match default {
+                Some(d) => format!("default is '{}' (from {})", d.value, d.origin),
+                None => "default is unset".to_string(),
+            },
+        ),
+        Err(why) => {
+            let mut picks: Vec<menu::Pick> = (0..menu.len()).map(menu::Pick::Bls).collect();
+            if !config.added.entries.is_empty() {
+                picks.push(menu::Pick::Added(None));
+            }
+            (picks, format!("check cannot tell default: {why}"))
         }
-        return vec![];
+    };
+    let picked: Vec<usize> = picks.iter().filter_map(|pick| match pick {
+        menu::Pick::Bls(i) => Some(*i),
+        menu::Pick::Added(_) => None,
+    }).collect();
+    let added: Vec<Option<usize>> = picks.iter().filter_map(|pick| match pick {
+        menu::Pick::Added(k) => Some(*k),
+        menu::Pick::Bls(_) => None,
+    }).collect();
+    let warnings = not_booted_by_default(&picked);
+    let verdict = |results: Vec<CheckResult>, counted: Vec<String>| Group { results, counted, warnings: warnings.clone() };
+
+    let mut named: Vec<String> = picked.iter().map(|&i| menu[i].describe(i)).collect();
+    named.extend(added.iter().map(|k| match k.and_then(|k| config.added.entries[k].title.as_deref()) {
+        Some(title) => format!("'{title}', an entry grub.cfg adds after the boot entries"),
+        None => "an entry grub.cfg adds after the boot entries".to_string(),
+    }));
+    let booted = match named.as_slice() {
+        [one] => format!("GRUB boots {one} when no key is pressed"),
+        several => format!("GRUB boots one of {} when no key is pressed", several.join("; ")),
+    };
+    let findings: Vec<&Finding> = picked.iter().filter_map(|&i| menu[i].verdict.as_ref().err()).collect();
+
+    // An entry grub.cfg adds, such as firmware setup or another system, is
+    // the user's choice and no boot entry check verifies: check says so and
+    // verifies the boot entries, which pass while one resolves.
+    if !added.is_empty() {
+        let resolving = menu.iter().filter(|entry| entry.verdict.is_ok()).count();
+        if resolving == 0 {
+            let message = format!("{booted}: {chosen}. check does not verify that entry, and no boot entry resolves.");
+            return if menu.iter().all(|entry| matches!(entry.verdict, Err(Finding::Fails(_)))) {
+                verdict(vec![Err(Finding::Fails(message))], vec![])
+            } else {
+                verdict(vec![Err(Finding::NotEvaluated(message))], vec![])
+            };
+        }
+        if findings.is_empty() {
+            return verdict(vec![Ok(())], vec![format!(
+                "{booted}: {chosen}. check does not verify that entry; {resolving} of the {} boot entries resolve. \
+                 check does not count the menu's timeout or a password an entry needs.", menu.len())]);
+        }
+        let detail = findings.iter().map(|finding| finding.message()).collect::<Vec<_>>().join(" ");
+        return verdict(vec![Err(Finding::NotEvaluated(format!("{booted}: {chosen}. {detail}")))], vec![]);
     }
 
-    // No entry is valid, but one check cannot verify may be: whether GRUB
-    // boots is unknown, and the broken entries are listed with it.
-    if !unverified.is_empty() {
-        return unverified.into_iter().chain(failures).map(|e| Err(Finding::CannotVerify(e))).collect();
+    if findings.is_empty() {
+        return verdict(vec![Ok(())], vec![format!(
+            "{booted}: {chosen}. GRUB finds its kernel and initramfs. \
+             check does not count the menu's timeout or a password the entry needs.")]);
     }
-
-    let mut results: Vec<CheckResult> = failures.into_iter().map(|e| Err(Finding::Fails(e))).collect();
-    results.push(Err(
-        "No boot entry has a valid kernel, initramfs, and root parameter. \
-         The system cannot boot. \
-         Rebuild the boot entry: sudo kernel-install add $(uname -r) /lib/modules/$(uname -r)/vmlinuz".to_string().into()));
-    results
+    let detail = findings.iter().map(|finding| finding.message()).collect::<Vec<_>>().join(" ");
+    if findings.len() == picked.len() && findings.iter().all(|finding| matches!(finding, Finding::Fails(_))) {
+        if let Some(fallback) = &config.fallback {
+            return verdict(vec![Err(Finding::NotEvaluated(format!(
+                "{booted}: {chosen}. {detail} GRUB then tries the entries fallback names ({fallback}), \
+                 which check does not follow.")))], vec![]);
+        }
+        return verdict(vec![Err(Finding::Fails(format!(
+            "{booted}: {chosen}. {detail}")))], vec![]);
+    }
+    // A pick check cannot read is unverified; otherwise picks that do and do
+    // not resolve leave it unable to evaluate which GRUB boots.
+    let message = format!("{booted}: {chosen}. {detail}");
+    if findings.iter().any(|finding| matches!(finding, Finding::CannotVerify(_))) {
+        verdict(vec![Err(Finding::CannotVerify(message))], vec![])
+    } else {
+        verdict(vec![Err(Finding::NotEvaluated(message))], vec![])
+    }
 }
 
-/// The GRUB paths of the files in blsdir whose names blscfg reads as boot
-/// entries.
-fn bls_entry_paths(blsdir: &BlsDir) -> Result<Vec<String>, Finding> {
+/// The files in blsdir whose names blscfg reads as boot entries, each as
+/// its name less ".conf" and its GRUB path.
+fn bls_entry_files(blsdir: &BlsDir) -> Result<Vec<(String, String)>, Finding> {
     let unverified = |e: std::io::Error| Finding::CannotVerify(format!(
         "cannot verify the boot entries in '{}': {e}", blsdir.grub_path));
-    let mut confs = Vec::new();
+    let mut files = Vec::new();
     for entry in fs::read_dir(&blsdir.linux).map_err(unverified)? {
         let name = entry.map_err(unverified)?.file_name();
         if !is_bls_entry_name(name.as_bytes()) {
             continue;
         }
-        let name = name.into_string().map_err(|name| Finding::CannotVerify(format!(
+        let name = name.into_string().map_err(|name| Finding::NotEvaluated(format!(
             "cannot verify the boot entry {name:?} in '{}': its name is not UTF-8, which check does not look up",
             blsdir.grub_path)))?;
-        confs.push(blsdir.entry(&name));
+        let conf = blsdir.entry(&name);
+        files.push((name[..name.len() - BLS_ENTRY_SUFFIX.len()].to_string(), conf));
     }
-    Ok(confs)
+    Ok(files)
+}
+
+/// A file blscfg reads as a boot entry.
+struct BlsEntry {
+    /// Its file name less ".conf", by which blscfg orders it and
+    /// create_entry names it.
+    name: String,
+    /// Its GRUB path.
+    conf: String,
+    /// What GRUB reads in it, or why check cannot read it.
+    content: Result<String, String>,
+}
+
+/// The files blscfg reads as boot entries from blsdir, in the order it
+/// lists them: newest first by bls_cmp, as bls_add_entry inserts them
+/// (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c). blscfg skips
+/// a file it cannot open (read_entry). Where the order depends on the
+/// order GRUB reads the directory in, check cannot verify the menu.
+fn blscfg_entries(grub: &GrubContext, blsdir: &BlsDir) -> Result<Vec<BlsEntry>, Finding> {
+    let mut entries = Vec::new();
+    for (name, conf) in bls_entry_files(blsdir)? {
+        let content = match read_grub_file(&grub.at_blscfg, &conf) {
+            Ok(content) => Ok(content),
+            Err(Finding::Fails(_)) => continue,
+            Err(unread) => Err(unread.message().to_string()),
+        };
+        entries.push(BlsEntry { name, conf, content });
+    }
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    let file = |name: &str| blsdir.entry(&format!("{name}.conf"));
+    let order = menu::blscfg_order(&names).map_err(|unknown| Finding::NotEvaluated(match unknown {
+        menu::UnknownOrder::SameVersion(a, b) => format!(
+            "cannot verify the menu: blscfg compares '{}' and '{}' as the same version and keeps the one \
+             GRUB reads first, in an order check does not read", file(&a), file(&b)),
+        menu::UnknownOrder::Unordered(a, b) => format!(
+            "cannot verify the menu: blscfg's comparison does not order '{}' and '{}' as it orders the \
+             other entries, so their order depends on the order GRUB reads them in, which check does not read",
+            file(&a), file(&b)),
+    }))?;
+    let mut rank = vec![0; order.len()];
+    for (position, &index) in order.iter().enumerate() {
+        rank[index] = position;
+    }
+    let mut ranked: Vec<(usize, BlsEntry)> = rank.into_iter().zip(entries).collect();
+    ranked.sort_by_key(|&(position, _)| position);
+    Ok(ranked.into_iter().map(|(_, entry)| entry).collect())
 }
 
 /// Whether blscfg reads the file of this name in the boot entry directory:
@@ -402,19 +592,18 @@ fn bls_entry_paths(blsdir: &BlsDir) -> Result<Vec<String>, Finding> {
 /// end in ".conf" (Fedora's grub2 2.12 patches,
 /// grub-core/commands/blscfg.c, read_entry).
 fn is_bls_entry_name(name: &[u8]) -> bool {
-    const BLS_ENTRY_SUFFIX: &[u8] = b".conf";
-    name.first() != Some(&b'.') && name.len() > BLS_ENTRY_SUFFIX.len() && name.ends_with(BLS_ENTRY_SUFFIX)
+    name.first() != Some(&b'.') && name.len() > BLS_ENTRY_SUFFIX.len() && name.ends_with(BLS_ENTRY_SUFFIX.as_bytes())
 }
+
+/// The suffix of the names blscfg reads as boot entries (read_entry).
+const BLS_ENTRY_SUFFIX: &str = ".conf";
 
 // BLS fields may contain GRUB variables after the file path:
 //   initrd /initramfs-6.19.9.img $tuned_initrd
 // Only the first token is a file path. The rest is GRUB's concern.
-// conf is the entry's GRUB path, and content what GRUB reads there.
-fn validate_bls_entry(grub: &GrubContext, conf: &str, content: &str) -> CheckResult {
-    let linux = parse::bls_field(content, "linux")
-        .ok_or_else(|| format!(
-            "Boot entry '{conf}' has no 'linux' field. \
-             GRUB does not know which kernel to load."))?;
+// conf is the entry's GRUB path, content what GRUB reads there, and linux
+// its linux value.
+fn validate_bls_entry(grub: &GrubContext, conf: &str, content: &str, linux: &str) -> CheckResult {
     let options = parse::bls_field(content, "options")
         .ok_or_else(|| format!(
             "Boot entry '{conf}' has no 'options' field. \
@@ -634,7 +823,7 @@ fn extract_root_uuid(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Re
         Err(Finding::Fails(_)) => return Ok(None),
         Err(unverified) => return Err(unverified.clone()),
     };
-    for conf in bls_entry_paths(blsdir)? {
+    for (_, conf) in bls_entry_files(blsdir)? {
         let content = match read_grub_file(&grub.at_blscfg, &conf) {
             Ok(content) => content,
             // blscfg skips a file it cannot open.
@@ -748,6 +937,27 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         format!("# GRUB Environment Block\n{vars}{}", "#".repeat(256))
     }
 
+    /// The lines of Fedora's generated grub.cfg that load grubenv
+    /// (util/grub.d/00_header.in:56-60).
+    const LOAD_GRUBENV: &str = "\
+if [ -f ${config_directory}/grubenv ]; then
+  load_env -f ${config_directory}/grubenv
+elif [ -s $prefix/grubenv ]; then
+  load_env
+fi
+";
+
+    /// The line of Fedora's generated grub.cfg that sets root to the boot
+    /// filesystem, which the stubs here name by UUID 3f2a9c41
+    /// (util/grub-mkconfig_lib.in, prepare_grub_to_access_device).
+    const SEARCH_ROOT: &str = "search --no-floppy --fs-uuid --set=root 3f2a9c41\n";
+
+    /// A grub.cfg that loads grubenv, sets root, then lists the boot
+    /// entries.
+    fn grub_cfg() -> String {
+        format!("{LOAD_GRUBENV}{SEARCH_ROOT}insmod blscfg\nblscfg\n")
+    }
+
     fn bls_entry(linux: &str, initrds: &[&str]) -> String {
         let mut entry = format!("title Fedora Linux ({KVER})\nversion {KVER}\nlinux {linux}\n");
         for initrd in initrds {
@@ -777,7 +987,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         put(&dir.join(format!("boot/initramfs-{KVER}.img")), "initramfs");
         std::os::unix::fs::symlink(format!("boot/vmlinuz-{KVER}"), dir.join(format!("vmlinuz-{KVER}"))).unwrap();
         std::os::unix::fs::symlink(format!("boot/initramfs-{KVER}.img"), dir.join(format!("initramfs-{KVER}.img"))).unwrap();
-        put(&dir.join("boot/grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&dir.join("boot/grub2/grub.cfg"), &grub_cfg());
         put(&dir.join("boot/grub2/grubenv"), &grubenv(grubenv_vars));
         put(&dir.join(format!("boot/loader/entries/{KVER}.conf")), entry);
     }
@@ -794,8 +1004,13 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     /// whose top level is visible at top and whose default subvolume is
     /// root, under the ESP stub stub.
     fn context_from_stub(top: &Path, stub: &str) -> Result<GrubContext, GrubContextError> {
+        context_with_grub_env(top, stub, None)
+    }
+
+    /// The same, with the GRUB_ENV EFI variable holding grub_env.
+    fn context_with_grub_env(top: &Path, stub: &str, grub_env: Option<&[u8]>) -> Result<GrubContext, GrubContextError> {
         let btrfs = tools::FsType::Btrfs;
-        GrubContext::build(stub, tools::parse_esp_stub(stub).unwrap(), &btrfs, &top.join("partition"),
+        GrubContext::build(stub, tools::parse_esp_stub(stub).unwrap(), &btrfs, &top.join("partition"), grub_env,
             |btrfs_relative| StartingLookupDir::select(&btrfs, btrfs_relative, top.to_path_buf(), || Ok("root".into())),
             None)
     }
@@ -813,7 +1028,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
             snapshot: tools::SubvolName::new(snapshot.into()),
         };
         let stub = esp_stub(false, prefix);
-        GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &fstype, &root.join("partition"),
+        GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &fstype, &root.join("partition"), None,
             |btrfs_relative| Ok(StartingLookupDir::after_rollback(&fstype, btrfs_relative, root.to_path_buf(), &exchange)),
             None).unwrap()
     }
@@ -823,11 +1038,12 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     }
 
     fn bls_entries(grub: &GrubContext) -> Vec<CheckResult> {
-        check_bls_entries(grub, &grub.blsdir())
+        check_bls_entries(grub, &grub.blsdir()).results
     }
 
     fn validate(grub: &GrubContext, conf: &str) -> CheckResult {
-        validate_bls_entry(grub, conf, &read_grub_file(&grub.at_blscfg, conf)?)
+        let content = read_grub_file(&grub.at_blscfg, conf)?;
+        validate_bls_entry(grub, conf, &content, parse::bls_field(&content, "linux").unwrap())
     }
 
     fn passes(results: &[CheckResult]) -> bool {
@@ -848,7 +1064,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     /// subvolume, and holds grub2/, loader/entries/ and the kernels. The
     /// context is the snapshot check's, which reads that live /boot.
     fn separate_boot(boot: &Path) -> GrubContext {
-        put(&boot.join("grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&boot.join("grub2/grub.cfg"), &grub_cfg());
         put(&boot.join("grub2/grubenv"), &grubenv(""));
         put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
         put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
@@ -948,7 +1164,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     #[test]
     fn filesystem_root_accepts_boot_partition_layout() {
         let boot = scratch("grub-filesystem-root");
-        put(&boot.join("grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&boot.join("grub2/grub.cfg"), &grub_cfg());
         put(&boot.join("grub2/grubenv"), &grubenv(""));
         put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
         put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
@@ -956,7 +1172,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         // Fedora cloud images set btrfs_relative_path on an ext4 /boot.
         let stub = esp_stub(true, "/grub2");
         let ext4 = tools::FsType::Ext4;
-        let grub = GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &ext4, &boot.join("partition"),
+        let grub = GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &ext4, &boot.join("partition"), None,
             |btrfs_relative| StartingLookupDir::select(&ext4, btrfs_relative, boot.clone(),
                 || panic!("no default subvolume off Btrfs")),
             None).unwrap();
@@ -1058,6 +1274,52 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         fs::remove_dir_all(&top).unwrap();
     }
 
+    // --- the entries blscfg adds to the menu ---
+
+    // create_entry leaves an entry without a linux line out of the menu
+    // (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c,
+    // create_entry): it is no broken menu entry.
+    #[test]
+    fn an_entry_without_linux_is_left_out_of_the_menu() {
+        let top = scratch("menu-no-linux");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/loader/entries/notes.conf"), "title Notes\noptions root=UUID=3f2a9c41\n");
+        let grub = btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX);
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+
+        fs::remove_file(top.join(format!("root/boot/loader/entries/{KVER}.conf"))).unwrap();
+        let results = bls_entries(&grub);
+        assert!(fails_with(&results, "'/root/boot/loader/entries/notes.conf', which has no linux line"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // bls_add_entry drops an entry that compares as the same version as one
+    // already listed (blscfg.c, bls_add_entry), keeping whichever GRUB read
+    // first, in an order check does not read.
+    #[test]
+    fn entries_of_the_same_version_cannot_be_verified() {
+        let top = scratch("menu-same-version");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/loader/entries/6.19.09-200.fc45.x86_64.conf"), &entry_from_top_level());
+        let results = bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX));
+        assert!(results.iter().any(|r| matches!(r, Err(Finding::NotEvaluated(e))
+            if e.contains(KVER) && e.contains("6.19.09-200.fc45.x86_64"))), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // create_entry's loop that strips ".conf" never ends for a name, less
+    // its final ".conf", whose first ".conf" is not at its end (blscfg.c,
+    // create_entry), so GRUB never shows the menu.
+    #[test]
+    fn an_entry_whose_id_create_entry_cannot_strip_fails() {
+        let top = scratch("menu-loop");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/loader/entries/x.confd-1.conf"), &entry_from_top_level());
+        let results = bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX));
+        assert!(fails_with(&results, "x.confd-1.conf"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // --- grubenv, read as GRUB's load_env reads it ---
 
     /// The boot entries of the root subvolume, from the top level, whose
@@ -1069,6 +1331,35 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let results = bls_entries(&btrfs_context(&top, false, "/root/boot/grub2"));
         fs::remove_dir_all(&top).unwrap();
         results
+    }
+
+    // grubenv sets variables only where grub.cfg loads it, which Fedora's
+    // generated header does before blscfg (util/grub.d/00_header.in:56-60).
+    #[test]
+    fn grubenv_applies_only_where_grub_cfg_loads_it() {
+        let top = scratch("grubenv-where-loaded");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub_cfg_path = top.join("root/boot/grub2/grub.cfg");
+        for script in [format!("{SEARCH_ROOT}insmod blscfg\nblscfg\n"), format!("{SEARCH_ROOT}insmod blscfg\nblscfg\n{LOAD_GRUBENV}")] {
+            put(&grub_cfg_path, &script);
+            let results = bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX));
+            assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{script}: {results:?}");
+        }
+        put(&grub_cfg_path, &grub_cfg());
+        assert!(passes(&bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX))));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The header loads env_block where it sets it, after grubenv
+    // (00_header.in:62-70).
+    #[test]
+    fn env_block_applies_only_where_grub_cfg_loads_it() {
+        let (top, _) = generated_layout("env-block-where-loaded", "env_block=/root/boot/grub2/envblock\n", &entry_from_top_level());
+        put(&top.join("root/boot/grub2/envblock"), &grubenv(BLSDIR_TOP_LEVEL));
+        put(&top.join("root/boot/grub2/grub.cfg"), &grub_cfg());
+        let results = bls_entries(&context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap());
+        assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
     }
 
     // load_env applies each assignment in turn, so the last one holds
@@ -1100,11 +1391,22 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
 
     // --- what grub.cfg sets before blscfg runs ---
 
-    /// The lines of Fedora's generated grub.cfg before blscfg that set
-    /// variables: 00_header's load_env of grubenv and of env_block
-    /// (util/grub.d/00_header.in:56-70), and 01_users's source of user.cfg
-    /// (util/grub.d/01_users.in:3-4).
-    const GENERATED_GRUB_CFG: &str = "\
+    /// Fedora's generated grub.cfg, as grub2-mkconfig wrote it on a Fedora 45
+    /// test install whose /etc/default/grub sets GRUB_DEFAULT=saved, with
+    /// synthetic filesystem UUIDs: 00_header loads grubenv and env_block
+    /// (util/grub.d/00_header.in:56-70) and sets default (:92-103), 01_users
+    /// sources user.cfg (util/grub.d/01_users.in:3-10), 08_fallback_counting
+    /// may set default (08_fallback_counting.in:12-27), 10_linux sets root
+    /// and runs blscfg, and after it 10_reset_boot_success, 14_menu_show_once,
+    /// 25_bli, 30_uefi-firmware and 41_custom run.
+    const GENERATED_GRUB_CFG: &str = r##"#
+# DO NOT EDIT THIS FILE
+#
+# It is automatically generated by grub2-mkconfig using templates
+# from /etc/grub.d and settings from /etc/default/grub
+#
+
+### BEGIN /etc/grub.d/00_header ###
 set pager=1
 
 if [ -f ${config_directory}/grubenv ]; then
@@ -1113,28 +1415,233 @@ elif [ -s $prefix/grubenv ]; then
   load_env
 fi
 
-if [ \"${env_block}\" ] ; then
-  if [ \"${dev}\" ]; then
-    set env_block=\"(${dev})${env_block}\"
+if [ "${env_block}" ] ; then
+  if [ "${dev}" ]; then
+    set env_block="(${dev})${env_block}"
   else
-    set env_block=\"(${root})${env_block}\"
+    set env_block="(${root})${env_block}"
   fi
   export env_block
-  load_env -f \"${env_block}\"
+  load_env -f "${env_block}"
 fi
 
+if [ "${next_entry}" ] ; then
+   set default="${next_entry}"
+   set next_entry=
+   if [ "${env_block}" ] ; then
+     save_env -f "${env_block}" next_entry
+   else
+     save_env next_entry
+   fi
+   set boot_once=true
+else
+   set default="${saved_entry}"
+fi
+
+if [ x"${feature_menuentry_id}" = xy ]; then
+  menuentry_id_option="--id"
+else
+  menuentry_id_option=""
+fi
+
+export menuentry_id_option
+
+if [ "${prev_saved_entry}" ]; then
+  set saved_entry="${prev_saved_entry}"
+  save_env saved_entry
+  set prev_saved_entry=
+  save_env prev_saved_entry
+  set boot_once=true
+fi
+
+function savedefault {
+  if [ -z "${boot_once}" ]; then
+    saved_entry="${chosen}"
+    if [ "${env_block}" ] ; then
+      save_env -f "${env_block}" saved_entry
+    else
+      save_env saved_entry
+    fi
+
+  fi
+}
+
+function load_video {
+  if [ x$feature_all_video_module = xy ]; then
+    insmod all_video
+  else
+    insmod efi_gop
+    insmod efi_uga
+    insmod ieee1275_fb
+    insmod vbe
+    insmod vga
+    insmod video_bochs
+    insmod video_cirrus
+  fi
+}
+
+serial --speed=115200
+terminal_input serial console
+terminal_output serial console
+if [ x$feature_timeout_style = xy ] ; then
+  set timeout_style=menu
+  set timeout=5
+# Fallback normal timeout code in case the timeout_style feature is
+# unavailable.
+else
+  set timeout=5
+fi
+### END /etc/grub.d/00_header ###
+
+### BEGIN /etc/grub.d/01_users ###
 if [ -f ${prefix}/user.cfg ]; then
   source ${prefix}/user.cfg
-  if [ -n \"${GRUB2_PASSWORD}\" ]; then
-    set superusers=\"root\"
+  if [ -n "${GRUB2_PASSWORD}" ]; then
+    set superusers="root"
     export superusers
     password_pbkdf2 root ${GRUB2_PASSWORD}
   fi
 fi
+### END /etc/grub.d/01_users ###
+
+### BEGIN /etc/grub.d/08_fallback_counting ###
+insmod increment
+# Check if boot_counter exists and boot_success=0 to activate this behaviour.
+if [ -n "${boot_counter}" -a "${boot_success}" = "0" ]; then
+  # if countdown has ended, choose to boot rollback deployment,
+  # i.e. default=1 on OSTree-based systems.
+  if  [ "${boot_counter}" = "0" -o "${boot_counter}" = "-1" ]; then
+    set default=1
+    set boot_counter=-1
+  # otherwise decrement boot_counter
+  else
+    decrement boot_counter
+  fi
+  if [ "${env_block}" ]; then
+    save_env -f "${env_block}" boot_counter
+  else
+    save_env boot_counter
+  fi
+fi
+### END /etc/grub.d/08_fallback_counting ###
+
+### BEGIN /etc/grub.d/10_linux ###
+insmod part_gpt
+insmod btrfs
+search --no-floppy --fs-uuid --set=root 3f2a9c41
+insmod part_gpt
+insmod fat
+search --no-floppy --fs-uuid --set=boot 0A1B-2C3D
+
+# This section was generated by a script. Do not modify the generated file - all changes
+# will be lost the next time file is regenerated. Instead edit the BootLoaderSpec files.
+#
+# The blscfg command parses the BootLoaderSpec files stored in /boot/loader/entries and
+# populates the boot menu. Please refer to the Boot Loader Specification documentation
+# for the files format: https://systemd.io/BOOT_LOADER_SPECIFICATION/.
+
+# The kernelopts variable should be defined in the grubenv file. But to ensure that menu
+# entries populated from BootLoaderSpec files that use this variable work correctly even
+# without a grubenv file, define a fallback kernelopts variable if this has not been set.
+#
+# The kernelopts variable in the grubenv file can be modified using the grubby tool or by
+# executing the grub2-mkconfig tool. For the latter, the values of the GRUB_CMDLINE_LINUX
+# and GRUB_CMDLINE_LINUX_DEFAULT options from /etc/default/grub file are used to set both
+# the kernelopts variable in the grubenv file and the fallback kernelopts variable.
+if [ -z "${kernelopts}" ]; then
+  set kernelopts="root=UUID=3f2a9c41 ro rootflags=subvol=root "
+fi
 
 insmod blscfg
 blscfg
-";
+### END /etc/grub.d/10_linux ###
+
+### BEGIN /etc/grub.d/10_reset_boot_success ###
+# Hiding the menu is ok if last boot was ok or if this is a first boot attempt to boot the entry
+if [ "${boot_success}" = "1" -o "${boot_indeterminate}" = "1" ]; then
+  set menu_hide_ok=1
+else
+  set menu_hide_ok=0 
+fi
+# Reset boot_indeterminate after a successful boot
+if [ "${boot_success}" = "1" ] ; then
+  set boot_indeterminate=0
+# Avoid boot_indeterminate causing the menu to be hidden more than once
+elif [ "${boot_indeterminate}" = "1" ]; then
+  set boot_indeterminate=2
+fi
+# Reset boot_success for current boot 
+set boot_success=0
+if [ "${env_block}" ]; then
+  save_env -f "${env_block}" boot_success boot_indeterminate
+else
+  save_env boot_success boot_indeterminate
+fi
+### END /etc/grub.d/10_reset_boot_success ###
+
+### BEGIN /etc/grub.d/12_menu_auto_hide ###
+### END /etc/grub.d/12_menu_auto_hide ###
+
+### BEGIN /etc/grub.d/14_menu_show_once ###
+if [ x$feature_timeout_style = xy ]; then
+  if [ "${menu_show_once_timeout}" ]; then
+    set timeout_style=menu
+    set timeout="${menu_show_once_timeout}"
+    unset menu_show_once_timeout
+    if [ "${env_block}" ]; then
+      save_env -f "${env_block}" menu_show_once_timeout
+    else
+      save_env menu_show_once_timeout
+    fi
+  fi
+fi
+### END /etc/grub.d/14_menu_show_once ###
+
+### BEGIN /etc/grub.d/20_linux_xen ###
+
+### END /etc/grub.d/20_linux_xen ###
+
+### BEGIN /etc/grub.d/20_ppc_terminfo ###
+### END /etc/grub.d/20_ppc_terminfo ###
+
+### BEGIN /etc/grub.d/25_bli ###
+if [ "$grub_platform" = "efi" ]; then
+        if [ ! insmod bli ]; then
+                echo "bli module not available"
+        fi
+fi
+### END /etc/grub.d/25_bli ###
+
+### BEGIN /etc/grub.d/30_os-prober ###
+### END /etc/grub.d/30_os-prober ###
+
+### BEGIN /etc/grub.d/30_uefi-firmware ###
+if [ "$grub_platform" = "efi" ]; then
+	if [ fwsetup --is-supported ]; then
+		menuentry 'UEFI Firmware Settings' $menuentry_id_option 'uefi-firmware' {
+			fwsetup
+		}
+	fi
+fi
+### END /etc/grub.d/30_uefi-firmware ###
+
+### BEGIN /etc/grub.d/35_fwupd ###
+### END /etc/grub.d/35_fwupd ###
+
+### BEGIN /etc/grub.d/40_custom ###
+# This file provides an easy way to add custom menu entries.  Simply type the
+# menu entries you want to add after this comment.  Be careful not to change
+# the 'exec tail' line above.
+### END /etc/grub.d/40_custom ###
+
+### BEGIN /etc/grub.d/41_custom ###
+if [ -f  ${config_directory}/custom.cfg ]; then
+  source ${config_directory}/custom.cfg
+elif [ -z "${config_directory}" -a -f  $prefix/custom.cfg ]; then
+  source $prefix/custom.cfg
+fi
+### END /etc/grub.d/41_custom ###
+"##;
 
     const STUB_TOP_LEVEL_PREFIX: &str = "/root/boot/grub2";
 
@@ -1160,6 +1667,316 @@ blscfg
         fs::remove_dir_all(&top).unwrap();
     }
 
+    // --- the entry GRUB boots without a key press ---
+
+    /// An older kernel than KVER, whose entry blscfg lists second and whose
+    /// kernel and initramfs the layouts here do not hold.
+    const OLDER: &str = "6.18.1-100.fc45.x86_64";
+
+    fn older_entry() -> String {
+        bls_entry(&format!("/root/boot/vmlinuz-{OLDER}"), &[&format!("/root/boot/initramfs-{OLDER}.img")])
+            .replace(&format!("({KVER})"), &format!("({OLDER})"))
+    }
+
+    /// Fedora's generated grub.cfg with GRUB_DEFAULT written as grub_default
+    /// over the root subvolume holding KVER's entry and the broken entry of
+    /// OLDER, with the grubenv variables vars.
+    fn two_kernels(name: &str, grub_default: &str, vars: &str) -> (PathBuf, GrubContext) {
+        let top = scratch(name);
+        install_subvol(&top, "root", &format!("{BLSDIR_TOP_LEVEL}{vars}"), &entry_from_top_level());
+        put(&top.join(format!("root/boot/loader/entries/{OLDER}.conf")), &older_entry());
+        put(&top.join("root/boot/grub2/grub.cfg"),
+            &GENERATED_GRUB_CFG.replace("set default=\"${saved_entry}\"", &format!("set default=\"{grub_default}\"")));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        (top, grub)
+    }
+
+    fn kernel_entry_status(grub: &GrubContext) -> BootStatus {
+        evaluate_checks(vec![("Kernel boot entry", check_bls_entries(grub, &grub.blsdir()))])
+    }
+
+    fn fails_naming(status: BootStatus, needle: &str) -> bool {
+        matches!(status, BootStatus::Fail(failures) if failures.iter().any(|f| f.contains(needle)))
+    }
+
+    fn cannot_verify(status: BootStatus, needle: &str) -> bool {
+        matches!(status, BootStatus::Inaccessible { reason, .. } if reason.contains(needle))
+    }
+
+    // run_menu boots entry get_entry_number(default), the first when that
+    // is no entry (grub-core/normal/menu.c), and 00_header sets default to
+    // saved_entry (util/grub.d/00_header.in:92-103): a broken default entry
+    // beside a working one leaves the machine unable to boot unattended.
+    #[test]
+    fn a_broken_default_entry_fails_beside_a_working_one() {
+        let (top, grub) = two_kernels("default-broken", "${saved_entry}", &format!("saved_entry={OLDER}\n"));
+        assert!(fails_naming(kernel_entry_status(&grub), &format!("`/root/boot/vmlinuz-{OLDER}'")));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // blscfg lists KVER first, so a default that names no entry, or is
+    // unset, boots it.
+    #[test]
+    fn a_working_default_entry_passes_with_a_warning_for_a_broken_one() {
+        for vars in [format!("saved_entry={KVER}\n"), String::new(), "saved_entry=gone-6.1.0\n".to_string()] {
+            let (top, grub) = two_kernels("default-works", "${saved_entry}", &vars);
+            assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn), "{vars}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // GRUB_DEFAULT=1 names the second entry by its place in the menu.
+    #[test]
+    fn a_default_by_number_fails_on_the_broken_entry_it_names() {
+        let (top, grub) = two_kernels("default-number", "1", "");
+        assert!(fails_naming(kernel_entry_status(&grub), OLDER));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // next_entry, set by grub2-reboot, wins over saved_entry for one boot
+    // (00_header.in:92-93).
+    #[test]
+    fn next_entry_decides_the_default_entry() {
+        let (top, grub) = two_kernels("default-next", "${saved_entry}", &format!("saved_entry={KVER}\nnext_entry={OLDER}\n"));
+        assert!(fails_naming(kernel_entry_status(&grub), OLDER));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // 08_fallback_counting sets default to 1 when boot_counter has run out
+    // and the last boot did not succeed (08_fallback_counting.in:12-16).
+    #[test]
+    fn the_boot_counter_decides_the_default_entry_when_it_runs_out() {
+        let (top, grub) = two_kernels("default-counter", "${saved_entry}",
+            &format!("saved_entry={KVER}\nboot_counter=0\nboot_success=0\n"));
+        assert!(fails_naming(kernel_entry_status(&grub), OLDER));
+        fs::remove_dir_all(&top).unwrap();
+
+        let (top, grub) = two_kernels("default-counter-success", "${saved_entry}",
+            &format!("saved_entry={KVER}\nboot_counter=0\nboot_success=1\n"));
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    /// 08_fallback_counting's block as Fedora 43's grub2-mkconfig writes it
+    /// (grub.cfg lines 86-101 of the repository CI's fedora-43 image), which
+    /// saves boot_counter without the env_block test Fedora 45's has.
+    const FALLBACK_COUNTING_FEDORA_43: &str = "\
+insmod increment
+# Check if boot_counter exists and boot_success=0 to activate this behaviour.
+if [ -n \"${boot_counter}\" -a \"${boot_success}\" = \"0\" ]; then
+  # if countdown has ended, choose to boot rollback deployment,
+  # i.e. default=1 on OSTree-based systems.
+  if  [ \"${boot_counter}\" = \"0\" -o \"${boot_counter}\" = \"-1\" ]; then
+    set default=1
+    set boot_counter=-1
+  # otherwise decrement boot_counter
+  else
+    decrement boot_counter
+  fi
+  save_env boot_counter
+fi
+";
+
+    /// Fedora's generated grub.cfg with Fedora 43's 08_fallback_counting.
+    fn fedora_43_grub_cfg() -> String {
+        let start = GENERATED_GRUB_CFG.find("insmod increment\n").unwrap();
+        let end = GENERATED_GRUB_CFG.find("### END /etc/grub.d/08_fallback_counting ###").unwrap();
+        format!("{}{FALLBACK_COUNTING_FEDORA_43}{}", &GENERATED_GRUB_CFG[..start], &GENERATED_GRUB_CFG[end..])
+    }
+
+    // GRUB runs the block's body only when its test holds
+    // (08_fallback_counting.in:12): with boot_counter unset or empty it
+    // cannot change default, whatever its other lines; set, the body sets
+    // default to 1 when boot_counter is 0 or -1, and leaves it otherwise.
+    #[test]
+    fn fedora_43s_boot_counter_decides_the_default_entry_only_when_its_test_holds() {
+        for (vars, by_default) in [
+            (format!("saved_entry={KVER}\n"), KVER),
+            (format!("saved_entry={KVER}\nboot_counter=\nboot_success=0\n"), KVER),
+            (format!("saved_entry={KVER}\nboot_counter=2\nboot_success=0\n"), KVER),
+            (format!("saved_entry={KVER}\nboot_counter=-1\nboot_success=0\n"), OLDER),
+        ] {
+            let (top, _) = two_kernels("default-counter-43", "${saved_entry}", &vars);
+            put(&top.join("root/boot/grub2/grub.cfg"), &fedora_43_grub_cfg());
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+            let status = kernel_entry_status(&grub);
+            if by_default == KVER {
+                assert!(matches!(status, BootStatus::Warn), "{vars}");
+            } else {
+                assert!(fails_naming(status, OLDER), "{vars}");
+            }
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+
+    // When the default entry fails, GRUB tries the entries fallback names
+    // (grub-core/normal/menu.c, grub_menu_execute_with_fallback), which
+    // check does not follow.
+    #[test]
+    fn a_broken_default_entry_with_fallback_set_cannot_be_verified() {
+        let (top, grub) = two_kernels("default-fallback", "${saved_entry}", &format!("saved_entry={OLDER}\nfallback=0\n"));
+        assert!(cannot_verify(kernel_entry_status(&grub), "fallback"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // 30_uefi-firmware adds its entry on EFI, as its test
+    // [ fwsetup --is-supported ] is two words test reads as true strings
+    // (util/grub.d/30_uefi-firmware.in:34-40; commands/test.c): a default
+    // naming it boots firmware setup, a choice of the user's. check says
+    // so, verifies the boot entries, and passes while one resolves.
+    #[test]
+    fn a_default_naming_the_firmware_entry_passes_while_a_boot_entry_resolves() {
+        let (top, grub) = two_kernels("default-firmware", "uefi-firmware", "");
+        let group = check_bls_entries(&grub, &grub.blsdir());
+        let counted = group.counted.join(" ");
+        assert!(counted.contains("GRUB boots 'UEFI Firmware Settings'") && counted.contains("does not verify that entry"),
+            "{counted}");
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
+
+        fs::remove_file(top.join(format!("root/boot/vmlinuz-{KVER}"))).unwrap();
+        assert!(fails_naming(kernel_entry_status(&grub), "no boot entry resolves"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The closing line of a boot chain check cannot verify says what it
+    // could not do: here evaluate a default user.cfg sets, not read a file.
+    #[test]
+    fn a_default_check_cannot_evaluate_is_not_reported_as_an_unread_file() {
+        let (top, _) = two_kernels("default-hint", "${saved_entry}", &format!("saved_entry={KVER}\n"));
+        put(&top.join("root/boot/grub2/user.cfg"), "set default=$chosen_by_user\n");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        match kernel_entry_status(&grub) {
+            BootStatus::Inaccessible { hint, .. } => {
+                assert!(!hint.contains("could not read") && hint.contains("evaluate"), "{hint}");
+            }
+            _ => panic!("not reported as unverified"),
+        }
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The verdict says which entry it counted, why GRUB boots it, and what
+    // it does not count.
+    #[test]
+    fn the_verdict_states_the_entry_it_counted() {
+        let (top, grub) = two_kernels("default-counted", "${saved_entry}", &format!("saved_entry={KVER}\n"));
+        let group = check_bls_entries(&grub, &grub.blsdir());
+        let counted = group.counted.join(" ");
+        assert!(counted.contains(&format!("GRUB boots 'Fedora Linux ({KVER})'")), "{counted}");
+        assert!(counted.contains("when no key is pressed"), "{counted}");
+        assert!(counted.contains(&format!("default is '{KVER}' (from 'set default=\"${{saved_entry}}\"' in grub.cfg, \
+            saved_entry from grubenv)")), "{counted}");
+        assert!(counted.contains("does not count the menu's timeout"), "{counted}");
+        assert!(group.warnings.iter().any(|w| w.contains(OLDER) && w.contains("does not boot by default")), "{:?}", group.warnings);
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // grub_normal_add_menu_entry adds each entry at the end of the menu
+    // (grub-core/commands/menuentry.c), so an entry grub.cfg defines before
+    // blscfg stands ahead of the boot entries.
+    #[test]
+    fn a_menu_entry_before_blscfg_cannot_be_verified() {
+        let (top, grub) = two_kernels("default-entry-before", "${saved_entry}", &format!("saved_entry={KVER}\n"));
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
+        put(&top.join("root/boot/grub2/grub.cfg"), &GENERATED_GRUB_CFG.replace("insmod blscfg\nblscfg\n",
+            "menuentry 'Other' {\n  chainloader /EFI/other.efi\n}\ninsmod blscfg\nblscfg\n"));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(cannot_verify(kernel_entry_status(&grub), "grub.cfg adds a menu entry before blscfg"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    /// The entry os-prober writes for Windows after the boot entries
+    /// (util/grub.d/30_os-prober.in), with a synthetic id.
+    const OS_PROBER_ENTRY: &str = "\
+menuentry 'Windows Boot Manager (on /dev/nvme0n1p1)' --class windows --class os $menuentry_id_option 'osprober-efi-0A1B-2C3D' {
+\tinsmod part_gpt
+\tchainloader /EFI/Microsoft/Boot/bootmgfw.efi
+}
+";
+
+    // An entry grub.cfg adds after blscfg is in the menu with the id after
+    // --id (00_header.in:108-112 sets menuentry_id_option): a default
+    // naming the Windows entry os-prober writes, by id, title or place,
+    // boots it, and check verifies the boot entries.
+    #[test]
+    fn a_default_naming_an_entry_grub_cfg_adds_passes_while_a_boot_entry_resolves() {
+        for (grub_default, booted) in [
+            ("osprober-efi-0A1B-2C3D", "'Windows Boot Manager (on /dev/nvme0n1p1)'"),
+            ("Windows Boot Manager (on /dev/nvme0n1p1)", "'Windows Boot Manager (on /dev/nvme0n1p1)'"),
+            ("3", "'Windows Boot Manager (on /dev/nvme0n1p1)'"),
+            ("2", "'UEFI Firmware Settings'"),
+            ("0", &format!("'Fedora Linux ({KVER})'")),
+        ] {
+            let top = scratch("default-os-prober");
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join(format!("root/boot/loader/entries/{OLDER}.conf")), &older_entry());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{}{OS_PROBER_ENTRY}",
+                GENERATED_GRUB_CFG.replace("set default=\"${saved_entry}\"", &format!("set default=\"{grub_default}\""))));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+            let counted = check_bls_entries(&grub, &grub.blsdir()).counted.join(" ");
+            assert!(counted.contains(&format!("GRUB boots {booted}")), "{grub_default}: {counted}");
+            assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn), "{grub_default}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // user.cfg runs after 00_header sets default (01_users.in:3-4): check
+    // follows a value it can evaluate, and otherwise GRUB boots any entry
+    // of the menu.
+    #[test]
+    fn user_cfg_setting_default_decides_the_default_entry() {
+        let (top, grub) = two_kernels("default-user-cfg", "${saved_entry}", &format!("saved_entry={KVER}\n"));
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
+        put(&top.join("root/boot/grub2/user.cfg"), "set default=1\n");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(fails_naming(kernel_entry_status(&grub), "'set default=1' in user.cfg"));
+        put(&top.join("root/boot/grub2/user.cfg"), "set default=$chosen_by_user\n");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(cannot_verify(kernel_entry_status(&grub), "user.cfg sets default"));
+
+        // A menu of boot entries that all resolve boots one that resolves.
+        fs::remove_file(top.join(format!("root/boot/loader/entries/{OLDER}.conf"))).unwrap();
+        put(&top.join("root/boot/grub2/grub.cfg"),
+            &format!("{LOAD_GRUBENV}source ${{prefix}}/user.cfg\n{SEARCH_ROOT}insmod blscfg\nblscfg\n"));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Pass));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // A group with nothing to check passes; it is no warning.
+    #[test]
+    fn a_group_with_no_results_passes() {
+        assert!(matches!(evaluate_checks(vec![("System mounts", Vec::new().into())]), BootStatus::Pass));
+    }
+
+    // When check cannot verify the default entry, a broken entry beside it
+    // is reported as broken, not as one check cannot verify.
+    #[test]
+    fn a_broken_entry_beside_a_default_check_cannot_verify_is_not_reported_as_unverified() {
+        let (top, _) = generated_layout("default-unverified", &format!("{BLSDIR_TOP_LEVEL}saved_entry={KVER}\n"),
+            &bls_entry(&format!("/root/locked/vmlinuz-{KVER}"), &[&format!("/root/boot/initramfs-{KVER}.img")]));
+        put(&top.join(format!("root/boot/loader/entries/{OLDER}.conf")), &older_entry());
+        put(&top.join(format!("root/locked/vmlinuz-{KVER}")), "kernel");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let locked = top.join("root/locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::symlink_metadata(locked.join(format!("vmlinuz-{KVER}"))).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: this process reads directories without permission");
+            return;
+        }
+        let status = kernel_entry_status(&grub);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        match status {
+            BootStatus::Inaccessible { reason, .. } => {
+                assert!(reason.contains("ermission denied") && !reason.contains(OLDER), "{reason}");
+            }
+            _ => panic!("not reported as unverified"),
+        }
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // grub.cfg loads grubenv before blscfg, and GRUB's Btrfs driver reads
     // btrfs_relative_path at each mount (btrfs.c, grub_btrfs_mount and
     // find_path): grub.cfg is looked up from the top level, as the stub
@@ -1179,6 +1996,16 @@ blscfg
         let (top, grub) = generated_layout("phase-subvol", "btrfs_relative_path=1\nbtrfs_subvol=root\n",
             &entry_from_root_subvol());
         assert!(matches!(&grub, Err(GrubContextError::Other(msg)) if msg.contains("grubenv sets btrfs_subvol,")), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // An empty btrfs_subvol, as grub2-editenv leaves it after unset, names
+    // no subvolume (btrfs.c, lookup_root_by_name).
+    #[test]
+    fn grubenv_empty_btrfs_subvol_with_btrfs_relative_path_is_followed() {
+        let (top, grub) = generated_layout("phase-subvol-empty", "btrfs_relative_path=1\nbtrfs_subvol=\n",
+            &entry_from_root_subvol());
+        assert!(grub.as_ref().is_ok_and(|grub| passes(&bls_entries(grub))), "{:?}", grub.as_ref().err());
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -1253,9 +2080,163 @@ blscfg
             let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
             assert!(cannot_verify_naming(grub, variable), "{variable}");
 
-            // After blscfg, grub.cfg no longer decides where the entries are.
-            put(&top.join("root/boot/grub2/grub.cfg"), &format!("insmod blscfg\nblscfg\nset {variable}=x\n"));
-            assert!(context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).is_ok(), "{variable}");
+            // After blscfg, blsdir no longer decides where the entries are.
+            if variable == "blsdir" {
+                put(&top.join("root/boot/grub2/grub.cfg"), &format!("{}set {variable}=x\n", grub_cfg()));
+                assert!(context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).is_ok(), "{variable}");
+            }
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // blscfg reads the boot entries from the device in root (Fedora's grub2
+    // 2.12 patches, grub-core/commands/blscfg.c, bls_load_entries), which
+    // 10_linux's search sets to the boot filesystem by its UUID
+    // (util/grub-mkconfig_lib.in, prepare_grub_to_access_device). Before
+    // that, root is the device GRUB started from, the EFI system partition
+    // (grub-core/kern/main.c, grub_set_prefix_and_root).
+    #[test]
+    fn blscfg_reads_the_entries_from_the_device_in_root() {
+        let top = scratch("root-device");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub_cfg_path = top.join("root/boot/grub2/grub.cfg");
+        let stub = esp_stub(false, STUB_TOP_LEVEL_PREFIX);
+        for (script, needle) in [
+            (format!("{LOAD_GRUBENV}insmod blscfg\nblscfg\n"), "EFI system partition"),
+            (format!("{LOAD_GRUBENV}search --no-floppy --fs-uuid --set=root 0badc0de\nblscfg\n"), "UUID=0badc0de"),
+            (format!("{LOAD_GRUBENV}{SEARCH_ROOT}set root=hd1,gpt2\nblscfg\n"), "set root=hd1,gpt2"),
+            (format!("{LOAD_GRUBENV}{SEARCH_ROOT}search --set 0badc0de\nblscfg\n"), "search --set 0badc0de"),
+        ] {
+            put(&grub_cfg_path, &script);
+            assert!(cannot_verify_naming(context_from_stub(&top, &stub), needle), "{script}");
+        }
+
+        // grubenv sets root where grub.cfg loads it: before the search, the
+        // search replaces it; after, it holds.
+        put(&top.join("root/boot/grub2/grubenv"), &grubenv(&format!("{BLSDIR_TOP_LEVEL}root=hd1,gpt2\n")));
+        put(&grub_cfg_path, &format!("{SEARCH_ROOT}{LOAD_GRUBENV}blscfg\n"));
+        assert!(cannot_verify_naming(context_from_stub(&top, &stub), "grubenv sets root"));
+        put(&grub_cfg_path, &grub_cfg());
+        assert!(context_from_stub(&top, &stub).is_ok());
+        put(&top.join("root/boot/grub2/grubenv"), &grubenv(BLSDIR_TOP_LEVEL));
+
+        // The compatibility line before the search, hints, and the case of
+        // the UUID, which search compares without it (commands/search.c).
+        put(&grub_cfg_path, &format!("{LOAD_GRUBENV}set root='hd0,gpt2'\n\
+            if [ x$feature_platform_search_hint = xy ]; then\n\
+              search --no-floppy --fs-uuid --set=root --hint-efi=hd0,gpt2 3F2A9C41\n\
+            else\n  search --no-floppy --fs-uuid --set=root 3f2a9c41\nfi\nblscfg\n"));
+        let grub = context_from_stub(&top, &stub);
+        assert!(grub.as_ref().is_ok_and(|grub| passes(&bls_entries(grub))), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // A menu entry blscfg adds looks its kernel up when it is booted,
+    // with the variables grub.cfg leaves: its linux and initrd lines name
+    // ($root) (blscfg.c, create_entry), and GRUB's Btrfs driver reads
+    // btrfs_relative_path, btrfs_subvol and btrfs_subvolid at each mount
+    // (btrfs.c, grub_btrfs_mount). So after blscfg, grub.cfg and the
+    // custom.cfg 41_custom sources (util/grub.d/41_custom.in:3-7) must not
+    // set those or root, and a second blscfg adds entries read with other
+    // values.
+    #[test]
+    fn grub_cfg_moving_the_kernel_lookup_after_blscfg_cannot_be_verified() {
+        let (top, grub) = generated_layout("after-blscfg", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        assert!(grub.is_ok(), "{:?}", grub.as_ref().err());
+        let stub = esp_stub(false, STUB_TOP_LEVEL_PREFIX);
+        for (line, needle) in [
+            ("set btrfs_relative_path=1", "btrfs_relative_path"),
+            ("set btrfs_subvol=@", "btrfs_subvol"),
+            ("btrfs_subvolid=256", "btrfs_subvolid"),
+            ("set root=hd1,gpt2", "root"),
+            (SEARCH_ROOT.trim(), "root"),
+            ("source /root/boot/grub2/other.cfg", "other.cfg"),
+            ("blscfg", "blscfg"),
+            ("set config_directory=/elsewhere", "config_directory"),
+        ] {
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{GENERATED_GRUB_CFG}{line}\n"));
+            assert!(cannot_verify_naming(context_from_stub(&top, &stub), needle), "grub.cfg: {line}");
+            put(&top.join("root/boot/grub2/grub.cfg"), GENERATED_GRUB_CFG);
+            put(&top.join("root/boot/grub2/custom.cfg"), &format!("{line}\n"));
+            assert!(cannot_verify_naming(context_from_stub(&top, &stub), "custom.cfg"), "custom.cfg: {line}");
+            fs::remove_file(top.join("root/boot/grub2/custom.cfg")).unwrap();
+        }
+
+        // blsdir and the variables 10_reset_boot_success sets are not read
+        // once blscfg has listed the entries.
+        put(&top.join("root/boot/grub2/custom.cfg"), "set blsdir=/elsewhere\nset boot_success=0\n");
+        assert!(context_from_stub(&top, &stub).is_ok());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // env_block and dev name where the header loads env_block, prefix where
+    // 01_users reads user.cfg, and config_directory where the header reads
+    // grubenv (00_header.in:56-70, 01_users.in:3-4), so grub.cfg setting one
+    // before blscfg moves a load check follows.
+    #[test]
+    fn grub_cfg_setting_where_variables_load_from_before_blscfg_cannot_be_verified() {
+        for variable in ["env_block", "dev", "prefix", "config_directory"] {
+            let top = scratch(&format!("phase-script-{variable}"));
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("set {variable}=x\n{}", grub_cfg()));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+            assert!(cannot_verify_naming(grub, variable), "{variable}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // GRUB sets a variable only through a command that assigns it
+    // (kern/corecmd.c, set and unset; script/execute.c, NAME=VALUE), so a
+    // line that only expands a lookup variable leaves it as it is, and the
+    // body of a function runs only when it is called.
+    #[test]
+    fn grub_cfg_reading_a_lookup_variable_before_blscfg_is_followed() {
+        for script in [
+            "if [ -z \"${blsdir}\" ]; then echo none; fi",
+            "echo $btrfs_relative_path ${btrfs_subvol}",
+            "function elsewhere {\n  set blsdir=/elsewhere\n}",
+        ] {
+            let top = scratch("phase-script-read");
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{LOAD_GRUBENV}{script}\n{SEARCH_ROOT}insmod blscfg\nblscfg\n"));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+            assert!(grub.is_ok(), "{script}: {:?}", grub.as_ref().err());
+            assert!(passes(&bls_entries(&grub.unwrap())), "{script}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // 00_header writes these for a theme on a graphical terminal
+    // (util/grub.d/00_header.in:183-226 and 262-310); loading a font or a
+    // background image and choosing a terminal set no variable
+    // (grub-core/font/font_cmd.c, term/gfxterm_background.c,
+    // commands/terminal.c).
+    #[test]
+    fn grub_cfg_loading_a_theme_before_blscfg_is_followed() {
+        let top = scratch("phase-script-theme");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/grub2/grub.cfg"), &format!("{LOAD_GRUBENV}\
+            if loadfont unicode ; then\n  set gfxmode=auto\n  insmod gfxterm\nfi\n\
+            terminal_input console\nterminal_output gfxterm\ninsmod gfxmenu\n\
+            loadfont ($root)/usr/share/grub/themes/starfield/dejavu_10.pf2\n\
+            background_image -m stretch ($root)/usr/share/grub/themes/starfield/starfield.png\n\
+            set theme=($root)/usr/share/grub/themes/starfield/theme.txt\nexport theme\n\
+            {SEARCH_ROOT}insmod blscfg\nblscfg\n"));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+        assert!(grub.as_ref().is_ok_and(|grub| passes(&bls_entries(grub))), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // A command whose variable name, or whose command name, is the value of
+    // a variable can set any variable (script/execute.c, grub_script_execute_cmdline).
+    #[test]
+    fn grub_cfg_assigning_through_an_expansion_before_blscfg_cannot_be_verified() {
+        for line in ["set ${x}=/elsewhere", "${x}=/elsewhere", "unset $x", "search --fs-uuid --set=$x 3f2a9c41", "$cmd"] {
+            let top = scratch("phase-script-expansion");
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{line}\ninsmod blscfg\nblscfg\n"));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+            assert!(cannot_verify_naming(grub, line), "{line}");
             fs::remove_dir_all(&top).unwrap();
         }
     }
@@ -1287,6 +2268,78 @@ blscfg
         fs::remove_dir_all(&top).unwrap();
     }
 
+    // --- the GRUB_ENV EFI variable ---
+
+    /// GRUB_ENV's data setting vars, laid out as grub2-editenv lays out
+    /// grubenv.
+    fn grub_env(vars: &str) -> Vec<u8> {
+        format!("# GRUB Environment Block\n{vars}").into_bytes()
+    }
+
+    // GRUB sets GRUB_ENV's variables when it starts, before it runs the ESP
+    // stub (Fedora's grub2 2.12 patches, grub-core/kern/efi/init.c,
+    // grub_efi_env_init), so they reach grub.cfg and blscfg as the stub's
+    // do. It iterates them without checking the signature, from the byte
+    // after it (grub-core/lib/envblk.c, grub_envblk_iterate).
+    #[test]
+    fn grub_env_variables_reach_blscfg() {
+        let top = scratch("grub-env-blsdir");
+        install_subvol(&top, "root", "", &entry_from_top_level());
+        let stub = esp_stub(false, STUB_TOP_LEVEL_PREFIX);
+        let results = bls_entries(&context_from_stub(&top, &stub).unwrap());
+        assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{results:?}");
+
+        let grub = context_with_grub_env(&top, &stub, Some(&grub_env(BLSDIR_TOP_LEVEL))).unwrap();
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        let unsigned = format!("{}\n{BLSDIR_TOP_LEVEL}", "x".repeat(24));
+        let grub = context_with_grub_env(&top, &stub, Some(unsigned.as_bytes())).unwrap();
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn grub_env_btrfs_relative_path_moves_the_lookup_of_grub_cfg() {
+        let top = scratch("grub-env-relative");
+        install_subvol(&top, "root", "", &entry_from_root_subvol());
+        let grub = context_with_grub_env(&top, &esp_stub(false, "/boot/grub2"),
+            Some(&grub_env("btrfs_relative_path=1\n"))).unwrap();
+        assert!(passes(&check_grub_cfg(&grub, None)), "{:?}", check_grub_cfg(&grub, None));
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The stub's search sets dev and its set prefix= sets prefix, replacing
+    // GRUB_ENV's values. The Btrfs driver registers the write hooks of
+    // btrfs_subvol and btrfs_subvolid when its module starts, after GRUB has
+    // set GRUB_ENV's variables (grub-core/kern/main.c, grub_main: machine
+    // init, then the modules), and registering a hook keeps a value without
+    // running it (grub-core/kern/env.c, grub_register_variable_hook), so
+    // GRUB_ENV's btrfs_subvol points the driver at no subvolume.
+    #[test]
+    fn grub_env_values_the_stub_or_the_btrfs_driver_replace_are_not_refused() {
+        let (top, _) = generated_layout("grub-env-replaced", "env_block=/root/boot/grub2/envblock\n", &entry_from_top_level());
+        put(&top.join("root/boot/grub2/envblock"), &grubenv(BLSDIR_TOP_LEVEL));
+        let grub = context_with_grub_env(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX),
+            Some(&grub_env("dev=hd9,gpt9\nprefix=/elsewhere\n")));
+        assert!(grub.as_ref().is_ok_and(|grub| passes(&bls_entries(grub))), "{:?}", grub.as_ref().err());
+
+        let grub = context_with_grub_env(&top, &esp_stub(true, "/boot/grub2"), Some(&grub_env("btrfs_subvol=@\n")));
+        assert!(grub.is_ok(), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // grub.cfg loads grubenv after the stub, so grubenv replaces GRUB_ENV's
+    // value.
+    #[test]
+    fn grubenv_replaces_a_grub_env_value() {
+        let top = scratch("grub-env-grubenv");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = context_with_grub_env(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX),
+            Some(&grub_env("blsdir=/elsewhere\n"))).unwrap();
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // --- refusals: each check fails on a seeded defect ---
 
     // The live root keeps its grub.cfg; the snapshot, whose prefix GRUB
@@ -1315,6 +2368,38 @@ blscfg
         put(&top.join("snap1/boot/grub2/grub.cfg"), "set timeout=5\n");
         let results = check_grub_cfg(&grub, None);
         assert!(refuses(&results, "does not use Boot Loader Specification entries"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // grub.cfg lists the boot entries only by running blscfg, or bls_import,
+    // which blscfg.c registers as the same command (GRUB_MOD_INIT); loading
+    // the module, a comment, or the body of a menu entry does not.
+    #[test]
+    fn grub_cfg_that_does_not_run_blscfg_is_refused() {
+        let top = scratch("refuse-no-blscfg-command");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX);
+        let grub_cfg = top.join("root/boot/grub2/grub.cfg");
+        for script in ["insmod blscfg\n", "# blscfg\n", "menuentry 'other' {\n  blscfg\n}\n"] {
+            put(&grub_cfg, script);
+            let results = check_grub_cfg(&grub, None);
+            assert!(refuses(&results, "does not use Boot Loader Specification entries"), "{script}: {results:?}");
+        }
+        put(&grub_cfg, "insmod blscfg\nbls_import\n");
+        let results = check_grub_cfg(&grub, None);
+        assert!(passes(&results), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // blscfg with an argument lists only some entries, or entries from
+    // another directory (blscfg.c, grub_cmd_blscfg).
+    #[test]
+    fn grub_cfg_running_blscfg_with_an_argument_cannot_be_verified() {
+        let top = scratch("blscfg-argument");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/grub2/grub.cfg"), "insmod blscfg\nblscfg (hd0,gpt2)/loader/entries\n");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+        assert!(cannot_verify_naming(grub, "blscfg (hd0,gpt2)/loader/entries"));
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -1381,7 +2466,7 @@ blscfg
             return;
         }
 
-        let status = evaluate_checks(vec![("Kernel boot entry", bls_entries(&grub))]);
+        let status = evaluate_checks(vec![("Kernel boot entry", check_bls_entries(&grub, &grub.blsdir()))]);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         match status {
             BootStatus::Inaccessible { reason, .. } => {

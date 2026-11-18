@@ -6,12 +6,14 @@ mod consts;
 mod diskspace;
 mod grub;
 mod kernel_hook;
+mod menu;
 mod migrate;
 mod parse;
 mod platform;
 #[cfg(any(test, kani))]
 mod proof;
 mod rollback;
+mod script;
 mod snapshot;
 mod swap;
 mod tools;
