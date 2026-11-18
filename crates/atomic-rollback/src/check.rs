@@ -1709,6 +1709,59 @@ fi
         fs::remove_dir_all(&top).unwrap();
     }
 
+    /// 08_fallback_counting's block as Fedora 43's grub2-mkconfig writes it
+    /// (grub.cfg lines 86-101 of the repository CI's fedora-43 image), which
+    /// saves boot_counter without the env_block test Fedora 45's has.
+    const FALLBACK_COUNTING_FEDORA_43: &str = "\
+insmod increment
+# Check if boot_counter exists and boot_success=0 to activate this behaviour.
+if [ -n \"${boot_counter}\" -a \"${boot_success}\" = \"0\" ]; then
+  # if countdown has ended, choose to boot rollback deployment,
+  # i.e. default=1 on OSTree-based systems.
+  if  [ \"${boot_counter}\" = \"0\" -o \"${boot_counter}\" = \"-1\" ]; then
+    set default=1
+    set boot_counter=-1
+  # otherwise decrement boot_counter
+  else
+    decrement boot_counter
+  fi
+  save_env boot_counter
+fi
+";
+
+    /// Fedora's generated grub.cfg with Fedora 43's 08_fallback_counting.
+    fn fedora_43_grub_cfg() -> String {
+        let start = GENERATED_GRUB_CFG.find("insmod increment\n").unwrap();
+        let end = GENERATED_GRUB_CFG.find("### END /etc/grub.d/08_fallback_counting ###").unwrap();
+        format!("{}{FALLBACK_COUNTING_FEDORA_43}{}", &GENERATED_GRUB_CFG[..start], &GENERATED_GRUB_CFG[end..])
+    }
+
+    // GRUB runs the block's body only when its test holds
+    // (08_fallback_counting.in:12): with boot_counter unset or empty it
+    // cannot change default, whatever its other lines; set, the body sets
+    // default to 1 when boot_counter is 0 or -1, and leaves it otherwise.
+    #[test]
+    fn fedora_43s_boot_counter_decides_the_default_entry_only_when_its_test_holds() {
+        for (vars, by_default) in [
+            (format!("saved_entry={KVER}\n"), KVER),
+            (format!("saved_entry={KVER}\nboot_counter=\nboot_success=0\n"), KVER),
+            (format!("saved_entry={KVER}\nboot_counter=2\nboot_success=0\n"), KVER),
+            (format!("saved_entry={KVER}\nboot_counter=-1\nboot_success=0\n"), OLDER),
+        ] {
+            let (top, _) = two_kernels("default-counter-43", "${saved_entry}", &vars);
+            put(&top.join("root/boot/grub2/grub.cfg"), &fedora_43_grub_cfg());
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+            let status = kernel_entry_status(&grub);
+            if by_default == KVER {
+                assert!(matches!(status, BootStatus::Warn), "{vars}");
+            } else {
+                assert!(fails_naming(status, OLDER), "{vars}");
+            }
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+
     // When the default entry fails, GRUB tries the entries fallback names
     // (grub-core/normal/menu.c, grub_menu_execute_with_fallback), which
     // check does not follow.
@@ -1738,7 +1791,8 @@ fi
         let counted = group.counted.join(" ");
         assert!(counted.contains(&format!("GRUB boots 'Fedora Linux ({KVER})'")), "{counted}");
         assert!(counted.contains("when no key is pressed"), "{counted}");
-        assert!(counted.contains(&format!("default is '{KVER}' (from saved_entry in grubenv)")), "{counted}");
+        assert!(counted.contains(&format!("default is '{KVER}' (from 'set default=\"${{saved_entry}}\"' in grub.cfg, \
+            saved_entry from grubenv)")), "{counted}");
         assert!(counted.contains("does not count the menu's timeout"), "{counted}");
         assert!(group.warnings.iter().any(|w| w.contains(OLDER) && w.contains("does not boot by default")), "{:?}", group.warnings);
         fs::remove_dir_all(&top).unwrap();
@@ -1788,14 +1842,17 @@ menuentry 'Windows Boot Manager (on /dev/nvme0n1p1)' --class windows --class os 
         }
     }
 
-    // user.cfg runs after 00_header sets default (01_users.in:3-4), so it
-    // can set default to anything: GRUB boots any entry of the menu, which
-    // in Fedora's grub.cfg may hold the UEFI firmware entry.
+    // user.cfg runs after 00_header sets default (01_users.in:3-4): check
+    // follows a value it can evaluate, and otherwise GRUB boots any entry
+    // of the menu.
     #[test]
-    fn user_cfg_setting_default_leaves_any_menu_entry_the_default() {
+    fn user_cfg_setting_default_decides_the_default_entry() {
         let (top, grub) = two_kernels("default-user-cfg", "${saved_entry}", &format!("saved_entry={KVER}\n"));
         assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
         put(&top.join("root/boot/grub2/user.cfg"), "set default=1\n");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(fails_naming(kernel_entry_status(&grub), "'set default=1' in user.cfg"));
+        put(&top.join("root/boot/grub2/user.cfg"), "set default=$chosen_by_user\n");
         let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
         assert!(cannot_verify(kernel_entry_status(&grub), "user.cfg sets default"));
 

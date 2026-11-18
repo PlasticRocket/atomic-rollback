@@ -492,12 +492,28 @@ const LOADING_VARIABLES: [&str; 3] = ["env_block", "dev", "prefix"];
 /// boot_counter and boot_success (08_fallback_counting.in:12-16), fallback,
 /// which names the entries GRUB tries when that one fails
 /// (grub-core/normal/menu.c, grub_menu_execute_with_fallback), and
-/// feature_menuentry_id and menuentry_id_option, which decide how a menu
-/// entry grub.cfg defines names its id (00_header.in:108-112).
-const MENU_VARIABLES: [&str; 8] = [
-    "default", "next_entry", "saved_entry", "boot_counter", "boot_success", "fallback",
-    "feature_menuentry_id", "menuentry_id_option",
+/// menuentry_id_option, which decides how a menu entry grub.cfg defines
+/// names its id (00_header.in:108-112).
+const MENU_VARIABLES: [&str; 7] = [
+    "default", "next_entry", "saved_entry", "boot_counter", "boot_success", "fallback", "menuentry_id_option",
 ];
+
+/// The variables normal mode sets when it starts, which generated grub.cfg
+/// tests: each feature it has, set to "y", and grub_platform, "efi" for the
+/// EFI GRUB check verifies (grub-core/normal/main.c, features and
+/// GRUB_MOD_INIT).
+const NORMAL_MODE_VARIABLES: [&str; 12] = [
+    "feature_chainloader_bpb", "feature_ntldr", "feature_platform_search_hint",
+    "feature_default_font_path", "feature_all_video_module", "feature_menuentry_id",
+    "feature_menuentry_options", "feature_200_final", "feature_nativedisk_cmd",
+    "feature_timeout_style", "feature_search_cryptodisk_only", "grub_platform",
+];
+
+/// The value normal mode gives each feature it has, and the platform of an
+/// EFI GRUB (grub-core/normal/main.c, GRUB_MOD_INIT; configure.ac, platform).
+const FEATURE_VALUE: &str = "y";
+const EFI_PLATFORM: &str = "efi";
+const NORMAL_MODE: &str = "normal mode";
 
 /// Where an assignment check follows was made.
 const GRUB_ENV: &str = "the GRUB_ENV EFI variable";
@@ -603,7 +619,7 @@ impl GrubVariables {
     /// contract values, so an earlier value of either does not hold.
     fn apply_stub(&mut self, stub_text: &str) {
         for line in tools::before_configfile(stub_text) {
-            for name in LOOKUP_VARIABLES.into_iter().chain(["env_block"]).chain(MENU_VARIABLES) {
+            for name in LOOKUP_VARIABLES.into_iter().chain(["env_block"]).chain(MENU_VARIABLES).chain(NORMAL_MODE_VARIABLES) {
                 if let Some(value) = tools::grub_assignment(line, name) {
                     self.assign(name, value.to_string(), ESP_STUB);
                 }
@@ -625,12 +641,12 @@ impl GrubVariables {
     /// values of those point the driver at no subvolume. GRUB then sets root
     /// to the device it started from (grub-core/kern/main.c,
     /// grub_set_prefix_and_root), so GRUB_ENV's root does not hold either,
-    /// and normal mode sets feature_menuentry_id to "y" when it starts
+    /// and normal mode sets its own variables when it starts, later
     /// (grub-core/normal/main.c, GRUB_MOD_INIT).
     fn load_grub_env(&mut self, data: &[u8]) -> Result<(), GrubContextError> {
         for (name, value) in envblk_iterate(data) {
             let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES)
-                .chain(MENU_VARIABLES.into_iter().filter(|&n| n != "feature_menuentry_id"))
+                .chain(MENU_VARIABLES)
                 .find(|n| n.as_bytes() == name) else {
                 continue;
             };
@@ -677,6 +693,7 @@ impl GrubVariables {
         let mut set = Vec::new();
         for (name, value) in envblk_assignments(block).unwrap_or_default() {
             let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).chain(["root"]).chain(MENU_VARIABLES)
+                .chain(NORMAL_MODE_VARIABLES)
                 .find(|n| n.as_bytes() == name) else {
                 continue;
             };
@@ -702,217 +719,111 @@ impl GrubVariables {
     }
 }
 
-/// What a GRUB script file does that check follows, in the order it does
-/// it.
+/// What a line of Fedora's generated grub.cfg does that check follows as a
+/// step of its own.
 enum Step {
     /// 00_header's load_env of grubenv from the GRUB directory, which is
     /// grub.cfg's config_directory (normal/main.c, read_config_file) and
     /// the prefix (util/grub.d/00_header.in:56-60).
     LoadGrubenv,
-    /// 00_header's load_env of env_block, when it is set, on the device the
-    /// stub's search left in dev (00_header.in:62-70).
+    /// 00_header's load_env of env_block on the device the stub's search
+    /// left in dev (00_header.in:62-70).
     LoadEnvBlock,
     /// 01_users's source of user.cfg from the prefix (util/grub.d/01_users.in:3-4).
     SourceUserCfg,
     /// 41_custom's source of custom.cfg from config_directory, which is the
-    /// GRUB directory, when it is a file there (util/grub.d/41_custom.in:3-4).
+    /// GRUB directory (util/grub.d/41_custom.in:3-4).
     SourceCustomCfg,
-    /// 00_header's choice of default: next_entry when it is not empty, else
-    /// GRUB_DEFAULT as grub2-mkconfig wrote it (util/grub.d/00_header.in:92-103).
-    SetDefault(GrubDefault),
-    /// 00_header's choice of menuentry_id_option: "--id" when
-    /// feature_menuentry_id is "y", else empty (00_header.in:108-112).
-    SetMenuentryIdOption,
-    /// 08_fallback_counting: default 1 when boot_counter is "0" or "-1" and
-    /// boot_success is "0" (util/grub.d/08_fallback_counting.in:12-27).
-    FallbackCounting,
-    /// Any other command, where it stands.
-    Run(script::Command),
 }
 
 /// The step a line of Fedora's generated grub.cfg is, for the lines check
 /// follows as steps of their own; Some(None) for a line that is no step:
 /// 00_header's lines that put the device in front of env_block, which
-/// LoadEnvBlock models, and 41_custom's source of $prefix/custom.cfg, which
-/// runs only when config_directory is empty, as normal mode never leaves it
-/// for grub.cfg (normal/main.c, read_config_file).
+/// LoadEnvBlock models, and 41_custom's source of $prefix/custom.cfg, the
+/// same file. The tests around them decide whether they run, as for any
+/// other command.
 fn generated_step(line: &str) -> Option<Option<Step>> {
     Some(match line {
         "load_env -f ${config_directory}/grubenv" | "load_env" => Some(Step::LoadGrubenv),
         "set env_block=\"(${dev})${env_block}\"" | "set env_block=\"(${root})${env_block}\"" => None,
         "load_env -f \"${env_block}\"" => Some(Step::LoadEnvBlock),
         "source ${prefix}/user.cfg" => Some(Step::SourceUserCfg),
-        "source ${config_directory}/custom.cfg" => Some(Step::SourceCustomCfg),
-        "source $prefix/custom.cfg" => None,
+        "source ${config_directory}/custom.cfg" | "source $prefix/custom.cfg" => Some(Step::SourceCustomCfg),
         _ => return None,
     })
 }
 
-/// GRUB_DEFAULT as grub2-mkconfig writes it into 00_header's
-/// set default="..." (util/grub.d/00_header.in:44-45 and 102).
-enum GrubDefault {
-    /// GRUB_DEFAULT=saved: the value of saved_entry.
-    SavedEntry,
-    /// A value with no variable or escape in it.
-    Literal(String),
-    /// A value check does not interpret, on this line.
-    Script(String),
-}
+/// The variables, besides the lookup variables, that a script line before
+/// blscfg must not set: those naming where grub.cfg reads more variables,
+/// and config_directory, where it reads grubenv (00_header.in:56-57).
+const SCRIPT_LOADING_VARIABLES: [&str; 4] = ["env_block", "dev", "prefix", "config_directory"];
 
-impl GrubDefault {
-    fn read(line: &str) -> Option<Self> {
-        let value = line.strip_prefix("set default=\"")?.strip_suffix('"')?;
-        Some(if value == "${saved_entry}" {
-            GrubDefault::SavedEntry
-        } else if value.contains(['$', '"', '\\']) {
-            GrubDefault::Script(line.to_string())
-        } else {
-            GrubDefault::Literal(value.to_string())
-        })
-    }
-}
+/// The variables a script line after blscfg must not set: those GRUB reads
+/// when it boots an entry blscfg added, whose linux and initrd lines name
+/// ($root) (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c,
+/// create_entry) and whose files the Btrfs driver looks up with
+/// btrfs_relative_path, btrfs_subvol and btrfs_subvolid (btrfs.c,
+/// grub_btrfs_mount), and config_directory, where 41_custom reads
+/// custom.cfg (util/grub.d/41_custom.in:3-4).
+const AFTER_BLSCFG_VARIABLES: [&str; 5] = ["btrfs_relative_path", "btrfs_subvol", "btrfs_subvolid", "root", "config_directory"];
 
-/// A line of a block of Fedora's generated grub.cfg, as check matches it.
-#[derive(Clone, Copy)]
-enum Template {
-    Line(&'static str),
-    /// 00_header's set default="..." with GRUB_DEFAULT in it.
-    SetGrubDefault,
-}
+/// The variables whose value names a device or the GRUB directory on it,
+/// never empty where check follows grub.cfg: dev, which the stub's search
+/// sets, root (grub-core/kern/main.c, grub_set_prefix_and_root), prefix,
+/// and config_directory (normal/main.c, read_config_file).
+const DEVICE_VARIABLES: [&str; 4] = ["dev", "root", "prefix", "config_directory"];
 
-use Template::{Line, SetGrubDefault};
+/// The deepest test GRUB evaluates in parentheses (commands/test.c,
+/// MAX_TEST_RECURSION_DEPTH).
+const MAX_TEST_RECURSION_DEPTH: u32 = 100;
 
-/// 00_header's choice of default (util/grub.d/00_header.in:92-103).
-const SET_DEFAULT_BLOCK: [Template; 12] = [
-    Line("if [ \"${next_entry}\" ] ; then"),
-    Line("set default=\"${next_entry}\""),
-    Line("set next_entry="),
-    Line("if [ \"${env_block}\" ] ; then"),
-    Line("save_env -f \"${env_block}\" next_entry"),
-    Line("else"),
-    Line("save_env next_entry"),
-    Line("fi"),
-    Line("set boot_once=true"),
-    Line("else"),
-    SetGrubDefault,
-    Line("fi"),
-];
-
-/// 00_header's choice of menuentry_id_option (00_header.in:108-112).
-const MENUENTRY_ID_OPTION_BLOCK: [Template; 5] = [
-    Line("if [ x\"${feature_menuentry_id}\" = xy ]; then"),
-    Line("menuentry_id_option=\"--id\""),
-    Line("else"),
-    Line("menuentry_id_option=\"\""),
-    Line("fi"),
-];
-
-/// 08_fallback_counting (util/grub.d/08_fallback_counting.in:12-27).
-const FALLBACK_COUNTING_BLOCK: [Template; 13] = [
-    Line("if [ -n \"${boot_counter}\" -a \"${boot_success}\" = \"0\" ]; then"),
-    Line("if  [ \"${boot_counter}\" = \"0\" -o \"${boot_counter}\" = \"-1\" ]; then"),
-    Line("set default=1"),
-    Line("set boot_counter=-1"),
-    Line("else"),
-    Line("decrement boot_counter"),
-    Line("fi"),
-    Line("if [ \"${env_block}\" ]; then"),
-    Line("save_env -f \"${env_block}\" boot_counter"),
-    Line("else"),
-    Line("save_env boot_counter"),
-    Line("fi"),
-    Line("fi"),
-];
-
-/// Whether line is blank or a comment, which GRUB's lexer skips (yylex.l).
-fn skipped_by_lexer(line: &str) -> bool {
-    let line = line.trim();
-    line.is_empty() || line.starts_with('#')
-}
-
-/// The lines from start matched against template, skipping blank and
-/// comment lines after the first: the index after the match, and the
-/// GRUB_DEFAULT it holds, when they match.
-fn match_block(lines: &[&str], start: usize, template: &[Template]) -> Option<(usize, Option<GrubDefault>)> {
-    let mut at = start;
-    let mut grub_default = None;
-    for (k, expected) in template.iter().enumerate() {
-        while k > 0 && lines.get(at).is_some_and(|line| skipped_by_lexer(line)) {
-            at += 1;
-        }
-        let line = lines.get(at)?.trim();
-        match expected {
-            Line(text) if line == *text => {}
-            Line(_) => return None,
-            SetGrubDefault => grub_default = Some(GrubDefault::read(line)?),
-        }
-        at += 1;
-    }
-    Some((at, grub_default))
-}
-
-/// The step that a block of Fedora's generated grub.cfg starting at
-/// lines[start] is, with the index after it.
-fn generated_block(lines: &[&str], start: usize) -> Option<(usize, Step)> {
-    if let Some((end, Some(grub_default))) = match_block(lines, start, &SET_DEFAULT_BLOCK) {
-        return Some((end, Step::SetDefault(grub_default)));
-    }
-    if let Some((end, _)) = match_block(lines, start, &MENUENTRY_ID_OPTION_BLOCK) {
-        return Some((end, Step::SetMenuentryIdOption));
-    }
-    match_block(lines, start, &FALLBACK_COUNTING_BLOCK).map(|(end, _)| (end, Step::FallbackCounting))
-}
-
-/// The steps of the GRUB script file script, named file. generated says
-/// whether Fedora's generated lines may appear in it. A line check cannot
-/// read leaves what GRUB does unknown.
-fn steps(script: &str, file: &str, generated: bool) -> Result<Vec<Step>, GrubContextError> {
-    let lines: Vec<&str> = script.lines().collect();
-    let mut steps = Vec::new();
-    let mut reader = script::Reader::default();
-    let mut at = 0;
-    while at < lines.len() {
-        let line = lines[at];
-        let trimmed = line.trim();
-        if generated && !reader.in_body() {
-            if let Some((end, step)) = generated_block(&lines, at) {
-                steps.push(step);
-                at = end;
-                continue;
-            }
-            if let Some(step) = generated_step(trimmed) {
-                steps.extend(step);
-                at += 1;
-                continue;
-            }
-        }
-        let commands = reader.line(line).map_err(|why| GrubContextError::CannotVerify(format!(
-            "{file} has the line '{trimmed}', which check cannot read: {why}")))?;
-        steps.extend(commands.into_iter().map(Step::Run));
-        at += 1;
-    }
-    Ok(steps)
-}
-
-/// The operators GRUB's test reads in the place of a three-argument test's
-/// operator (grub-core/commands/test.c, test_parse): a value equal to one
-/// there changes what the test compares. -nt and -ot take a suffix.
-const TEST_OPERATORS: [&str; 15] = [
-    "=", "==", "!=", "<", "<=", ">", ">=", "-eq", "-ge", "-gt", "-le", "-lt", "-ne", "-pgt", "-plt",
-];
-
-fn is_test_operator(value: &str) -> bool {
-    TEST_OPERATORS.contains(&value) || value.starts_with("-nt") || value.starts_with("-ot")
-}
-
-/// What $menuentry_id_option expands to where a script defines a menu entry.
-enum IdOption {
-    /// Nothing: the variable is unset or empty, so an entry's id is its title.
-    Empty,
-    /// "--id", so the word after it is the entry's id.
-    Id,
-    /// A value set where check does not follow.
+/// An argument of a test as check knows it.
+enum TestArgument {
+    Known(String),
+    /// A value check does not know but that is not empty and is no
+    /// operator: a device or GRUB directory.
+    NonEmpty,
+    /// A file in the GRUB directory, by its GRUB path.
+    GrubDirFile(String),
+    /// A value check does not know.
     Unknown,
+}
+
+impl TestArgument {
+    /// The argument as an operator or keyword of test: Ok(None) for one
+    /// that is none, Err(()) when check cannot tell.
+    fn token(&self) -> Result<Option<&str>, ()> {
+        match self {
+            TestArgument::Known(text) => Ok(Some(text)),
+            TestArgument::NonEmpty | TestArgument::GrubDirFile(_) => Ok(None),
+            TestArgument::Unknown => Err(()),
+        }
+    }
+
+    fn is_empty(&self) -> Option<bool> {
+        match self {
+            TestArgument::Known(text) => Some(text.is_empty()),
+            TestArgument::NonEmpty | TestArgument::GrubDirFile(_) => Some(false),
+            TestArgument::Unknown => None,
+        }
+    }
+}
+
+/// Three-valued and, or: None stands for a value check cannot tell.
+fn and3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
 }
 
 /// The value of default when the menu runs, and where it comes from.
@@ -934,20 +845,6 @@ pub struct MenuConfig {
     pub added: menu::AddedEntries,
 }
 
-/// The variables, besides the lookup variables, that a script line before
-/// blscfg must not set: those naming where grub.cfg reads more variables,
-/// and config_directory, where it reads grubenv (00_header.in:56-57).
-const SCRIPT_LOADING_VARIABLES: [&str; 4] = ["env_block", "dev", "prefix", "config_directory"];
-
-/// The variables a script line after blscfg must not set: those GRUB reads
-/// when it boots an entry blscfg added, whose linux and initrd lines name
-/// ($root) (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c,
-/// create_entry) and whose files the Btrfs driver looks up with
-/// btrfs_relative_path, btrfs_subvol and btrfs_subvolid (btrfs.c,
-/// grub_btrfs_mount), and config_directory, where 41_custom reads
-/// custom.cfg (util/grub.d/41_custom.in:3-4).
-const AFTER_BLSCFG_VARIABLES: [&str; 5] = ["btrfs_relative_path", "btrfs_subvol", "btrfs_subvolid", "root", "config_directory"];
-
 /// GRUB running grub.cfg as check follows it (normal/main.c,
 /// grub_normal_execute): the variables in force, and where GRUB starts its
 /// lookups with them.
@@ -959,13 +856,14 @@ struct ConfigRun<'a, F> {
     grub_dir: &'a str,
     /// The UUID of the filesystem the ESP stub's search names.
     boot_uuid: &'a str,
+    /// The script file whose commands run.
+    file: &'static str,
     /// Where blscfg starts its lookups, and the blsdir variable, once
     /// grub.cfg runs it.
     at_blscfg: Option<(StartingLookupDir, Option<String>)>,
-    /// The variables deciding default that a command check does not
-    /// interpret has set, each with where.
+    /// The variables check follows whose value a command it cannot evaluate
+    /// has set, each with where.
     unread: HashMap<&'static str, String>,
-    id_option: IdOption,
     /// The entries scripts add after blscfg.
     added: menu::AddedEntries,
     /// Where a script adds a menu entry before blscfg, ahead of its entries.
@@ -978,7 +876,31 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
         Ok(self.lookup_dirs.for_setting(self.variables.btrfs_relative())?)
     }
 
-    fn step(&mut self, step: Step, file: &str) -> Result<(), GrubContextError> {
+    /// Runs the GRUB script file script, named file, from top to bottom as
+    /// GRUB does. generated says whether Fedora's generated lines may appear
+    /// in it.
+    fn script(&mut self, script: &str, file: &'static str, generated: bool) -> Result<(), GrubContextError> {
+        let outer = std::mem::replace(&mut self.file, file);
+        let mut reader = script::Reader::default();
+        for line in script.lines() {
+            let trimmed = line.trim();
+            if generated && !reader.in_body() && let Some(step) = generated_step(trimmed) {
+                match (step, reader.runs()) {
+                    (None, _) | (_, script::Runs::No) => {}
+                    (Some(step), script::Runs::Yes) => self.step(step)?,
+                    (Some(_), script::Runs::Maybe) => return Err(GrubContextError::CannotVerify(format!(
+                        "{file} runs '{trimmed}', which loads variables check follows, under a condition \
+                         check cannot evaluate"))),
+                }
+                continue;
+            }
+            reader.line(line, self)?;
+        }
+        self.file = outer;
+        Ok(())
+    }
+
+    fn step(&mut self, step: Step) -> Result<(), GrubContextError> {
         match step {
             Step::LoadGrubenv => {
                 let at = self.starting_lookup_dir()?;
@@ -1018,69 +940,15 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                 }
                 let at = self.starting_lookup_dir()?;
                 if let Some(script) = read_if_found(&at, &grub_dir_file(self.grub_dir, "user.cfg"))? {
-                    for step in steps(&String::from_utf8_lossy(&script), "user.cfg", false)? {
-                        self.step(step, "user.cfg")?;
-                    }
+                    self.script(&String::from_utf8_lossy(&script), "user.cfg", false)?;
                 }
             }
             Step::SourceCustomCfg => {
                 let at = self.starting_lookup_dir()?;
                 if let Some(script) = read_if_found(&at, &grub_dir_file(self.grub_dir, "custom.cfg"))? {
-                    for step in steps(&String::from_utf8_lossy(&script), "custom.cfg", false)? {
-                        self.step(step, "custom.cfg")?;
-                    }
+                    self.script(&String::from_utf8_lossy(&script), "custom.cfg", false)?;
                 }
             }
-            Step::SetDefault(grub_default) => {
-                // [ "${next_entry}" ] is true exactly when next_entry is not
-                // empty, whatever it holds (commands/test.c, test_parse).
-                let default = match self.menu_variable("next_entry") {
-                    Err(why) => Err(why),
-                    Ok(Some((value, source))) if !value.is_empty() =>
-                        Ok((value, format!("next_entry in {source}, for this boot only"))),
-                    Ok(_) => match grub_default {
-                        GrubDefault::SavedEntry => match self.menu_variable("saved_entry") {
-                            Err(why) => Err(why),
-                            Ok(Some((value, source))) => Ok((value, format!("saved_entry in {source}"))),
-                            Ok(None) => Ok((String::new(), "saved_entry, which is unset".to_string())),
-                        },
-                        GrubDefault::Literal(value) => Ok((value, format!("GRUB_DEFAULT in {file}"))),
-                        GrubDefault::Script(line) => Err(format!(
-                            "{file} sets default in '{line}', which check does not interpret")),
-                    },
-                };
-                self.set_default(default);
-            }
-            Step::SetMenuentryIdOption => {
-                // Normal mode sets feature_menuentry_id to "y" when it
-                // starts (normal/main.c, GRUB_MOD_INIT).
-                self.id_option = match self.menu_variable("feature_menuentry_id") {
-                    Err(_) => IdOption::Unknown,
-                    Ok(Some((value, _))) if value != "y" => IdOption::Empty,
-                    Ok(_) => IdOption::Id,
-                };
-            }
-            Step::FallbackCounting => {
-                let counting = match (self.menu_variable("boot_counter"), self.menu_variable("boot_success")) {
-                    (Err(why), _) | (_, Err(why)) => Err(why),
-                    (Ok(counter), Ok(success)) => Ok((counter.map(|(v, _)| v).unwrap_or_default(),
-                        success.map(|(v, _)| v).unwrap_or_default())),
-                };
-                match counting {
-                    Err(why) => self.set_default(Err(why)),
-                    Ok((counter, success)) => {
-                        if let Some(operator) = [&counter, &success].into_iter().find(|v| is_test_operator(v)) {
-                            self.set_default(Err(format!(
-                                "08_fallback_counting tests boot_counter and boot_success, and '{operator}' \
-                                 is an operator to GRUB's test, which check does not model")));
-                        } else if !counter.is_empty() && success == "0" && (counter == "0" || counter == "-1") {
-                            self.set_default(Ok(("1".to_string(),
-                                format!("08_fallback_counting in {file}, as boot_counter has run out"))));
-                        }
-                    }
-                }
-            }
-            Step::Run(command) => self.run(&command, file)?,
         }
         Ok(())
     }
@@ -1106,8 +974,8 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
         MenuConfig { default, fallback, added }
     }
 
-    /// The value of a variable deciding default, with where it was set;
-    /// Err when a command check does not interpret has set it.
+    /// The value of a variable check follows, with where it was set; Err
+    /// when a command check cannot evaluate has set it.
     fn menu_variable(&self, name: &str) -> Result<Option<(String, String)>, String> {
         match self.unread.get(name) {
             Some(why) => Err(why.clone()),
@@ -1115,34 +983,217 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
         }
     }
 
-    fn set_default(&mut self, default: Result<(String, String), String>) {
-        match default {
-            Ok(value) => {
-                self.unread.remove("default");
-                self.variables.values.insert("default", value);
-            }
-            Err(why) => {
-                self.unread.insert("default", why);
-            }
+    /// The value of name where the script stands, with where it was set:
+    /// Some(None) when it is unset, None when check cannot tell.
+    fn value(&self, name: &str) -> Option<Option<(String, String)>> {
+        let followed = LOOKUP_VARIABLES.into_iter().chain(["env_block"]).chain(MENU_VARIABLES).chain(NORMAL_MODE_VARIABLES)
+            .any(|n| n == name);
+        if !followed {
+            return None;
         }
+        self.menu_variable(name).ok()
     }
 
     /// Notes the variables an environment block set when it loaded.
     fn loaded(&mut self, set: &[&'static str]) {
         for &name in set {
             self.unread.remove(name);
-            if name == "menuentry_id_option" {
-                self.id_option = IdOption::Unknown;
-            }
         }
     }
 
-    /// Follows what command, a command of file, does to the menu GRUB
-    /// shows when grub.cfg ends and the variables its default entry is
-    /// chosen with: a menu entry it defines, and a variable deciding default
-    /// it sets, which check does not interpret.
-    fn follow_menu(&mut self, command: &script::Command, names: &[String], file: &str) {
-        let line = command.line.trim();
+    /// The value word expands to, with the variables it used and where each
+    /// was set, where check can evaluate it as one word: its text and the
+    /// values of variables it knows. An unquoted expansion whose value GRUB
+    /// would split into words, or drop when empty, is not evaluated.
+    fn expand(&self, parts: &[script::Part]) -> Option<(String, Vec<String>)> {
+        let mut value = String::new();
+        let mut uses = Vec::new();
+        for part in parts {
+            match part {
+                script::Part::Text(text) => value.push_str(text),
+                script::Part::Variable { name, quoted } => {
+                    let (expanded, source) = match self.value(name)? {
+                        Some((expanded, source)) => (expanded, Some(source)),
+                        None => (String::new(), None),
+                    };
+                    if !quoted && (expanded.is_empty() || expanded.chars().any(|c| is_grub_space(c as u8))) {
+                        return None;
+                    }
+                    uses.push(match source {
+                        Some(source) => format!("{name} from {source}"),
+                        None => format!("{name}, which is unset"),
+                    });
+                    value.push_str(&expanded);
+                }
+            }
+        }
+        Some((value, uses))
+    }
+
+    /// The variable command assigns and the value it assigns, None when it
+    /// unsets it, with the variables the value used: set NAME=VALUE, which
+    /// assigns its first argument (kern/corecmd.c, grub_core_cmd_set),
+    /// NAME=VALUE (script/execute.c), or unset NAME (grub_core_cmd_unset),
+    /// with a name check reads and a value it can evaluate.
+    fn assignment(&self, command: &script::Command) -> Option<(String, Option<String>, Vec<String>)> {
+        let words = &command.words;
+        let first = words.first()?;
+        if first.is("unset") {
+            let name = words.get(1).filter(|w| w.expansion.is_none())?;
+            return Some((name.text.clone(), None, Vec::new()));
+        }
+        let word = if first.is("set") { words.get(1)? } else { first };
+        let (script::Part::Text(head), rest) = word.parts.split_first()? else {
+            return None;
+        };
+        let (name, value_head) = head.split_once('=')?;
+        let mut parts = vec![script::Part::Text(value_head.to_string())];
+        parts.extend(rest.iter().cloned());
+        let (value, uses) = self.expand(&parts)?;
+        Some((name.to_string(), Some(value), uses))
+    }
+
+    /// command's arguments as test reads them.
+    fn test_arguments(&self, command: &script::Command) -> Option<Vec<TestArgument>> {
+        let mut arguments = Vec::new();
+        for word in &command.words[1..] {
+            let device = |part: &script::Part| matches!(part, script::Part::Variable { name, .. }
+                if DEVICE_VARIABLES.contains(&name.as_str()) && !self.unread.contains_key(name.as_str()));
+            arguments.push(match word.parts.as_slice() {
+                [only] if device(only) => TestArgument::NonEmpty,
+                [directory @ script::Part::Variable { name, .. }, script::Part::Text(file)]
+                    if device(directory) && (name == "prefix" || name == "config_directory") && file.starts_with('/') =>
+                    TestArgument::GrubDirFile(grub_dir_file(self.grub_dir, file.trim_start_matches('/'))),
+                parts => match self.expand(parts) {
+                    Some((value, _)) => TestArgument::Known(value),
+                    // An unquoted expansion may become no word or several.
+                    None if parts.iter().any(|p| matches!(p, script::Part::Variable { quoted: false, .. })) => return None,
+                    None => TestArgument::Unknown,
+                },
+            });
+        }
+        if matches!(arguments.last(), Some(TestArgument::Known(last)) if last == "]") {
+            arguments.pop();
+        }
+        Some(arguments)
+    }
+
+    /// Whether GRUB's test finds the GRUB directory file path: -f, a file
+    /// that is not a directory, or -s, a file GRUB opens that is not empty
+    /// (commands/test.c, test_parse and get_fileinfo).
+    fn file_test(&mut self, operator: &str, path: &str) -> Result<Option<bool>, GrubContextError> {
+        let at = self.starting_lookup_dir()?;
+        match at.find_file(path) {
+            Ok(linux) if operator == "-s" => fs::metadata(&linux).map(|meta| Some(meta.len() != 0))
+                .map_err(|e| GrubContextError::CannotVerify(format!("cannot verify '{path}': {e}"))),
+            Ok(_) => Ok(Some(true)),
+            Err(e) => match Finding::from(e) {
+                Finding::Fails(_) => Ok(Some(false)),
+                unverified => Err(GrubContextError::CannotVerify(unverified.message().to_string())),
+            },
+        }
+    }
+
+    /// test_parse (commands/test.c) over arguments from argn, in three
+    /// values: what GRUB's test returns, or None where it depends on a value
+    /// check does not know or a test check does not evaluate (numbers, file
+    /// times, and files outside the GRUB directory).
+    fn test_parse(&mut self, arguments: &[TestArgument], argn: &mut usize, depth: &mut u32) -> Result<Option<bool>, GrubContextError> {
+        let (mut and, mut or, mut invert) = (Some(true), Some(false), false);
+        let update = |value: Option<bool>, and: &mut Option<bool>, invert: &mut bool| {
+            *and = and3(*and, if *invert { value.map(|v| !v) } else { value });
+            *invert = false;
+        };
+        while *argn < arguments.len() {
+            let at = |k: usize| &arguments[*argn + k];
+            if *argn + 2 < arguments.len() {
+                let Ok(operator) = at(1).token() else {
+                    return Ok(None);
+                };
+                let compared = match operator {
+                    Some(op @ ("=" | "==" | "!=" | "<" | "<=" | ">" | ">=")) => Some(match (at(0), at(2)) {
+                        (TestArgument::Known(a), TestArgument::Known(b)) => Some(match op {
+                            "=" | "==" => a == b,
+                            "!=" => a != b,
+                            "<" => a < b,
+                            "<=" => a <= b,
+                            ">" => a > b,
+                            _ => a >= b,
+                        }),
+                        _ => None,
+                    }),
+                    Some(op) if ["-eq", "-ge", "-gt", "-le", "-lt", "-ne", "-pgt", "-plt"].contains(&op)
+                        || op.starts_with("-nt") || op.starts_with("-ot") => Some(None),
+                    _ => None,
+                };
+                if let Some(value) = compared {
+                    update(value, &mut and, &mut invert);
+                    *argn += 3;
+                    continue;
+                }
+            }
+            let Ok(token) = at(0).token() else {
+                return Ok(None);
+            };
+            if *argn + 1 < arguments.len() {
+                let value = match (token, at(1)) {
+                    (Some("-n"), operand) => Some(operand.is_empty().map(|empty| !empty)),
+                    (Some("-z"), operand) => Some(operand.is_empty()),
+                    (Some(op @ ("-f" | "-s")), TestArgument::GrubDirFile(path)) => {
+                        let path = path.clone();
+                        Some(self.file_test(op, &path)?)
+                    }
+                    (Some("-d" | "-e" | "-f" | "-s"), _) => Some(None),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    update(value, &mut and, &mut invert);
+                    *argn += 2;
+                    continue;
+                }
+            }
+            match token {
+                Some(")") => {
+                    *argn += 1;
+                    *depth = depth.saturating_sub(1);
+                    return Ok(or3(or, and));
+                }
+                Some("(") => {
+                    *argn += 1;
+                    *depth += 1;
+                    if *depth > MAX_TEST_RECURSION_DEPTH {
+                        return Ok(None);
+                    }
+                    let value = self.test_parse(arguments, argn, depth)?;
+                    update(value, &mut and, &mut invert);
+                }
+                Some("!") => {
+                    invert = !invert;
+                    *argn += 1;
+                }
+                Some("-a") => *argn += 1,
+                Some("-o") => {
+                    or = or3(or, and);
+                    and = Some(true);
+                    *argn += 1;
+                }
+                _ => {
+                    let value = at(0).is_empty().map(|empty| !empty);
+                    update(value, &mut and, &mut invert);
+                    *argn += 1;
+                }
+            }
+        }
+        Ok(or3(or, and))
+    }
+
+    /// Follows what command, a command of the running file, does to the
+    /// menu GRUB shows when grub.cfg ends and to the variables its default
+    /// entry is chosen with: a menu entry it defines, and a variable check
+    /// follows that it sets, to the value it assigns where check can
+    /// evaluate it and the command runs on every boot.
+    fn follow_menu(&mut self, command: &script::Command, names: &[String]) {
+        let (file, line) = (self.file, command.line.trim());
         if command.words.first().is_some_and(|w| w.is("menuentry") || w.is("submenu")) {
             if self.at_blscfg.is_some() {
                 let entry = self.added_entry(command);
@@ -1152,13 +1203,32 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                 self.entry_before_blscfg.get_or_insert_with(|| format!("{file} adds a menu entry before blscfg in '{line}'"));
             }
         }
-        for name in MENU_VARIABLES {
-            if names.iter().any(|n| n == name) {
-                let why = format!("{file} sets {name} in '{line}'");
-                if name == "menuentry_id_option" {
-                    self.id_option = IdOption::Unknown;
+        let assignment = (!command.conditional).then(|| self.assignment(command)).flatten();
+        for name in MENU_VARIABLES.into_iter().chain(NORMAL_MODE_VARIABLES) {
+            if !names.iter().any(|n| n == name) {
+                continue;
+            }
+            match &assignment {
+                Some((assigned, value, uses)) if assigned == name => {
+                    self.unread.remove(name);
+                    match value {
+                        Some(value) => {
+                            let uses = uses.iter().map(|u| format!(", {u}")).collect::<String>();
+                            self.variables.values.insert(name, (value.clone(), format!("'{line}' in {file}{uses}")));
+                        }
+                        None => {
+                            self.variables.values.remove(name);
+                        }
+                    }
                 }
-                self.unread.insert(name, why);
+                _ => {
+                    let why = if command.conditional {
+                        format!("{file} may set {name} in '{line}', as a condition check cannot evaluate decides")
+                    } else {
+                        format!("{file} sets {name} in '{line}', which check cannot evaluate")
+                    };
+                    self.unread.insert(name, why);
+                }
             }
         }
     }
@@ -1169,8 +1239,9 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
     /// --hotkey, --source and --id take the next word or an "=" value,
     /// --users takes the next word unless it starts with '-', the first
     /// other word is the title, and the id is the title when --id is not
-    /// given (grub_normal_add_menu_entry). A word check cannot read leaves
-    /// both unknown.
+    /// given (grub_normal_add_menu_entry). menuentry_id_option expands to
+    /// "--id" or to nothing as 00_header sets it (00_header.in:108-112). A
+    /// word check cannot read leaves both unknown.
     fn added_entry(&self, command: &script::Command) -> menu::AddedEntry {
         let unknown = menu::AddedEntry { id: None, title: None, certain: !command.conditional };
         let mut words = command.words[1..].iter().peekable();
@@ -1178,11 +1249,12 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
         while let Some(word) = words.next() {
             let text = if word.expansion.is_none() {
                 word.text.as_str()
-            } else if matches!(word.text.as_str(), "$menuentry_id_option" | "${menuentry_id_option}") {
-                match &self.id_option {
-                    IdOption::Id => "--id",
-                    IdOption::Empty => continue,
-                    IdOption::Unknown => return unknown,
+            } else if matches!(word.parts.as_slice(), [script::Part::Variable { name, quoted: false }] if name == "menuentry_id_option") {
+                match self.value("menuentry_id_option") {
+                    Some(Some((value, _))) if value == "--id" => "--id",
+                    Some(None) => continue,
+                    Some(Some((value, _))) if value.is_empty() => continue,
+                    _ => return unknown,
                 }
             } else {
                 return unknown;
@@ -1218,23 +1290,23 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
         menu::AddedEntry { id: Some(id.unwrap_or_else(|| title.clone())), title: Some(title), certain: !command.conditional }
     }
 
-    /// Follows command, a command of file that check follows as no step of
-    /// its own. Before blscfg, a command that sets a lookup variable or a
-    /// variable naming where variables are loaded from, or that can set any
-    /// variable, such as a load of variables other than as the generated
-    /// lines load them, makes where GRUB looks the boot entries up unknown,
-    /// since check does not interpret GRUB script; a command that only reads
-    /// one does not.
-    fn run(&mut self, command: &script::Command, file: &str) -> Result<(), GrubContextError> {
-        let line = command.line.trim();
-        if self.at_blscfg.is_some() {
-            return self.run_after_blscfg(command, file);
-        }
+    /// Follows command, a command of the running file before blscfg. A
+    /// command that sets a lookup variable or a variable naming where
+    /// variables are loaded from, or that can set any variable, such as a
+    /// load of variables other than as the generated lines load them, makes
+    /// where GRUB looks the boot entries up unknown, since check does not
+    /// interpret GRUB script; a command that only reads one does not.
+    fn run_before_blscfg(&mut self, command: &script::Command) -> Result<(), GrubContextError> {
+        let (file, line) = (self.file, command.line.trim());
         if is_blscfg(command) {
             if command.words.len() > 1 {
                 return Err(GrubContextError::CannotVerify(format!(
                     "{file} runs '{line}', whose argument chooses the entries blscfg lists or where it reads them, \
                      which check does not model")));
+            }
+            if command.conditional {
+                return Err(GrubContextError::CannotVerify(format!(
+                    "{file} runs '{line}' under a condition check cannot evaluate")));
             }
             // blscfg reads the entries from the device in root (Fedora's
             // grub2 2.12 patches, grub-core/commands/blscfg.c,
@@ -1256,7 +1328,11 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
             return Ok(());
         }
         if let Some(uuid) = root_search(command) {
-            self.variables.root = Root::FilesystemUuid(uuid);
+            self.variables.root = if command.conditional {
+                Root::Other(format!("{file} may set root in '{line}', as a condition check cannot evaluate decides"))
+            } else {
+                Root::FilesystemUuid(uuid)
+            };
             return Ok(());
         }
         let names = match script::sets(&command.words) {
@@ -1265,7 +1341,7 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                 "{file} runs '{line}' before blscfg, which can set where GRUB looks the boot entries up, \
                  and check does not interpret GRUB script"))),
         };
-        self.follow_menu(command, &names, file);
+        self.follow_menu(command, &names);
         if names.iter().any(|n| n == "root") {
             self.variables.root = Root::Other(format!("{file} sets root in '{line}'"));
         }
@@ -1278,12 +1354,12 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
         Ok(())
     }
 
-    /// Follows command, a command of file after blscfg. A second blscfg, a
-    /// command that sets a variable GRUB reads when it boots an entry, or
-    /// one that can set any variable, makes where GRUB looks the kernels up
-    /// unknown.
-    fn run_after_blscfg(&mut self, command: &script::Command, file: &str) -> Result<(), GrubContextError> {
-        let line = command.line.trim();
+    /// Follows command, a command of the running file after blscfg. A second
+    /// blscfg, a command that sets a variable GRUB reads when it boots an
+    /// entry, or one that can set any variable, makes where GRUB looks the
+    /// kernels up unknown.
+    fn run_after_blscfg(&mut self, command: &script::Command) -> Result<(), GrubContextError> {
+        let (file, line) = (self.file, command.line.trim());
         if is_blscfg(command) {
             return Err(GrubContextError::CannotVerify(format!(
                 "{file} runs '{line}' after blscfg has run, adding entries read with the variables then in force, \
@@ -1295,13 +1371,41 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                 "{file} runs '{line}' after blscfg, which can set where GRUB looks the kernels up when it boots \
                  an entry, and check does not interpret GRUB script"))),
         };
-        self.follow_menu(command, &names, file);
+        self.follow_menu(command, &names);
         if let Some(variable) = AFTER_BLSCFG_VARIABLES.into_iter().find(|v| names.iter().any(|n| n == v)) {
             return Err(GrubContextError::CannotVerify(format!(
                 "{file} sets {variable} after blscfg in '{line}', which moves where GRUB looks the kernels up \
                  when it boots an entry, and check does not interpret GRUB script")));
         }
+        if names.iter().any(|n| n == "prefix") {
+            self.unread.insert("prefix", format!("{file} sets prefix in '{line}'"));
+        }
         Ok(())
+    }
+}
+
+impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> script::Runner for ConfigRun<'_, F> {
+    type Error = GrubContextError;
+
+    fn run(&mut self, command: &script::Command) -> Result<(), GrubContextError> {
+        if self.at_blscfg.is_some() { self.run_after_blscfg(command) } else { self.run_before_blscfg(command) }
+    }
+
+    /// A test's exit status, as GRUB's test command returns it
+    /// (commands/test.c, grub_cmd_test, which drops a last "]"); any other
+    /// command's is not evaluated.
+    fn succeeded(&mut self, command: &script::Command) -> Result<Option<bool>, GrubContextError> {
+        if !command.words.first().is_some_and(|w| w.is("[") || w.is("test")) {
+            return Ok(None);
+        }
+        let Some(arguments) = self.test_arguments(command) else {
+            return Ok(None);
+        };
+        self.test_parse(&arguments, &mut 0, &mut 0)
+    }
+
+    fn unreadable(&self, line: &str, why: &str) -> GrubContextError {
+        GrubContextError::CannotVerify(format!("{} has the line '{}', which check cannot read: {why}", self.file, line.trim()))
     }
 }
 
@@ -1313,15 +1417,36 @@ fn is_blscfg(command: &script::Command) -> bool {
     command.words.first().is_some_and(|w| BLSCFG_COMMANDS.iter().any(|name| w.is(name)))
 }
 
+/// Notes whether a script runs blscfg, its conditions not evaluated.
+#[derive(Default)]
+struct BlscfgRuns(bool);
+
+impl script::Runner for BlscfgRuns {
+    type Error = String;
+
+    fn run(&mut self, command: &script::Command) -> Result<(), String> {
+        self.0 |= is_blscfg(command);
+        Ok(())
+    }
+
+    fn succeeded(&mut self, _: &script::Command) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
+
+    fn unreadable(&self, line: &str, why: &str) -> String {
+        format!("grub.cfg has the line '{}', which check cannot read: {why}", line.trim())
+    }
+}
+
 /// Whether the GRUB script file script runs blscfg where it stands, not in
 /// the body of a menu entry or function that is never called. Err says why
 /// check cannot read a line before it.
 pub fn runs_blscfg(script: &str) -> Result<bool, String> {
     let mut reader = script::Reader::default();
+    let mut runs = BlscfgRuns::default();
     for line in script.lines() {
-        let commands = reader.line(line)
-            .map_err(|why| format!("grub.cfg has the line '{}', which check cannot read: {why}", line.trim()))?;
-        if commands.iter().any(is_blscfg) {
+        reader.line(line, &mut runs)?;
+        if runs.0 {
             return Ok(true);
         }
     }
@@ -1586,6 +1711,10 @@ impl GrubContext {
         if let Some(data) = grub_env {
             variables.load_grub_env(data)?;
         }
+        for name in NORMAL_MODE_VARIABLES {
+            let value = if name == "grub_platform" { EFI_PLATFORM } else { FEATURE_VALUE };
+            variables.values.insert(name, (value.to_string(), NORMAL_MODE.to_string()));
+        }
         variables.apply_stub(stub_text);
         reject_btrfs_subvol_variables(&variables, fstype)?;
         let mut run = ConfigRun {
@@ -1595,21 +1724,16 @@ impl GrubContext {
             partition,
             grub_dir: &stub.grub_dir,
             boot_uuid: stub.boot_uuid.as_str(),
+            file: "grub.cfg",
             at_blscfg: None,
             unread: HashMap::new(),
-            id_option: IdOption::Empty,
             added: menu::AddedEntries { entries: Vec::new(), countable: true },
             entry_before_blscfg: None,
         };
-        if run.variables.source("menuentry_id_option").is_some() {
-            run.id_option = IdOption::Unknown;
-        }
         let at_configfile = run.starting_lookup_dir()?;
 
         if let Some(script) = read_if_found(&at_configfile, &grub_dir_file(&stub.grub_dir, "grub.cfg"))? {
-            for step in steps(&String::from_utf8_lossy(&script), "grub.cfg", true)? {
-                run.step(step, "grub.cfg")?;
-            }
+            run.script(&String::from_utf8_lossy(&script), "grub.cfg", true)?;
         }
         let (at_blscfg, blsdir) = match run.at_blscfg.take() {
             Some(at_blscfg) => at_blscfg,

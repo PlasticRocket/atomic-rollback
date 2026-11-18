@@ -13,14 +13,33 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Word {
     pub text: String,
-    /// Byte offset in text of the first variable the word expands. check
-    /// does not substitute values, so text keeps the expansion as written.
+    /// Byte offset in text of the first variable the word expands. text
+    /// keeps each expansion as written.
     pub expansion: Option<usize>,
+    /// The word as its text and the variables it expands, in order.
+    pub parts: Vec<Part>,
+}
+
+/// A part of a word: text, or a variable GRUB expands there, inside double
+/// quotes or not. GRUB splits an unquoted expansion's value into words and
+/// drops an empty one (grub-core/script/argv.c).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Part {
+    Text(String),
+    Variable { name: String, quoted: bool },
 }
 
 impl Word {
     fn literal(text: &str) -> Self {
-        Word { text: text.to_string(), expansion: None }
+        Word { text: text.to_string(), expansion: None, parts: vec![Part::Text(text.to_string())] }
+    }
+
+    fn push(&mut self, c: char) {
+        self.text.push(c);
+        match self.parts.last_mut() {
+            Some(Part::Text(text)) => text.push(c),
+            _ => self.parts.push(Part::Text(c.to_string())),
+        }
     }
 
     /// Whether the word is exactly text, with nothing expanded.
@@ -50,7 +69,7 @@ fn split(line: &str) -> Result<Vec<Vec<Word>>, &'static str> {
         }
     }
     fn expansion(word: &mut Option<Word>) -> &mut Word {
-        word.get_or_insert_with(|| Word::literal(""))
+        word.get_or_insert_with(|| Word { text: String::new(), expansion: None, parts: Vec::new() })
     }
 
     while let Some(c) = chars.next() {
@@ -73,7 +92,7 @@ fn split(line: &str) -> Result<Vec<Vec<Word>>, &'static str> {
                 loop {
                     match chars.next() {
                         Some('\'') => break,
-                        Some(q) => w.text.push(q),
+                        Some(q) => w.push(q),
                         None => return Err("a quote continues on the next line"),
                     }
                 }
@@ -84,21 +103,21 @@ fn split(line: &str) -> Result<Vec<Vec<Word>>, &'static str> {
                     match chars.next() {
                         Some('"') => break,
                         Some('\\') => match chars.next() {
-                            Some(e) => w.text.push(e),
+                            Some(e) => w.push(e),
                             None => return Err("a quote continues on the next line"),
                         },
-                        Some('$') => read_variable(w, &mut chars)?,
-                        Some(q) => w.text.push(q),
+                        Some('$') => read_variable(w, &mut chars, true)?,
+                        Some(q) => w.push(q),
                         None => return Err("a quote continues on the next line"),
                     }
                 }
             }
             '\\' => match chars.next() {
-                Some(e) => expansion(&mut word).text.push(e),
+                Some(e) => expansion(&mut word).push(e),
                 None => return Err("the line continues on the next one"),
             },
-            '$' => read_variable(expansion(&mut word), &mut chars)?,
-            c => expansion(&mut word).text.push(c),
+            '$' => read_variable(expansion(&mut word), &mut chars, false)?,
+            c => expansion(&mut word).push(c),
         }
     }
     finish(&mut word, &mut words);
@@ -109,33 +128,43 @@ fn split(line: &str) -> Result<Vec<Vec<Word>>, &'static str> {
 }
 
 /// Reads the variable a '$' expands into w, as written: $NAME, ${NAME},
-/// $DIGITS or a special parameter (yylex.l, VARIABLE).
-fn read_variable(w: &mut Word, chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<(), &'static str> {
+/// $DIGITS or a special parameter (yylex.l, VARIABLE). quoted says whether
+/// it stands inside double quotes.
+fn read_variable(w: &mut Word, chars: &mut std::iter::Peekable<std::str::Chars>, quoted: bool) -> Result<(), &'static str> {
     w.expansion.get_or_insert(w.text.len());
     w.text.push('$');
+    let mut name = String::new();
     if chars.peek() == Some(&'{') {
-        for c in chars.by_ref() {
-            w.text.push(c);
-            if c == '}' {
-                return Ok(());
+        w.text.push('{');
+        chars.next();
+        loop {
+            match chars.next() {
+                Some('}') => break,
+                Some(c) => name.push(c),
+                None => return Err("a variable's braces are not closed"),
             }
         }
-        return Err("a variable's braces are not closed");
-    }
-    let mut read = false;
-    while let Some(&c) = chars.peek() {
-        let special = !read && matches!(c, '?' | '#' | '*' | '@');
-        if !(c.is_ascii_alphanumeric() || c == '_' || special) {
-            break;
+        w.text.push_str(&name);
+        w.text.push('}');
+    } else {
+        while let Some(&c) = chars.peek() {
+            let special = name.is_empty() && matches!(c, '?' | '#' | '*' | '@');
+            if !(c.is_ascii_alphanumeric() || c == '_' || special) {
+                break;
+            }
+            name.push(c);
+            chars.next();
+            if special {
+                break;
+            }
         }
-        w.text.push(c);
-        chars.next();
-        read = true;
-        if special {
-            break;
+        if name.is_empty() {
+            return Err("a '$' expands no variable");
         }
+        w.text.push_str(&name);
     }
-    if read { Ok(()) } else { Err("a '$' expands no variable") }
+    w.parts.push(Part::Variable { name, quoted });
+    Ok(())
 }
 
 /// What a command can set.
@@ -241,20 +270,71 @@ fn sets_root_by_default(argument: &str) -> bool {
     argument == "--set" || (argument.starts_with('-') && !argument.starts_with("--") && argument.contains('s'))
 }
 
+/// Whether a command runs where a script stands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Runs {
+    Yes,
+    No,
+    /// It runs or not as something check cannot evaluate decides.
+    Maybe,
+}
+
+impl Runs {
+    fn and(self, other: Runs) -> Runs {
+        match (self, other) {
+            (Runs::No, _) | (_, Runs::No) => Runs::No,
+            (Runs::Yes, other) | (other, Runs::Yes) => other,
+            _ => Runs::Maybe,
+        }
+    }
+
+    fn not(self) -> Runs {
+        match self {
+            Runs::Yes => Runs::No,
+            Runs::No => Runs::Yes,
+            Runs::Maybe => Runs::Maybe,
+        }
+    }
+
+    /// A command's exit status, success or failure, or None when unknown.
+    fn of(status: Option<bool>) -> Runs {
+        match status {
+            Some(true) => Runs::Yes,
+            Some(false) => Runs::No,
+            None => Runs::Maybe,
+        }
+    }
+}
+
 /// One command a script runs where it stands: not in the body of a menu
-/// entry or function, which runs only when booted or called. A call of a
-/// function the script defined runs the commands of its body.
+/// entry or function, which runs only when booted or called, nor in a branch
+/// GRUB does not take. A call of a function the script defined runs the
+/// commands of its body.
 #[derive(Debug)]
 pub struct Command {
     /// The line the command is on, as the script holds it.
     pub line: String,
     /// The command's words, without the keywords that lead into it.
     pub words: Vec<Word>,
-    /// Whether it runs inside an if, while, until or for, so it may not run.
+    /// Whether it runs inside a branch or loop whose running check cannot
+    /// evaluate, so it may not run.
     pub conditional: bool,
     /// Whether it runs inside a while, until or for, so it may run more
     /// than once.
     pub in_loop: bool,
+}
+
+/// What runs the commands a Reader reads: each command where the script
+/// stands, and the exit status of a condition, which decides the branch.
+pub trait Runner {
+    type Error;
+    /// Runs command.
+    fn run(&mut self, command: &Command) -> Result<(), Self::Error>;
+    /// Whether command, which has just run, succeeded; None when the runner
+    /// cannot tell.
+    fn succeeded(&mut self, command: &Command) -> Result<Option<bool>, Self::Error>;
+    /// The error for line, which check cannot read, and why.
+    fn unreadable(&self, line: &str, why: &str) -> Self::Error;
 }
 
 /// A body that has opened and not closed: a function's, recorded for its
@@ -270,11 +350,14 @@ struct Body {
 /// which check does not follow into a call.
 type FunctionBody = Option<Vec<(String, Vec<Word>)>>;
 
-/// A compound command a script is inside where it stands.
-#[derive(PartialEq)]
-enum Compound {
-    If,
-    Loop,
+/// A compound command a script is inside where it stands (parser.y).
+enum Frame {
+    /// An if: whether GRUB reaches the next condition or else without having
+    /// taken a branch, whether the current branch runs, and, while a
+    /// condition is being read, its exit status so far.
+    If { untaken: Runs, branch: Runs, condition: Option<Option<bool>> },
+    /// A while, until or for, whose body runs any number of times.
+    Loop { body: Runs },
 }
 
 /// Reads a script line by line as GRUB runs it from top to bottom.
@@ -285,7 +368,9 @@ pub struct Reader {
     /// The functions being called, innermost last.
     calling: Vec<String>,
     /// The compound commands open where the script stands, innermost last.
-    compounds: Vec<Compound>,
+    frames: Vec<Frame>,
+    /// Whether a '!' inverts the next condition's status.
+    invert: bool,
 }
 
 impl Reader {
@@ -294,21 +379,34 @@ impl Reader {
         !self.bodies.is_empty()
     }
 
-    /// The commands line runs where it stands, in order. Err says why
-    /// check cannot tell what the line does.
-    pub fn line(&mut self, line: &str) -> Result<Vec<Command>, String> {
-        let mut run = Vec::new();
-        for words in split(line).map_err(str::to_string)? {
-            self.command(line, words, &mut run)?;
+    /// Whether a command where the script stands runs.
+    pub fn runs(&self) -> Runs {
+        match self.frames.last() {
+            None => Runs::Yes,
+            Some(Frame::If { untaken, condition: Some(_), .. }) => *untaken,
+            Some(Frame::If { branch, .. }) => *branch,
+            Some(Frame::Loop { body }) => *body,
         }
-        Ok(run)
     }
 
-    fn command(&mut self, line: &str, mut words: Vec<Word>, run: &mut Vec<Command>) -> Result<(), String> {
+    fn in_loop(&self) -> bool {
+        self.frames.iter().any(|frame| matches!(frame, Frame::Loop { .. }))
+    }
+
+    /// Reads line and runs its commands with runner, in order.
+    pub fn line<R: Runner>(&mut self, line: &str, runner: &mut R) -> Result<(), R::Error> {
+        for words in split(line).map_err(|why| runner.unreadable(line, why))? {
+            self.command(line, words, runner)?;
+        }
+        Ok(())
+    }
+
+    fn command<R: Runner>(&mut self, line: &str, mut words: Vec<Word>, runner: &mut R) -> Result<(), R::Error> {
+        let unreadable = |runner: &R, why: &str| runner.unreadable(line, why);
         if let Some(body) = self.bodies.last_mut() {
             if words.first().is_some_and(|w| w.is("}")) {
                 if words.len() > 1 {
-                    return Err("words follow the '}' that closes a body".into());
+                    return Err(unreadable(runner, "words follow the '}' that closes a body"));
                 }
                 if body.nested > 0 {
                     body.nested -= 1;
@@ -332,83 +430,123 @@ impl Reader {
         }
 
         while let Some(keyword) = words.first().filter(|w| LEADING_KEYWORDS.iter().any(|k| w.is(k))) {
-            if keyword.is("if") {
-                self.compounds.push(Compound::If);
-            } else if keyword.is("while") || keyword.is("until") {
-                self.compounds.push(Compound::Loop);
-            }
+            let keyword = keyword.text.clone();
             words.remove(0);
+            match keyword.as_str() {
+                "if" => {
+                    let untaken = self.runs();
+                    self.frames.push(Frame::If { untaken, branch: Runs::No, condition: Some(None) });
+                }
+                "elif" => match self.frames.last_mut() {
+                    Some(Frame::If { condition: condition @ None, .. }) => *condition = Some(None),
+                    _ => return Err(unreadable(runner, "its elif follows no branch of an if")),
+                },
+                "then" => match self.frames.last_mut() {
+                    Some(Frame::If { untaken, branch, condition }) if condition.is_some() => {
+                        let holds = Runs::of(condition.unwrap_or(None));
+                        *branch = untaken.and(holds);
+                        *untaken = untaken.and(holds.not());
+                        *condition = None;
+                    }
+                    _ => return Err(unreadable(runner, "its then follows no condition of an if")),
+                },
+                "else" => match self.frames.last_mut() {
+                    Some(Frame::If { untaken, branch, condition: None }) => *branch = *untaken,
+                    _ => return Err(unreadable(runner, "its else follows no branch of an if")),
+                },
+                "while" | "until" => {
+                    let body = self.runs().and(Runs::Maybe);
+                    self.frames.push(Frame::Loop { body });
+                }
+                "!" => self.invert = !self.invert,
+                _ => {}
+            }
         }
         let Some(first) = words.first() else {
             return Ok(());
         };
         if first.is("fi") || first.is("done") {
-            let closes = if first.is("fi") { Compound::If } else { Compound::Loop };
-            if words.len() > 1 || self.compounds.pop() != Some(closes) {
-                return Err(format!("its {} closes no compound command it opened", first.text));
+            let closes = match self.frames.last() {
+                Some(Frame::If { condition: None, .. }) => first.is("fi"),
+                Some(Frame::Loop { .. }) => first.is("done"),
+                _ => false,
+            };
+            if words.len() > 1 || !closes {
+                return Err(unreadable(runner, &format!("its {} closes no compound command it opened", first.text)));
             }
+            self.frames.pop();
             return Ok(());
         }
-        if first.is("for") {
-            self.compounds.push(Compound::Loop);
-        }
         if first.is("{") || first.is("}") {
-            return Err("a brace stands outside the body of a menu entry or function".into());
+            return Err(unreadable(runner, "a brace stands outside the body of a menu entry or function"));
         }
         if ["case", "esac", "select", "[["].iter().any(|k| first.is(k)) {
-            return Err(format!("it uses {}, which GRUB's generated files do not use", first.text));
+            return Err(unreadable(runner, &format!("it uses {}, which GRUB's generated files do not use", first.text)));
+        }
+        let runs = self.runs();
+        if first.is("for") {
+            self.frames.push(Frame::Loop { body: runs.and(Runs::Maybe) });
         }
 
         if ["menuentry", "submenu", "function"].iter().any(|k| first.is(k)) {
             let defines_function = first.is("function");
             let Some(open) = words.iter().position(|w| w.is("{")) else {
-                return Err("its body does not open on the same line".into());
+                return Err(unreadable(runner, "its body does not open on the same line"));
             };
             let body = words.split_off(open + 1);
             words.pop();
-            let function = defines_function.then(|| words.get(1).map(|w| w.text.clone())).flatten();
+            let function = (defines_function && runs != Runs::No).then(|| words.get(1).map(|w| w.text.clone())).flatten();
             if let Some(function) = &function {
                 self.functions.insert(function.clone(), Some(Vec::new()));
             }
-            run.push(self.at(line, words));
+            if runs != Runs::No {
+                runner.run(&self.at(line, words, runs))?;
+            }
             self.bodies.push(Body { function, nested: 0 });
             if !body.is_empty() {
-                self.command(line, body, run)?;
+                self.command(line, body, runner)?;
             }
+            return Ok(());
+        }
+        if runs == Runs::No {
+            self.invert = false;
             return Ok(());
         }
 
         if let Some(body) = (first.expansion.is_none()).then(|| self.functions.get(&first.text).cloned()).flatten() {
             let name = first.text.clone();
             if words.len() > 1 {
-                return Err(format!("it calls function {name} with arguments, which check does not pass"));
+                return Err(unreadable(runner, &format!("it calls function {name} with arguments, which check does not pass")));
             }
             let Some(body) = body else {
-                return Err(format!("it calls function {name}, whose body defines a menu entry or function"));
+                return Err(unreadable(runner, &format!("it calls function {name}, whose body defines a menu entry or function")));
             };
             if self.calling.contains(&name) {
-                return Err(format!("function {name} calls itself"));
+                return Err(unreadable(runner, &format!("function {name} calls itself")));
             }
             self.calling.push(name);
             for (called_line, called_words) in body {
-                self.command(&called_line, called_words, run)?;
+                self.command(&called_line, called_words, runner)?;
             }
             self.calling.pop();
             return Ok(());
         }
 
-        run.push(self.at(line, words));
+        let command = self.at(line, words, runs);
+        runner.run(&command)?;
+        let invert = std::mem::take(&mut self.invert);
+        if let Some(Frame::If { condition: condition @ Some(_), .. }) = self.frames.last_mut() {
+            // The exit status of the last command before then decides the
+            // branch (script/execute.c, grub_script_execute_cmdif), and a
+            // '!' inverts it (grub_script_execute_cmdline).
+            *condition = Some(runner.succeeded(&command)?.map(|status| status != invert));
+        }
         Ok(())
     }
 
-    /// The command of words on line, where the script stands.
-    fn at(&self, line: &str, words: Vec<Word>) -> Command {
-        Command {
-            line: line.to_string(),
-            words,
-            conditional: !self.compounds.is_empty(),
-            in_loop: self.compounds.contains(&Compound::Loop),
-        }
+    /// The command of words on line, which runs as runs says.
+    fn at(&self, line: &str, words: Vec<Word>, runs: Runs) -> Command {
+        Command { line: line.to_string(), words, conditional: runs == Runs::Maybe, in_loop: self.in_loop() }
     }
 }
 
@@ -457,15 +595,69 @@ mod tests {
         assert_eq!(names("$cmd"), Sets::Any);
     }
 
+    /// Records the commands it runs, a '?' before one that may not run; the
+    /// condition [ yes ] succeeds, [ no ] fails, and any other is unknown.
+    #[derive(Default)]
+    struct Recorder(Vec<String>);
+
+    impl Runner for Recorder {
+        type Error = String;
+
+        fn run(&mut self, command: &Command) -> Result<(), String> {
+            let words = command.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+            self.0.push(format!("{}{words}", if command.conditional { "?" } else { "" }));
+            Ok(())
+        }
+
+        fn succeeded(&mut self, command: &Command) -> Result<Option<bool>, String> {
+            Ok(match command.words.get(1).map(|w| w.text.as_str()) {
+                Some("yes") => Some(true),
+                Some("no") => Some(false),
+                _ => None,
+            })
+        }
+
+        fn unreadable(&self, line: &str, why: &str) -> String {
+            format!("{line}: {why}")
+        }
+    }
+
     fn run(script: &str) -> Vec<String> {
         let mut reader = Reader::default();
-        script.lines().flat_map(|l| reader.line(l).unwrap())
-            .map(|c| c.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")).collect()
+        let mut recorder = Recorder::default();
+        for line in script.lines() {
+            reader.line(line, &mut recorder).unwrap();
+        }
+        recorder.0
     }
 
     #[test]
     fn reader_skips_bodies_and_runs_called_functions() {
         let script = "function load_video {\n  insmod all_video\n}\nmenuentry 'x' {\n  set root=hd0\n}\nif [ a ]; then\n  load_video\nfi\n";
-        assert_eq!(run(script), vec!["function load_video", "menuentry x", "[ a ]", "insmod all_video"]);
+        assert_eq!(run(script), vec!["function load_video", "menuentry x", "[ a ]", "?insmod all_video"]);
+    }
+
+    // GRUB runs the branch after the first condition that succeeds, else the
+    // else branch (script/execute.c, grub_script_execute_cmdif); a '!'
+    // inverts a condition's status.
+    #[test]
+    fn reader_runs_the_branch_grub_takes() {
+        let script = "\
+if [ no ]; then set a=1; elif [ yes ]; then set b=2; else set c=3; fi
+if [ maybe ]; then set d=4; else set e=5; fi
+if [ yes ]; then
+  if [ no ]; then set f=6; fi
+  set g=7
+fi
+if ! [ no ]; then set h=8; fi
+while [ yes ]; do set i=9; done
+";
+        assert_eq!(run(script), vec![
+            "[ no ]", "[ yes ]", "set b=2",
+            "[ maybe ]", "?set d=4", "?set e=5",
+            "[ yes ]", "[ no ]", "set g=7",
+            "[ no ]", "set h=8",
+            "?[ yes ]", "?set i=9",
+        ]);
     }
 }
