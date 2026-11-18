@@ -223,6 +223,7 @@ fragments! {
     CheckResolvesPathsLikeGrub,
     SnapshotCheckReadsSeparateBootPartition,
     CheckRefusesEspSubvolumeOverride,
+    ProbeMountsInFreshRunDirectory,
 }
 
 impl Fragment {
@@ -502,6 +503,10 @@ impl Fragment {
             Self::CheckRefusesEspSubvolumeOverride => Status::Unreleased {
                 section: Section::Changed,
                 text: "`check` fails when the ESP `grub.cfg` sets `btrfs_subvol` or `btrfs_subvolid`, naming the variable. Neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.",
+            },
+            Self::ProbeMountsInFreshRunDirectory => Status::Unreleased {
+                section: Section::Security,
+                text: "The boot chain check run by `check`, `rollback`, `migrate` and the kernel hook makes its temporary read-only mounts in a new directory created by `mkdtemp` under `/run`, which only root can write to. It previously mounted at a predictable path under `/tmp`, which any local user could create beforehand, for example as a symlink, to choose where root mounted and later unmounted a filesystem.",
             },
         }
     }
