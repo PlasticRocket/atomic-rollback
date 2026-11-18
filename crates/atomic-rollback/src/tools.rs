@@ -2,11 +2,11 @@
 //! dracut, grub2-mkconfig, rsync) and fstab parsing helpers. Each
 //! function delegates to a system tool and returns structured results.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::fs;
 
-use crate::consts::{BTRFS_TOPLEVEL_SUBVOLID, PROBE_MOUNT_PREFIX, TOPLEVEL_MOUNT};
+use crate::consts::{BTRFS_TOPLEVEL_SUBVOLID, PROBE_MOUNT_PARENT, PROBE_MOUNT_TEMPLATE, TOPLEVEL_MOUNT};
 
 /// Bare filesystem UUID extracted from BLS boot entries or grub2-probe.
 /// Convert via into_device_spec() before passing to resolve_fstab_device
@@ -52,12 +52,6 @@ impl DeviceSpec {
         }
     }
 
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Uuid(s) | Self::Label(s) | Self::PartUuid(s)
-            | Self::PartLabel(s) | Self::Id(s) | Self::Path(s) => s,
-        }
-    }
 }
 
 impl std::fmt::Display for DeviceSpec {
@@ -366,19 +360,46 @@ pub fn mount_subvolid(device: &DevicePath, target: &str, subvolid: u64) -> Resul
 }
 
 /// Mounts the top-level subvolume (subvolid=5) of the Btrfs filesystem
-/// with this UUID read-only, at a directory of its own so it never
-/// collides with TOPLEVEL_MOUNT. Unmounted when the MountPoint drops.
+/// with this UUID read-only, as a probe mount, apart from TOPLEVEL_MOUNT.
+/// Unmounted when the MountPoint drops.
 pub fn mount_toplevel_ro(uuid: &BareUuid) -> Result<MountPoint, String> {
     let device = blkid_device_for_uuid(uuid)?;
-    let suffix = &uuid.as_str()[uuid.as_str().len().saturating_sub(8)..];
-    let dir = format!("{PROBE_MOUNT_PREFIX}toplevel-{suffix}");
-    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
-    let options = format!("ro,subvolid={BTRFS_TOPLEVEL_SUBVOLID}");
-    if let Err(e) = run_ok("mount", &["-o", &options, device.as_str(), &dir]) {
+    probe_mount(&device, &format!("ro,subvolid={BTRFS_TOPLEVEL_SUBVOLID}"))
+}
+
+/// Mounts device with the given options at a fresh probe directory.
+fn probe_mount(device: &DevicePath, options: &str) -> Result<MountPoint, String> {
+    let dir = make_probe_dir(Path::new(PROBE_MOUNT_PARENT))?;
+    // mkdtemp's suffix is ASCII, so the conversion is lossless.
+    let dir = dir.to_string_lossy().into_owned();
+    if let Err(e) = run_ok("mount", &["-o", options, device.as_str(), &dir]) {
         let _ = fs::remove_dir(&dir);
         return Err(e);
     }
     Ok(MountPoint::Probed(dir))
+}
+
+/// Creates a new directory under parent named from PROBE_MOUNT_TEMPLATE,
+/// with mkdtemp(3): the name gets a unique suffix, and the directory is
+/// created in one step with mode 0700. An existing entry of the same name,
+/// a symlink included, makes mkdtemp pick another name; it is never reused
+/// or followed.
+fn make_probe_dir(parent: &Path) -> Result<PathBuf, String> {
+    use std::ffi::{CString, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let template = parent.join(PROBE_MOUNT_TEMPLATE);
+    let mut buf = CString::new(template.as_os_str().as_bytes())
+        .map_err(|_| format!("probe mount template {} contains a NUL byte", template.display()))?
+        .into_bytes_with_nul();
+    // SAFETY: buf is a writable, NUL-terminated buffer that mkdtemp
+    // rewrites in place; it is read only after a successful return.
+    let created = unsafe { libc::mkdtemp(buf.as_mut_ptr().cast()) };
+    if created.is_null() {
+        return Err(format!("mkdtemp {}: {}", template.display(), std::io::Error::last_os_error()));
+    }
+    buf.pop(); // the NUL terminator
+    Ok(PathBuf::from(OsString::from_vec(buf)))
 }
 
 /// Whether the process runs with root's effective UID, which mount(8)
@@ -683,12 +704,8 @@ pub fn get_mount_point(device_spec: &DeviceSpec) -> Result<MountPoint, String> {
         }
     }
 
-    let suffix = &device_spec.as_str()[device_spec.as_str().len().saturating_sub(8)..];
-    let probe_dir = format!("{PROBE_MOUNT_PREFIX}{suffix}");
-    fs::create_dir_all(&probe_dir).map_err(|e| format!("mkdir {probe_dir}: {e}"))?;
     let device = resolve_fstab_device(device_spec)?;
-    mount_ro(&device, &probe_dir)?;
-    Ok(MountPoint::Probed(probe_dir))
+    probe_mount(&device, "ro")
 }
 
 /// A filesystem mount point, either already mounted or probed temporarily.
@@ -721,6 +738,93 @@ impl Drop for MountPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- probe mount directories ---
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atomic-rollback-test-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn probe_name_matches_template(name: &str) -> bool {
+        let prefix = PROBE_MOUNT_TEMPLATE.trim_end_matches('X');
+        let suffix_len = PROBE_MOUNT_TEMPLATE.len() - prefix.len();
+        name.strip_prefix(prefix).is_some_and(|suffix|
+            suffix.len() == suffix_len && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
+    }
+
+    // A probe directory is one this call created: a real directory, not a
+    // pre-existing entry, private to its owner, empty, under parent.
+    fn assert_fresh_probe_dir(parent: &Path, dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(dir.parent(), Some(parent));
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(probe_name_matches_template(name), "{name}");
+        let meta = fs::symlink_metadata(dir).unwrap();
+        assert!(meta.file_type().is_dir(), "{} is not a directory", dir.display());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        assert!(fs::read_dir(dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn probe_dir_is_created_fresh_under_its_parent() {
+        let parent = scratch("probe-fresh");
+        let first = make_probe_dir(&parent).unwrap();
+        let second = make_probe_dir(&parent).unwrap();
+        assert_ne!(first, second);
+        assert_fresh_probe_dir(&parent, &first);
+        assert_fresh_probe_dir(&parent, &second);
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    // Entries another user could have prepared, under the names a
+    // predictable scheme would pick: none is ever returned or followed.
+    #[test]
+    fn probe_dir_never_reuses_an_existing_entry() {
+        let parent = scratch("probe-existing");
+        let elsewhere = scratch("probe-existing-target");
+        let prefix = PROBE_MOUNT_TEMPLATE.trim_end_matches('X');
+        let planted = [
+            parent.join(PROBE_MOUNT_TEMPLATE),
+            parent.join(format!("{prefix}toplevel-b7f6a24")),
+            parent.join(format!("{prefix}AAAAAA")),
+        ];
+        std::os::unix::fs::symlink(&elsewhere, &planted[0]).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &planted[1]).unwrap();
+        fs::create_dir(&planted[2]).unwrap();
+
+        for _ in 0..64 {
+            let dir = make_probe_dir(&parent).unwrap();
+            assert!(!planted.contains(&dir), "reused {}", dir.display());
+            assert_fresh_probe_dir(&parent, &dir);
+        }
+        assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+        fs::remove_dir_all(&parent).unwrap();
+        fs::remove_dir_all(&elsewhere).unwrap();
+    }
+
+    #[test]
+    fn probe_dir_reports_a_missing_parent() {
+        let scratch_dir = scratch("probe-missing");
+        assert!(make_probe_dir(&scratch_dir.join("absent")).is_err());
+        fs::remove_dir_all(&scratch_dir).unwrap();
+    }
+
+    // The production parent refuses entries from users other than root,
+    // which is what keeps them from preparing a mount point there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_parent_is_writable_only_by_root() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = fs::metadata(PROBE_MOUNT_PARENT).unwrap();
+        assert_eq!(meta.uid(), 0);
+        assert_eq!(meta.permissions().mode() & 0o022, 0, "{PROBE_MOUNT_PARENT} is group or world writable");
+        if !is_root() {
+            assert!(make_probe_dir(Path::new(PROBE_MOUNT_PARENT)).is_err());
+        }
+    }
 
     #[test]
     fn default_subvol_parses_a_subvolume() {
