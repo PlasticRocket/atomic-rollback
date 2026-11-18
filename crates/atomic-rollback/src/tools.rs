@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::fs;
 
-use crate::consts::{BTRFS_TOPLEVEL_SUBVOLID, PROBE_MOUNT_PARENT, PROBE_MOUNT_TEMPLATE, TOPLEVEL_MOUNT};
+use crate::consts::{BTRFS_TOPLEVEL_SUBVOLID, TEMPORARY_MOUNTPOINT_PARENT, TEMPORARY_MOUNTPOINT_TEMPLATE, TOPLEVEL_MOUNT};
 
 /// Bare filesystem UUID extracted from BLS boot entries or grub2-probe.
 /// Convert via into_device_spec() before passing to resolve_fstab_device
@@ -360,37 +360,38 @@ pub fn mount_subvolid(device: &DevicePath, target: &str, subvolid: u64) -> Resul
 }
 
 /// Mounts the top-level subvolume (subvolid=5) of the Btrfs filesystem
-/// with this UUID read-only, as a probe mount, apart from TOPLEVEL_MOUNT.
+/// with this UUID read-only at a temporary mount point, apart from
+/// TOPLEVEL_MOUNT.
 /// Unmounted when the MountPoint drops.
 pub fn mount_toplevel_ro(uuid: &BareUuid) -> Result<MountPoint, String> {
     let device = blkid_device_for_uuid(uuid)?;
-    probe_mount(&device, &format!("ro,subvolid={BTRFS_TOPLEVEL_SUBVOLID}"))
+    mount_temporary(&device, &format!("ro,subvolid={BTRFS_TOPLEVEL_SUBVOLID}"))
 }
 
-/// Mounts device with the given options at a fresh probe directory.
-fn probe_mount(device: &DevicePath, options: &str) -> Result<MountPoint, String> {
-    let dir = make_probe_dir(Path::new(PROBE_MOUNT_PARENT))?;
+/// Mounts device with the given options at a new temporary mount point.
+fn mount_temporary(device: &DevicePath, options: &str) -> Result<MountPoint, String> {
+    let dir = make_temporary_mountpoint(Path::new(TEMPORARY_MOUNTPOINT_PARENT))?;
     // mkdtemp's suffix is ASCII, so the conversion is lossless.
     let dir = dir.to_string_lossy().into_owned();
     if let Err(e) = run_ok("mount", &["-o", options, device.as_str(), &dir]) {
         let _ = fs::remove_dir(&dir);
         return Err(e);
     }
-    Ok(MountPoint::Probed(dir))
+    Ok(MountPoint::Temporary(dir))
 }
 
-/// Creates a new directory under parent named from PROBE_MOUNT_TEMPLATE,
+/// Creates a new directory under parent named from TEMPORARY_MOUNTPOINT_TEMPLATE,
 /// with mkdtemp(3): the name gets a unique suffix, and the directory is
 /// created in one step with mode 0700. An existing entry of the same name,
 /// a symlink included, makes mkdtemp pick another name; it is never reused
 /// or followed.
-fn make_probe_dir(parent: &Path) -> Result<PathBuf, String> {
+fn make_temporary_mountpoint(parent: &Path) -> Result<PathBuf, String> {
     use std::ffi::{CString, OsString};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-    let template = parent.join(PROBE_MOUNT_TEMPLATE);
+    let template = parent.join(TEMPORARY_MOUNTPOINT_TEMPLATE);
     let mut buf = CString::new(template.as_os_str().as_bytes())
-        .map_err(|_| format!("probe mount template {} contains a NUL byte", template.display()))?
+        .map_err(|_| format!("temporary mount point template {} contains a NUL byte", template.display()))?
         .into_bytes_with_nul();
     // SAFETY: buf is a writable, NUL-terminated buffer that mkdtemp
     // rewrites in place; it is read only after a successful return.
@@ -692,11 +693,11 @@ pub fn parse_bls(content: &str) -> Vec<BlsLine> {
         .collect()
 }
 
-// --- probe mount: mount a device temporarily if not already mounted ---
+// --- temporary mount point: mount a device if not already mounted ---
 
 /// Accepts any fstab device spec (UUID=, LABEL=, PARTUUID=, PARTLABEL=,
 /// ID=, /dev/ path). Checks findmnt first; if not mounted, resolves to
-/// a device path and probe-mounts read-only.
+/// a device path and mounts it read-only at a temporary mount point.
 pub fn get_mount_point(device_spec: &DeviceSpec) -> Result<MountPoint, String> {
     if let Ok(target) = findmnt_target(device_spec) {
         if !target.is_empty() {
@@ -705,29 +706,29 @@ pub fn get_mount_point(device_spec: &DeviceSpec) -> Result<MountPoint, String> {
     }
 
     let device = resolve_fstab_device(device_spec)?;
-    probe_mount(&device, "ro")
+    mount_temporary(&device, "ro")
 }
 
-/// A filesystem mount point, either already mounted or probed temporarily.
-/// Probed mounts are unmounted on drop.
+/// A filesystem mount point, either already mounted or mounted by this tool
+/// at a temporary mount point, which is unmounted on drop.
 pub enum MountPoint {
     /// Already mounted by the system (e.g. / or /home).
     Existing(String),
-    /// Temporarily mounted by this tool for inspection.
-    Probed(String),
+    /// Mounted by this tool for inspection, at a temporary mount point.
+    Temporary(String),
 }
 
 impl MountPoint {
     pub fn path(&self) -> &str {
         match self {
-            MountPoint::Existing(p) | MountPoint::Probed(p) => p,
+            MountPoint::Existing(p) | MountPoint::Temporary(p) => p,
         }
     }
 }
 
 impl Drop for MountPoint {
     fn drop(&mut self) {
-        if let MountPoint::Probed(p) = self {
+        if let MountPoint::Temporary(p) = self {
             // Best-effort. Failure means the mount persists until reboot.
             let _ = Command::new("umount").arg(p.as_str()).output();
             let _ = fs::remove_dir(p.as_str());
@@ -739,7 +740,7 @@ impl Drop for MountPoint {
 mod tests {
     use super::*;
 
-    // --- probe mount directories ---
+    // --- temporary mount points ---
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("atomic-rollback-test-{name}"));
@@ -748,20 +749,20 @@ mod tests {
         dir
     }
 
-    fn probe_name_matches_template(name: &str) -> bool {
-        let prefix = PROBE_MOUNT_TEMPLATE.trim_end_matches('X');
-        let suffix_len = PROBE_MOUNT_TEMPLATE.len() - prefix.len();
+    fn temporary_mountpoint_name_matches_template(name: &str) -> bool {
+        let prefix = TEMPORARY_MOUNTPOINT_TEMPLATE.trim_end_matches('X');
+        let suffix_len = TEMPORARY_MOUNTPOINT_TEMPLATE.len() - prefix.len();
         name.strip_prefix(prefix).is_some_and(|suffix|
             suffix.len() == suffix_len && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
     }
 
-    // A probe directory is one this call created: a real directory, not a
-    // pre-existing entry, private to its owner, empty, under parent.
-    fn assert_fresh_probe_dir(parent: &Path, dir: &Path) {
+    // A temporary mount point is one this call created: a real directory,
+    // not a pre-existing entry, private to its owner, empty, under parent.
+    fn assert_fresh_temporary_mountpoint(parent: &Path, dir: &Path) {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(dir.parent(), Some(parent));
         let name = dir.file_name().unwrap().to_str().unwrap();
-        assert!(probe_name_matches_template(name), "{name}");
+        assert!(temporary_mountpoint_name_matches_template(name), "{name}");
         let meta = fs::symlink_metadata(dir).unwrap();
         assert!(meta.file_type().is_dir(), "{} is not a directory", dir.display());
         assert_eq!(meta.permissions().mode() & 0o777, 0o700);
@@ -769,25 +770,25 @@ mod tests {
     }
 
     #[test]
-    fn probe_dir_is_created_fresh_under_its_parent() {
-        let parent = scratch("probe-fresh");
-        let first = make_probe_dir(&parent).unwrap();
-        let second = make_probe_dir(&parent).unwrap();
+    fn temporary_mountpoint_is_created_fresh_under_its_parent() {
+        let parent = scratch("temporary-mountpoint-fresh");
+        let first = make_temporary_mountpoint(&parent).unwrap();
+        let second = make_temporary_mountpoint(&parent).unwrap();
         assert_ne!(first, second);
-        assert_fresh_probe_dir(&parent, &first);
-        assert_fresh_probe_dir(&parent, &second);
+        assert_fresh_temporary_mountpoint(&parent, &first);
+        assert_fresh_temporary_mountpoint(&parent, &second);
         fs::remove_dir_all(&parent).unwrap();
     }
 
     // Entries another user could have prepared, under the names a
     // predictable scheme would pick: none is ever returned or followed.
     #[test]
-    fn probe_dir_never_reuses_an_existing_entry() {
-        let parent = scratch("probe-existing");
-        let elsewhere = scratch("probe-existing-target");
-        let prefix = PROBE_MOUNT_TEMPLATE.trim_end_matches('X');
+    fn temporary_mountpoint_never_reuses_an_existing_entry() {
+        let parent = scratch("temporary-mountpoint-existing");
+        let elsewhere = scratch("temporary-mountpoint-existing-target");
+        let prefix = TEMPORARY_MOUNTPOINT_TEMPLATE.trim_end_matches('X');
         let planted = [
-            parent.join(PROBE_MOUNT_TEMPLATE),
+            parent.join(TEMPORARY_MOUNTPOINT_TEMPLATE),
             parent.join(format!("{prefix}toplevel-b7f6a24")),
             parent.join(format!("{prefix}AAAAAA")),
         ];
@@ -796,9 +797,9 @@ mod tests {
         fs::create_dir(&planted[2]).unwrap();
 
         for _ in 0..64 {
-            let dir = make_probe_dir(&parent).unwrap();
+            let dir = make_temporary_mountpoint(&parent).unwrap();
             assert!(!planted.contains(&dir), "reused {}", dir.display());
-            assert_fresh_probe_dir(&parent, &dir);
+            assert_fresh_temporary_mountpoint(&parent, &dir);
         }
         assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
         fs::remove_dir_all(&parent).unwrap();
@@ -806,9 +807,9 @@ mod tests {
     }
 
     #[test]
-    fn probe_dir_reports_a_missing_parent() {
-        let scratch_dir = scratch("probe-missing");
-        assert!(make_probe_dir(&scratch_dir.join("absent")).is_err());
+    fn temporary_mountpoint_reports_a_missing_parent() {
+        let scratch_dir = scratch("temporary-mountpoint-missing");
+        assert!(make_temporary_mountpoint(&scratch_dir.join("absent")).is_err());
         fs::remove_dir_all(&scratch_dir).unwrap();
     }
 
@@ -816,13 +817,13 @@ mod tests {
     // which is what keeps them from preparing a mount point there.
     #[cfg(target_os = "linux")]
     #[test]
-    fn probe_parent_is_writable_only_by_root() {
+    fn temporary_mountpoint_parent_is_writable_only_by_root() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let meta = fs::metadata(PROBE_MOUNT_PARENT).unwrap();
+        let meta = fs::metadata(TEMPORARY_MOUNTPOINT_PARENT).unwrap();
         assert_eq!(meta.uid(), 0);
-        assert_eq!(meta.permissions().mode() & 0o022, 0, "{PROBE_MOUNT_PARENT} is group or world writable");
+        assert_eq!(meta.permissions().mode() & 0o022, 0, "{TEMPORARY_MOUNTPOINT_PARENT} is group or world writable");
         if !is_root() {
-            assert!(make_probe_dir(Path::new(PROBE_MOUNT_PARENT)).is_err());
+            assert!(make_temporary_mountpoint(Path::new(TEMPORARY_MOUNTPOINT_PARENT)).is_err());
         }
     }
 
