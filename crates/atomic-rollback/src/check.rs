@@ -795,7 +795,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     /// root, under the ESP stub stub.
     fn context_from_stub(top: &Path, stub: &str) -> Result<GrubContext, GrubContextError> {
         let btrfs = tools::FsType::Btrfs;
-        GrubContext::build(stub, tools::parse_esp_stub(stub).unwrap(), &btrfs,
+        GrubContext::build(stub, tools::parse_esp_stub(stub).unwrap(), &btrfs, &top.join("partition"),
             |btrfs_relative| StartingLookupDir::select(&btrfs, btrfs_relative, top.to_path_buf(), || Ok("root".into())),
             None)
     }
@@ -813,7 +813,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
             snapshot: tools::SubvolName::new(snapshot.into()),
         };
         let stub = esp_stub(false, prefix);
-        GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &fstype,
+        GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &fstype, &root.join("partition"),
             |btrfs_relative| Ok(StartingLookupDir::after_rollback(&fstype, btrfs_relative, root.to_path_buf(), &exchange)),
             None).unwrap()
     }
@@ -956,7 +956,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         // Fedora cloud images set btrfs_relative_path on an ext4 /boot.
         let stub = esp_stub(true, "/grub2");
         let ext4 = tools::FsType::Ext4;
-        let grub = GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &ext4,
+        let grub = GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &ext4, &boot.join("partition"),
             |btrfs_relative| StartingLookupDir::select(&ext4, btrfs_relative, boot.clone(),
                 || panic!("no default subvolume off Btrfs")),
             None).unwrap();
@@ -1203,6 +1203,34 @@ blscfg
         put(&top.join("root/boot/grub2/envblock"), &grubenv(BLSDIR_TOP_LEVEL));
         let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
         assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    /// An environment block of one 512-byte sector setting vars, padded
+    /// with '#' as grub2-editenv pads it.
+    fn envblk_sector(vars: &str) -> Vec<u8> {
+        let mut block = format!("# GRUB Environment Block\n{vars}").into_bytes();
+        block.resize(512, b'#');
+        block
+    }
+
+    // Fedora's grub2-editenv keeps env_block in sectors a Btrfs filesystem
+    // reserves, so grubenv holds env_block=512+1, which the header loads
+    // from the device the stub found (00_header.in:62-70): a name that does
+    // not start with '/' is a block list (kern/file.c:107-114), here one
+    // 512-byte sector at sector 512 (kern/fs.c, grub_fs_blocklist_open).
+    // A regular file stands in for the partition.
+    #[test]
+    fn env_block_as_a_block_list_is_read_from_the_partition() {
+        let (top, _) = generated_layout("phase-env-block-sectors", "env_block=512+1\n", &entry_from_top_level());
+        let mut partition = vec![0u8; 1024 * 512];
+        partition[512 * 512..513 * 512].copy_from_slice(&envblk_sector(BLSDIR_TOP_LEVEL));
+        fs::write(top.join("partition"), &partition).unwrap();
+
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+        assert!(grub.is_ok(), "{:?}", grub.as_ref().err());
+        let results = bls_entries(&grub.unwrap());
+        assert!(passes(&results), "{results:?}");
         fs::remove_dir_all(&top).unwrap();
     }
 
