@@ -410,12 +410,10 @@ fn read_esp_stub(path: &Path) -> Result<String, GrubContextError> {
 }
 
 /// The stub's contract values, with the block device holding the
-/// filesystem it names and that filesystem's type. Refuses a stub whose
-/// resolution check does not model.
+/// filesystem it names and that filesystem's type.
 fn boot_filesystem(content: &str) -> Result<(tools::EspStub, tools::DevicePath, tools::FsType), String> {
     let stub = tools::parse_esp_stub(content)?;
     let (device, fstype) = boot_device(&stub)?;
-    reject_btrfs_subvol_variables(content, &stub, &fstype)?;
     Ok((stub, device, fstype))
 }
 
@@ -468,10 +466,10 @@ impl GrubContext {
             tools::get_mount_point(&device.into_device_spec())?
         };
 
-        let starting_lookup_dir = StartingLookupDir::select(&fstype, stub.btrfs_relative, PathBuf::from(mount.path()),
-            || tools::btrfs_subvol_get_default(mount.path()).map(|d| d.path().to_string()))?;
-
-        Ok(Self { starting_lookup_dir, grub_dir: stub.grub_dir, _mount: Some(mount) })
+        let fs_root = mount.path().to_string();
+        let select = |btrfs_relative| StartingLookupDir::select(&fstype, btrfs_relative, PathBuf::from(&fs_root),
+            || tools::btrfs_subvol_get_default(&fs_root).map(|d| d.path().to_string()));
+        Self::build(&content, stub, &fstype, select, Some(mount))
     }
 
     /// Builds a context for verifying a snapshot before rollback makes the
@@ -490,9 +488,23 @@ impl GrubContext {
             Some(tools::get_mount_point(&device.into_device_spec())?)
         };
         let fs_root = mount.as_ref().map_or_else(|| toplevel.to_path_buf(), |m| PathBuf::from(m.path()));
+        let select = |btrfs_relative| Ok(StartingLookupDir::after_rollback(&fstype, btrfs_relative, fs_root.clone(), exchange));
+        Self::build(&content, stub, &fstype, select, mount)
+    }
 
-        let starting_lookup_dir = StartingLookupDir::after_rollback(&fstype, stub.btrfs_relative, fs_root, exchange);
-
+    /// Builds the context from the ESP stub, its text and the contract values
+    /// parsed from it, once the filesystem it names, of type fstype, is
+    /// visible. select gives GRUB's starting lookup directory on that
+    /// filesystem for a btrfs_relative_path setting.
+    pub fn build(
+        stub_text: &str,
+        stub: tools::EspStub,
+        fstype: &tools::FsType,
+        mut select: impl FnMut(bool) -> Result<StartingLookupDir, String>,
+        mount: Option<tools::MountPoint>,
+    ) -> Result<Self, GrubContextError> {
+        reject_btrfs_subvol_variables(stub_text, &stub, fstype)?;
+        let starting_lookup_dir = select(stub.btrfs_relative)?;
         Ok(Self { starting_lookup_dir, grub_dir: stub.grub_dir, _mount: mount })
     }
 
