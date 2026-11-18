@@ -726,6 +726,27 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
             && results.iter().any(|r| r.as_ref().err().is_some_and(|e| e.contains(needle)))
     }
 
+    fn refuses(results: &[CheckResult], needle: &str) -> bool {
+        results.iter().any(|r| r.as_ref().err().is_some_and(|e| e.contains(needle)))
+    }
+
+    /// A system set up without migrate: /boot is ext4, outside the root
+    /// subvolume, and holds grub2/, loader/entries/ and the kernels. The
+    /// context is the snapshot check's, which reads that live /boot.
+    fn separate_boot(boot: &Path) -> GrubContext {
+        put(&boot.join("grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&boot.join("grub2/grubenv"), &grubenv(""));
+        put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
+        put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
+        put(&boot.join(format!("loader/entries/{KVER}.conf")), &entry_from_root_subvol());
+        let exchange = RenameExchange {
+            root: tools::SubvolName::new("root".into()),
+            snapshot: tools::SubvolName::new("snap1".into()),
+        };
+        let starting_lookup_dir = StartingLookupDir::after_rollback(&tools::FsType::Ext4, false, boot.to_path_buf(), &exchange);
+        GrubContext::new(starting_lookup_dir, "/grub2".into())
+    }
+
     #[test]
     fn top_level_accepts_paths_from_the_top_level() {
         let top = scratch("grub-top-level-accepts");
@@ -873,27 +894,91 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     fn setup_only_snapshot_check_reads_the_live_boot_partition() {
         let scratch_dir = scratch("grub-setup-only-snapshot");
         let boot = scratch_dir.join("boot");
-        put(&boot.join("grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
-        put(&boot.join("grub2/grubenv"), &grubenv(""));
-        put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
-        put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
-        put(&boot.join(format!("loader/entries/{KVER}.conf")), &entry_from_root_subvol());
-        let top = scratch_dir.join("top");
-        let snapshot = top.join("snap1");
+        let grub = separate_boot(&boot);
+        let snapshot = scratch_dir.join("top/snap1");
         fs::create_dir_all(snapshot.join("boot")).unwrap();
         put(&snapshot.join("etc/fstab"), "UUID=3f2a9c41 / btrfs subvol=root 0 0\n");
-
-        let exchange = RenameExchange {
-            root: tools::SubvolName::new("root".into()),
-            snapshot: tools::SubvolName::new("snap1".into()),
-        };
-        let starting_lookup_dir = StartingLookupDir::after_rollback(&tools::FsType::Ext4, false, boot.clone(), &exchange);
-        let grub = GrubContext::new(starting_lookup_dir, "/grub2".into());
 
         assert!(passes(&check_grub_cfg(&grub, None)), "{:?}", check_grub_cfg(&grub, None));
         assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
         assert_eq!(extract_root_uuid(&grub, &grub.blsdir()).map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
         fs::remove_dir_all(&scratch_dir).unwrap();
+    }
+
+    // --- refusals: each check fails on a seeded defect ---
+
+    // The live root keeps its grub.cfg; the snapshot, whose prefix GRUB
+    // reaches through the root subvolume's name after the exchange, does not.
+    #[test]
+    fn snapshot_check_refuses_a_snapshot_without_grub_cfg() {
+        let top = scratch("refuse-snapshot-grub-cfg");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        install_subvol(&top, "snap1", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = snapshot_context(&top, "snap1");
+        assert!(passes(&check_grub_cfg(&grub, None)));
+
+        fs::remove_file(top.join("snap1/boot/grub2/grub.cfg")).unwrap();
+        let results = check_grub_cfg(&grub, None);
+        assert!(fails_with(&results, "file `/root/boot/grub2/grub.cfg' not found"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn snapshot_check_refuses_a_snapshot_grub_cfg_without_blscfg() {
+        let top = scratch("refuse-snapshot-blscfg");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        install_subvol(&top, "snap1", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = snapshot_context(&top, "snap1");
+
+        put(&top.join("snap1/boot/grub2/grub.cfg"), "set timeout=5\n");
+        let results = check_grub_cfg(&grub, None);
+        assert!(refuses(&results, "does not use Boot Loader Specification entries"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn snapshot_check_refuses_a_separate_boot_without_grub_cfg() {
+        let boot = scratch("refuse-boot-grub-cfg");
+        let grub = separate_boot(&boot);
+        assert!(passes(&check_grub_cfg(&grub, None)));
+
+        fs::remove_file(boot.join("grub2/grub.cfg")).unwrap();
+        let results = check_grub_cfg(&grub, None);
+        assert!(fails_with(&results, "file `/grub2/grub.cfg' not found"), "{results:?}");
+        fs::remove_dir_all(&boot).unwrap();
+    }
+
+    #[test]
+    fn snapshot_check_refuses_a_separate_boot_grub_cfg_without_blscfg() {
+        let boot = scratch("refuse-boot-blscfg");
+        let grub = separate_boot(&boot);
+
+        put(&boot.join("grub2/grub.cfg"), "set timeout=5\n");
+        let results = check_grub_cfg(&grub, None);
+        assert!(refuses(&results, "does not use Boot Loader Specification entries"), "{results:?}");
+        fs::remove_dir_all(&boot).unwrap();
+    }
+
+    #[test]
+    fn snapshot_check_refuses_a_kernel_missing_from_a_separate_boot() {
+        let boot = scratch("refuse-boot-kernel");
+        let grub = separate_boot(&boot);
+        assert!(passes(&bls_entries(&grub)));
+
+        fs::remove_file(boot.join(format!("vmlinuz-{KVER}"))).unwrap();
+        let results = bls_entries(&grub);
+        assert!(fails_with(&results, &format!("file `/vmlinuz-{KVER}' not found")), "{results:?}");
+        fs::remove_dir_all(&boot).unwrap();
+    }
+
+    #[test]
+    fn default_subvol_check_refuses_a_default_other_than_the_root_subvolume() {
+        let root = tools::SubvolName::new("root".into());
+        assert!(default_subvol_is_root(256, &root, 256).is_ok());
+
+        let err = default_subvol_is_root(5, &root, 256).unwrap_err();
+        assert!(err.contains("GRUB and Linux see different root filesystems"), "{err}");
+        assert!(err.contains("set-default 256"), "{err}");
     }
 
     // --- what a failure names ---
