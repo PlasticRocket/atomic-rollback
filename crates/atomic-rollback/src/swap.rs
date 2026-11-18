@@ -2,7 +2,7 @@
 //! irreversible operation in the tool (migration steps, rollback,
 //! kernel hook) goes through this function.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::tools::SubvolName;
 
@@ -22,23 +22,24 @@ impl RenameExchange {
     /// exchange, to the path naming the same file before it: a path through
     /// the root subvolume's name reaches the snapshot, and a path through
     /// the snapshot's name reaches the old root subvolume.
-    pub fn before_exchange(&self, path: &str) -> String {
-        let path = path.trim_start_matches('/');
-        let root = self.root.as_str().trim_matches('/');
-        let snapshot = self.snapshot.as_str().trim_matches('/');
-        if let Some(rest) = below(path, root) {
-            format!("{snapshot}{rest}")
-        } else if let Some(rest) = below(path, snapshot) {
-            format!("{root}{rest}")
+    pub fn before_exchange(&self, path: &Path) -> PathBuf {
+        let path = path.strip_prefix("/").unwrap_or(path);
+        let root = Path::new(self.root.as_str().trim_start_matches('/'));
+        let snapshot = Path::new(self.snapshot.as_str().trim_start_matches('/'));
+        if let Ok(rest) = path.strip_prefix(root) {
+            join_below(snapshot, rest)
+        } else if let Ok(rest) = path.strip_prefix(snapshot) {
+            join_below(root, rest)
         } else {
-            path.to_string()
+            path.to_path_buf()
         }
     }
 }
 
-/// The rest of path after name, when path is name or lies below it.
-fn below<'a>(path: &'a str, name: &str) -> Option<&'a str> {
-    path.strip_prefix(name).filter(|rest| rest.is_empty() || rest.starts_with('/'))
+/// dir joined with rest, a path below it; dir itself when rest is empty,
+/// where Path::join would add a trailing slash.
+pub fn join_below(dir: &Path, rest: &Path) -> PathBuf {
+    if rest.as_os_str().is_empty() { dir.to_path_buf() } else { dir.join(rest) }
 }
 
 /// Swap two filesystem entries within the same directory.

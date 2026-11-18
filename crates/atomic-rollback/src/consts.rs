@@ -16,6 +16,10 @@ pub const TEMPORARY_MOUNTPOINT_TEMPLATE: &str = "atomic-rollback-mount-XXXXXX";
 // All user subvolumes (root, home, var) are children of this.
 pub const BTRFS_TOPLEVEL_SUBVOLID: u64 = 5;
 
+// Inode number of the root directory of every Btrfs subvolume
+// (BTRFS_FIRST_FREE_OBJECTID, include/uapi/linux/btrfs_tree.h).
+pub const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
+
 // Configuration file path. Shell key=value format.
 pub const CONFIG_PATH: &str = "/etc/atomic-rollback.conf";
 

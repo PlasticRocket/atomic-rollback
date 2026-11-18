@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::fs;
 
-use crate::consts::{BTRFS_TOPLEVEL_SUBVOLID, TEMPORARY_MOUNTPOINT_PARENT, TEMPORARY_MOUNTPOINT_TEMPLATE, TOPLEVEL_MOUNT};
+use crate::consts::{BTRFS_FIRST_FREE_OBJECTID, BTRFS_TOPLEVEL_SUBVOLID, TEMPORARY_MOUNTPOINT_PARENT, TEMPORARY_MOUNTPOINT_TEMPLATE, TOPLEVEL_MOUNT};
 
 /// Bare filesystem UUID extracted from BLS boot entries or grub2-probe.
 /// Convert via into_device_spec() before passing to resolve_fstab_device
@@ -313,6 +313,34 @@ pub fn btrfs_subvol_get_default(mount_point: &str) -> Result<DefaultSubvol, Stri
     let out = run_stdout("btrfs", &["subvolume", "get-default", mount_point])?;
     parse_default_subvol(&out)
         .ok_or_else(|| format!("cannot parse default subvol ID from: {out}"))
+}
+
+/// Whether path is the root directory of a Btrfs subvolume, by
+/// libbtrfsutil's test (btrfs_util_is_subvolume): a directory on a Btrfs
+/// filesystem whose inode number is BTRFS_FIRST_FREE_OBJECTID. A path that
+/// cannot be examined is not one.
+#[cfg(target_os = "linux")]
+pub fn is_btrfs_subvolume_root(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else { return false };
+    let mut sfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: statfs reads the NUL-terminated c_path and writes only into
+    // sfs, which has the size and alignment of a statfs.
+    if unsafe { libc::statfs(c_path.as_ptr(), sfs.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: statfs returned 0, so it filled sfs.
+    let sfs = unsafe { sfs.assume_init() };
+    sfs.f_type == libc::BTRFS_SUPER_MAGIC
+        && fs::metadata(path).is_ok_and(|m| m.is_dir() && m.ino() == BTRFS_FIRST_FREE_OBJECTID)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_btrfs_subvolume_root(_path: &Path) -> bool {
+    false
 }
 
 /// Sets the default subvolume for the filesystem at mount_point.
