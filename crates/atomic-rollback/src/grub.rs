@@ -484,15 +484,42 @@ const LOOKUP_VARIABLES: [&str; 4] = ["btrfs_relative_path", "btrfs_subvol", "btr
 const LOADING_VARIABLES: [&str; 3] = ["env_block", "dev", "prefix"];
 
 /// Where an assignment check follows was made.
+const GRUB_ENV: &str = "the GRUB_ENV EFI variable";
 const ESP_STUB: &str = "ESP grub.cfg";
 const GRUBENV: &str = "grubenv";
 const ENV_BLOCK: &str = "env_block";
 
-/// The GRUB variables check follows from the ESP stub to blscfg, each with
+/// The GUID GRUB keeps its EFI variables under (include/grub/efi/efi.h,
+/// GRUB_EFI_GRUB_VARIABLE_GUID).
+const GRUB_VARIABLE_GUID: &str = "91376aff-cba6-42be-949d-06fde81128e8";
+
+/// Where efivarfs shows the EFI variables.
+const EFIVARS_DIR: &str = "/sys/firmware/efi/efivars";
+
+/// The bytes of attributes efivarfs shows before a variable's data (the
+/// kernel's Documentation/filesystems/efivarfs.rst).
+const EFIVARFS_ATTRIBUTES_SIZE: usize = 4;
+
+/// The data of the GRUB_ENV EFI variable, which Fedora's GRUB reads when it
+/// starts, as efivarfs at dir shows it, or None when the variable is not
+/// set.
+fn read_grub_env_variable(dir: &Path) -> Result<Option<Vec<u8>>, GrubContextError> {
+    let path = dir.join(format!("GRUB_ENV-{GRUB_VARIABLE_GUID}"));
+    let unverified = |reason: String| GrubContextError::CannotVerify(format!(
+        "cannot read {GRUB_ENV}, whose variables GRUB sets when it starts: {reason}"));
+    match fs::read(&path) {
+        Ok(bytes) => bytes.get(EFIVARFS_ATTRIBUTES_SIZE..).map(|data| Some(data.to_vec()))
+            .ok_or_else(|| unverified(format!("{} is shorter than its attributes", path.display()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && dir.is_dir() => Ok(None),
+        Err(e) => Err(unverified(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// The GRUB variables check follows from GRUB's start to blscfg, each with
 /// its last assignment and where that was made. configfile copies every
 /// variable into the context it opens for grub.cfg (normal/context.c,
-/// grub_env_new_context), so the stub's assignments reach blscfg unless
-/// grub.cfg makes another.
+/// grub_env_new_context), so the assignments made before it reach blscfg
+/// unless grub.cfg makes another.
 #[derive(Default)]
 struct GrubVariables {
     values: HashMap<&'static str, (String, &'static str)>,
@@ -505,18 +532,53 @@ struct GrubVariables {
 }
 
 impl GrubVariables {
-    /// The variables as the ESP stub leaves them at configfile. dev, set
-    /// by its search, and prefix are the stub's as check reads them.
+    /// The variables as the ESP stub leaves them at configfile, when it
+    /// is the first to set them.
+    #[cfg(test)]
     fn from_stub(stub_text: &str) -> Self {
         let mut variables = Self::default();
+        variables.apply_stub(stub_text);
+        variables
+    }
+
+    /// Makes the ESP stub's assignments before configfile. Its search sets
+    /// dev and its set prefix= sets prefix, which check reads as the stub's
+    /// contract values, so an earlier value of either does not hold.
+    fn apply_stub(&mut self, stub_text: &str) {
         for line in tools::before_configfile(stub_text) {
             for name in LOOKUP_VARIABLES.into_iter().chain(["env_block"]) {
                 if let Some(value) = tools::grub_assignment(line, name) {
-                    variables.assign(name, value.to_string(), ESP_STUB);
+                    self.assign(name, value.to_string(), ESP_STUB);
                 }
             }
         }
-        variables
+        self.values.remove("dev");
+        self.values.remove("prefix");
+    }
+
+    /// Sets the variables of the GRUB_ENV EFI variable as Fedora's GRUB sets
+    /// them when it starts, before it runs the ESP stub: its data, when it
+    /// holds a byte, iterated as an environment block without the signature
+    /// check load_env makes (Fedora's grub2 2.12 patches,
+    /// grub-core/kern/efi/init.c, grub_efi_env_init). The Btrfs driver
+    /// registers the write hooks of btrfs_subvol and btrfs_subvolid when its
+    /// module starts, which is later (grub-core/kern/main.c, grub_main), and
+    /// registering a hook keeps a value without running it
+    /// (grub-core/kern/env.c, grub_register_variable_hook), so GRUB_ENV's
+    /// values of those point the driver at no subvolume.
+    fn load_grub_env(&mut self, data: &[u8]) -> Result<(), GrubContextError> {
+        for (name, value) in envblk_iterate(data) {
+            let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).find(|n| n.as_bytes() == name) else {
+                continue;
+            };
+            if name == "btrfs_subvol" || name == "btrfs_subvolid" {
+                continue;
+            }
+            let value = String::from_utf8(value).map_err(|_| GrubContextError::CannotVerify(format!(
+                "{GRUB_ENV} sets {name} to bytes that are not UTF-8, which check does not look up")))?;
+            self.values.insert(name, (value, GRUB_ENV));
+        }
+        Ok(())
     }
 
     /// Sets name to value as GRUB's grub_env_set does, through the write
@@ -850,7 +912,8 @@ impl GrubContext {
         let fs_root = mount.path().to_string();
         let select = |btrfs_relative| StartingLookupDir::select(&fstype, btrfs_relative, PathBuf::from(&fs_root),
             || tools::btrfs_subvol_get_default(&fs_root).map(|d| d.path().to_string()));
-        Self::build(&content, stub, &fstype, &partition, select, Some(mount))
+        let grub_env = read_grub_env_variable(Path::new(EFIVARS_DIR))?;
+        Self::build(&content, stub, &fstype, &partition, grub_env.as_deref(), select, Some(mount))
     }
 
     /// Builds a context for verifying a snapshot before rollback makes the
@@ -871,15 +934,17 @@ impl GrubContext {
         };
         let fs_root = mount.as_ref().map_or_else(|| toplevel.to_path_buf(), |m| PathBuf::from(m.path()));
         let select = |btrfs_relative| Ok(StartingLookupDir::after_rollback(&fstype, btrfs_relative, fs_root.clone(), exchange));
-        Self::build(&content, stub, &fstype, &partition, select, mount)
+        let grub_env = read_grub_env_variable(Path::new(EFIVARS_DIR))?;
+        Self::build(&content, stub, &fstype, &partition, grub_env.as_deref(), select, mount)
     }
 
     /// Builds the context from the ESP stub, its text and the contract values
     /// parsed from it, once the filesystem it names, of type fstype, is
     /// visible. partition is the block device holding that filesystem, the
-    /// one the stub's search leaves in dev. select gives GRUB's starting
-    /// lookup directory on that filesystem for a btrfs_relative_path
-    /// setting.
+    /// one the stub's search leaves in dev. grub_env is the data of the
+    /// GRUB_ENV EFI variable, None when it is not set. select gives GRUB's
+    /// starting lookup directory on that filesystem for a
+    /// btrfs_relative_path setting.
     ///
     /// GRUB reads btrfs_relative_path, btrfs_subvol and btrfs_subvolid at
     /// each mount and lookup (Fedora's grub2 2.12 patches,
@@ -895,12 +960,17 @@ impl GrubContext {
         stub: tools::EspStub,
         fstype: &tools::FsType,
         partition: &Path,
+        grub_env: Option<&[u8]>,
         select: impl FnMut(bool) -> Result<StartingLookupDir, String>,
         mount: Option<tools::MountPoint>,
     ) -> Result<Self, GrubContextError> {
         let mut lookup_dirs = LookupDirs { select, selected: [None, None] };
         let grub_dir = stub.grub_dir;
-        let mut variables = GrubVariables::from_stub(stub_text);
+        let mut variables = GrubVariables::default();
+        if let Some(data) = grub_env {
+            variables.load_grub_env(data)?;
+        }
+        variables.apply_stub(stub_text);
         reject_btrfs_subvol_variables(&variables, fstype)?;
         let at_configfile = lookup_dirs.for_setting(variables.btrfs_relative())?;
 
@@ -1001,15 +1071,21 @@ const ENVBLK_SIGNATURE: &[u8] = b"# GRUB Environment Block\n";
 /// it makes them, as grub-core/lib/envblk.c reads the block; None when GRUB
 /// refuses it. grub_envblk_open requires the signature and at least one
 /// byte after it, since it compares the size with the signature's sizeof,
-/// which counts the terminating NUL. grub_envblk_iterate skips a line
-/// starting with '#', reads a name up to '=' and its value up to the
-/// newline, where a backslash makes the next byte part of the value, and
-/// stops at an assignment with no '=' or no newline after it. A name and a
-/// value end at a NUL byte, as the C strings load_env sets do.
+/// which counts the terminating NUL.
 fn envblk_assignments(block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     if block.len() <= ENVBLK_SIGNATURE.len() || !block.starts_with(ENVBLK_SIGNATURE) {
         return None;
     }
+    Some(envblk_iterate(block))
+}
+
+/// The assignments grub_envblk_iterate reads from block, in order: it
+/// starts after the signature's length, whatever those bytes hold, skips a
+/// line starting with '#', reads a name up to '=' and its value up to the
+/// newline, where a backslash makes the next byte part of the value, and
+/// stops at an assignment with no '=' or no newline after it. A name and a
+/// value end at a NUL byte, as the C strings it passes on do.
+fn envblk_iterate(block: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let end = block.len();
     let mut p = ENVBLK_SIGNATURE.len();
     let mut assignments = Vec::new();
@@ -1044,7 +1120,7 @@ fn envblk_assignments(block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         }
         p = envblk_next_line(block, p);
     }
-    Some(assignments)
+    assignments
 }
 
 /// The position after the newline that ends the line at p, where a
@@ -1589,6 +1665,20 @@ configfile $prefix/grub.cfg
         assert!(matches!(&found, Some(LookupFailure::CannotRead(e)) if e.contains("ermission denied")), "{found:?}");
         drop(_locked);
         fs::remove_dir_all(&top).unwrap();
+    }
+
+    // --- the GRUB_ENV EFI variable ---
+
+    // efivarfs shows a variable as its attributes, 4 bytes, then its data;
+    // a variable that is not set has no file, in a directory that exists.
+    #[test]
+    fn grub_env_is_read_after_its_attributes() {
+        let dir = scratch("efivars");
+        assert!(matches!(read_grub_env_variable(&dir), Ok(None)));
+        fs::write(dir.join(format!("GRUB_ENV-{GRUB_VARIABLE_GUID}")), b"\x07\0\0\0blsdir=/b\n").unwrap();
+        assert_eq!(read_grub_env_variable(&dir).ok().flatten(), Some(b"blsdir=/b\n".to_vec()));
+        assert!(matches!(read_grub_env_variable(&dir.join("absent")), Err(GrubContextError::CannotVerify(_))));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- grubenv ---

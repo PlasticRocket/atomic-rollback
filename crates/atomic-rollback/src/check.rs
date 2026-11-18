@@ -795,8 +795,13 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     /// whose top level is visible at top and whose default subvolume is
     /// root, under the ESP stub stub.
     fn context_from_stub(top: &Path, stub: &str) -> Result<GrubContext, GrubContextError> {
+        context_with_grub_env(top, stub, None)
+    }
+
+    /// The same, with the GRUB_ENV EFI variable holding grub_env.
+    fn context_with_grub_env(top: &Path, stub: &str, grub_env: Option<&[u8]>) -> Result<GrubContext, GrubContextError> {
         let btrfs = tools::FsType::Btrfs;
-        GrubContext::build(stub, tools::parse_esp_stub(stub).unwrap(), &btrfs, &top.join("partition"),
+        GrubContext::build(stub, tools::parse_esp_stub(stub).unwrap(), &btrfs, &top.join("partition"), grub_env,
             |btrfs_relative| StartingLookupDir::select(&btrfs, btrfs_relative, top.to_path_buf(), || Ok("root".into())),
             None)
     }
@@ -814,7 +819,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
             snapshot: tools::SubvolName::new(snapshot.into()),
         };
         let stub = esp_stub(false, prefix);
-        GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &fstype, &root.join("partition"),
+        GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &fstype, &root.join("partition"), None,
             |btrfs_relative| Ok(StartingLookupDir::after_rollback(&fstype, btrfs_relative, root.to_path_buf(), &exchange)),
             None).unwrap()
     }
@@ -957,7 +962,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         // Fedora cloud images set btrfs_relative_path on an ext4 /boot.
         let stub = esp_stub(true, "/grub2");
         let ext4 = tools::FsType::Ext4;
-        let grub = GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &ext4, &boot.join("partition"),
+        let grub = GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &ext4, &boot.join("partition"), None,
             |btrfs_relative| StartingLookupDir::select(&ext4, btrfs_relative, boot.clone(),
                 || panic!("no default subvolume off Btrfs")),
             None).unwrap();
@@ -1330,6 +1335,78 @@ blscfg
 
         put(&top.join("root/boot/grub2/user.cfg"), "blsdir=/elsewhere\n");
         assert!(cannot_verify_naming(context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)), "blsdir"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // --- the GRUB_ENV EFI variable ---
+
+    /// GRUB_ENV's data setting vars, laid out as grub2-editenv lays out
+    /// grubenv.
+    fn grub_env(vars: &str) -> Vec<u8> {
+        format!("# GRUB Environment Block\n{vars}").into_bytes()
+    }
+
+    // GRUB sets GRUB_ENV's variables when it starts, before it runs the ESP
+    // stub (Fedora's grub2 2.12 patches, grub-core/kern/efi/init.c,
+    // grub_efi_env_init), so they reach grub.cfg and blscfg as the stub's
+    // do. It iterates them without checking the signature, from the byte
+    // after it (grub-core/lib/envblk.c, grub_envblk_iterate).
+    #[test]
+    fn grub_env_variables_reach_blscfg() {
+        let top = scratch("grub-env-blsdir");
+        install_subvol(&top, "root", "", &entry_from_top_level());
+        let stub = esp_stub(false, STUB_TOP_LEVEL_PREFIX);
+        let results = bls_entries(&context_from_stub(&top, &stub).unwrap());
+        assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{results:?}");
+
+        let grub = context_with_grub_env(&top, &stub, Some(&grub_env(BLSDIR_TOP_LEVEL))).unwrap();
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        let unsigned = format!("{}\n{BLSDIR_TOP_LEVEL}", "x".repeat(24));
+        let grub = context_with_grub_env(&top, &stub, Some(unsigned.as_bytes())).unwrap();
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn grub_env_btrfs_relative_path_moves_the_lookup_of_grub_cfg() {
+        let top = scratch("grub-env-relative");
+        install_subvol(&top, "root", "", &entry_from_root_subvol());
+        let grub = context_with_grub_env(&top, &esp_stub(false, "/boot/grub2"),
+            Some(&grub_env("btrfs_relative_path=1\n"))).unwrap();
+        assert!(passes(&check_grub_cfg(&grub, None)), "{:?}", check_grub_cfg(&grub, None));
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The stub's search sets dev and its set prefix= sets prefix, replacing
+    // GRUB_ENV's values. The Btrfs driver registers the write hooks of
+    // btrfs_subvol and btrfs_subvolid when its module starts, after GRUB has
+    // set GRUB_ENV's variables (grub-core/kern/main.c, grub_main: machine
+    // init, then the modules), and registering a hook keeps a value without
+    // running it (grub-core/kern/env.c, grub_register_variable_hook), so
+    // GRUB_ENV's btrfs_subvol points the driver at no subvolume.
+    #[test]
+    fn grub_env_values_the_stub_or_the_btrfs_driver_replace_are_not_refused() {
+        let (top, _) = generated_layout("grub-env-replaced", "env_block=/root/boot/grub2/envblock\n", &entry_from_top_level());
+        put(&top.join("root/boot/grub2/envblock"), &grubenv(BLSDIR_TOP_LEVEL));
+        let grub = context_with_grub_env(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX),
+            Some(&grub_env("dev=hd9,gpt9\nprefix=/elsewhere\n")));
+        assert!(grub.as_ref().is_ok_and(|grub| passes(&bls_entries(grub))), "{:?}", grub.as_ref().err());
+
+        let grub = context_with_grub_env(&top, &esp_stub(true, "/boot/grub2"), Some(&grub_env("btrfs_subvol=@\n")));
+        assert!(grub.is_ok(), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // grub.cfg loads grubenv after the stub, so grubenv replaces GRUB_ENV's
+    // value.
+    #[test]
+    fn grubenv_replaces_a_grub_env_value() {
+        let top = scratch("grub-env-grubenv");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = context_with_grub_env(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX),
+            Some(&grub_env("blsdir=/elsewhere\n"))).unwrap();
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
         fs::remove_dir_all(&top).unwrap();
     }
 
