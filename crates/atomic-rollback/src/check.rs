@@ -89,6 +89,10 @@ fn context_unavailable(e: GrubContextError, command: &str, describe: impl FnOnce
             hint: format!("check mounts the Btrfs top-level subvolume read-only to read the files GRUB reads. \
                            Run: sudo atomic-rollback {command}"),
         },
+        GrubContextError::CannotVerify(reason) => BootStatus::Inaccessible {
+            reason,
+            hint: "check cannot tell where GRUB looks the boot entries up, so the boot chain may still be valid.".into(),
+        },
         GrubContextError::Other(msg) => BootStatus::Fail(vec![describe(msg)]),
     }
 }
@@ -100,7 +104,7 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
             "Cannot determine how GRUB boots this system: {msg}. \
              Ensure {}/grub.cfg exists and the root filesystem is mounted.", P.esp_dir)),
     };
-    println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
+    print_starting_lookup_dirs(&grub);
 
     let blsdir = grub.blsdir();
     evaluate_checks(vec![
@@ -123,7 +127,7 @@ pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> B
             "Cannot determine boot configuration: {msg}. \
              Ensure {}/grub.cfg exists.", P.esp_dir)),
     };
-    println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
+    print_starting_lookup_dirs(&grub);
 
     let snapshot = toplevel.join(exchange.snapshot.as_str());
     let blsdir = grub.blsdir();
@@ -133,6 +137,18 @@ pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> B
         ("Root filesystem", check_root_mountable(&snapshot, &grub, &blsdir)),
         ("System mounts", check_fstab_mounts(&snapshot)),
     ])
+}
+
+/// Names where GRUB starts its lookups, for each part of the boot where it
+/// starts elsewhere.
+fn print_starting_lookup_dirs(grub: &GrubContext) {
+    let (at_configfile, at_blscfg) = (grub.at_configfile.describe(), grub.at_blscfg.describe());
+    if at_configfile == at_blscfg {
+        println!("  GRUB resolves paths from {at_blscfg}");
+    } else {
+        println!("  GRUB loads grub.cfg from {at_configfile}");
+        println!("  GRUB reads the boot entries from {at_blscfg}, as grub.cfg leaves btrfs_relative_path");
+    }
 }
 
 /// Gate: run verify_bootable, exit on failure.
@@ -208,7 +224,11 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
     let regenerate = format!("Regenerate with: sudo grub2-mkconfig -o {}/grub.cfg", P.grub_dir);
     let mut results = check_grub_cfg(grub, Some(&regenerate));
 
-    if let StartingLookupDir::BtrfsDefaultSubvol(default_subvol) = &grub.starting_lookup_dir {
+    let default_subvol = [&grub.at_configfile, &grub.at_blscfg].into_iter().find_map(|start| match start {
+        StartingLookupDir::BtrfsDefaultSubvol(default_subvol) => Some(default_subvol),
+        _ => None,
+    });
+    if let Some(default_subvol) = default_subvol {
         results.push(check_default_subvol_matches_root(&default_subvol.to_string_lossy(), root));
     }
 
@@ -223,7 +243,7 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
 fn check_grub_cfg(grub: &GrubContext, remedy: Option<&str>) -> Vec<CheckResult> {
     let remedy = remedy.map(|r| format!(" {r}")).unwrap_or_default();
     let grub_path = grub.grub_dir_file("grub.cfg");
-    let content = match read_grub_file(grub, &grub_path) {
+    let content = match read_grub_file(&grub.at_configfile, &grub_path) {
         Ok(content) => content,
         Err(finding) => return vec![Err(finding.map_fails(|fact| format!(
             "GRUB loads its configuration from '{grub_path}': {fact}. \
@@ -245,10 +265,10 @@ fn check_grub_cfg(grub: &GrubContext, remedy: Option<&str>) -> Vec<CheckResult> 
     ]
 }
 
-/// The content of the file GRUB opens at grub_path. A Linux error reading
-/// it says nothing about GRUB, so check cannot verify past it.
-fn read_grub_file(grub: &GrubContext, grub_path: &str) -> Result<String, Finding> {
-    let path = grub.find_file(grub_path)?;
+/// The content of the file GRUB opens at grub_path from start. A Linux
+/// error reading it says nothing about GRUB, so check cannot verify past it.
+fn read_grub_file(start: &StartingLookupDir, grub_path: &str) -> Result<String, Finding> {
+    let path = start.find_file(grub_path)?;
     fs::read_to_string(path).map_err(|e| Finding::CannotVerify(format!("cannot verify '{grub_path}': {e}")))
 }
 
@@ -302,7 +322,7 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Ve
     let mut failures: Vec<String> = Vec::new();
     let mut unverified: Vec<String> = Vec::new();
     for conf in &confs {
-        let content = match read_grub_file(grub, conf) {
+        let content = match read_grub_file(&grub.at_blscfg, conf) {
             Ok(content) => content,
             // blscfg skips a file it cannot open (Fedora's grub2 2.12
             // patches, grub-core/commands/blscfg.c, read_entry).
@@ -400,7 +420,7 @@ fn validate_bls_entry(grub: &GrubContext, conf: &str, content: &str) -> CheckRes
             "Boot entry '{conf}' has no 'options' field. \
              The kernel will not know which root filesystem to mount."))?;
 
-    grub.find_file(linux).map_err(|e| Finding::from(e).map_fails(|fact| format!(
+    grub.at_blscfg.find_file(linux).map_err(|e| Finding::from(e).map_fails(|fact| format!(
         "GRUB cannot find the kernel ({fact}). \
          The system will not boot with this entry.")))?;
 
@@ -416,7 +436,7 @@ fn validate_bls_entry(grub: &GrubContext, conf: &str, content: &str) -> CheckRes
     for initrd_val in &initrd_values {
         for path in initrd_val.split_whitespace() {
             if path.starts_with('$') { continue; } // GRUB variable
-            grub.find_file(path).map_err(|e| Finding::from(e).map_fails(|fact| format!(
+            grub.at_blscfg.find_file(path).map_err(|e| Finding::from(e).map_fails(|fact| format!(
                 "GRUB cannot find the initial ramdisk ({fact}). \
                  The kernel will panic during boot.")))?;
         }
@@ -615,7 +635,7 @@ fn extract_root_uuid(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Re
         Err(unverified) => return Err(unverified.clone()),
     };
     for conf in bls_entry_paths(blsdir)? {
-        let content = match read_grub_file(grub, &conf) {
+        let content = match read_grub_file(&grub.at_blscfg, &conf) {
             Ok(content) => content,
             // blscfg skips a file it cannot open.
             Err(Finding::Fails(_)) => continue,
@@ -762,21 +782,44 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         put(&dir.join(format!("boot/loader/entries/{KVER}.conf")), entry);
     }
 
-    /// GRUB's view of a Btrfs filesystem whose top level is visible at top
-    /// and whose default subvolume is root, selected as from_system selects.
-    fn btrfs_context(top: &Path, btrfs_relative: bool, prefix: &str) -> GrubContext {
-        let starting_lookup_dir = StartingLookupDir::select(&tools::FsType::Btrfs, btrfs_relative, top.to_path_buf(),
-            || Ok("root".into())).unwrap();
-        GrubContext::new(starting_lookup_dir, prefix.into())
+    /// An ESP stub as gen_grub_cfgstub writes it for prefix, with
+    /// btrfs_relative_path set as migrate sets it when btrfs_relative.
+    fn esp_stub(btrfs_relative: bool, prefix: &str) -> String {
+        let relative = if btrfs_relative { "set btrfs_relative_path=\"yes\"\n" } else { "" };
+        format!("{relative}search --no-floppy --root-dev-only --fs-uuid --set=dev 3f2a9c41\n\
+                 set prefix=($dev){prefix}\nexport $prefix\nconfigfile $prefix/grub.cfg\n")
     }
 
-    fn snapshot_context(top: &Path, snapshot: &str) -> GrubContext {
+    /// GRUB's view, built as from_system builds it, of a Btrfs filesystem
+    /// whose top level is visible at top and whose default subvolume is
+    /// root, under the ESP stub stub.
+    fn context_from_stub(top: &Path, stub: &str) -> Result<GrubContext, GrubContextError> {
+        let btrfs = tools::FsType::Btrfs;
+        GrubContext::build(stub, tools::parse_esp_stub(stub).unwrap(), &btrfs,
+            |btrfs_relative| StartingLookupDir::select(&btrfs, btrfs_relative, top.to_path_buf(), || Ok("root".into())),
+            None)
+    }
+
+    fn btrfs_context(top: &Path, btrfs_relative: bool, prefix: &str) -> GrubContext {
+        context_from_stub(top, &esp_stub(btrfs_relative, prefix)).unwrap()
+    }
+
+    /// GRUB's view, built as for_snapshot builds it, of the filesystem
+    /// root, of type fstype, once rollback exchanges the root subvolume and
+    /// snapshot, under the ESP stub for prefix.
+    fn after_rollback_context(fstype: tools::FsType, root: &Path, snapshot: &str, prefix: &str) -> GrubContext {
         let exchange = RenameExchange {
             root: tools::SubvolName::new("root".into()),
             snapshot: tools::SubvolName::new(snapshot.into()),
         };
-        let starting_lookup_dir = StartingLookupDir::BtrfsTopLevel { toplevel: top.to_path_buf(), exchange: Some(exchange) };
-        GrubContext::new(starting_lookup_dir, "/root/boot/grub2".into())
+        let stub = esp_stub(false, prefix);
+        GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &fstype,
+            |btrfs_relative| Ok(StartingLookupDir::after_rollback(&fstype, btrfs_relative, root.to_path_buf(), &exchange)),
+            None).unwrap()
+    }
+
+    fn snapshot_context(top: &Path, snapshot: &str) -> GrubContext {
+        after_rollback_context(tools::FsType::Btrfs, top, snapshot, "/root/boot/grub2")
     }
 
     fn bls_entries(grub: &GrubContext) -> Vec<CheckResult> {
@@ -784,7 +827,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     }
 
     fn validate(grub: &GrubContext, conf: &str) -> CheckResult {
-        validate_bls_entry(grub, conf, &read_grub_file(grub, conf)?)
+        validate_bls_entry(grub, conf, &read_grub_file(&grub.at_blscfg, conf)?)
     }
 
     fn passes(results: &[CheckResult]) -> bool {
@@ -810,12 +853,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
         put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
         put(&boot.join(format!("loader/entries/{KVER}.conf")), &entry_from_root_subvol());
-        let exchange = RenameExchange {
-            root: tools::SubvolName::new("root".into()),
-            snapshot: tools::SubvolName::new("snap1".into()),
-        };
-        let starting_lookup_dir = StartingLookupDir::after_rollback(&tools::FsType::Ext4, false, boot.to_path_buf(), &exchange);
-        GrubContext::new(starting_lookup_dir, "/grub2".into())
+        after_rollback_context(tools::FsType::Ext4, boot, "snap1", "/grub2")
     }
 
     #[test]
@@ -916,9 +954,12 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
         put(&boot.join(format!("loader/entries/{KVER}.conf")), &entry_from_root_subvol());
         // Fedora cloud images set btrfs_relative_path on an ext4 /boot.
-        let starting_lookup_dir = StartingLookupDir::select(&tools::FsType::Ext4, true, boot.clone(),
-            || panic!("no default subvolume off Btrfs")).unwrap();
-        let grub = GrubContext::new(starting_lookup_dir, "/grub2".into());
+        let stub = esp_stub(true, "/grub2");
+        let ext4 = tools::FsType::Ext4;
+        let grub = GrubContext::build(&stub, tools::parse_esp_stub(&stub).unwrap(), &ext4,
+            |btrfs_relative| StartingLookupDir::select(&ext4, btrfs_relative, boot.clone(),
+                || panic!("no default subvolume off Btrfs")),
+            None).unwrap();
 
         assert!(passes(&check_grub_config(&boot, &grub)));
         assert!(passes(&bls_entries(&grub)));
@@ -1057,6 +1098,167 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{results:?}");
     }
 
+    // --- what grub.cfg sets before blscfg runs ---
+
+    /// The lines of Fedora's generated grub.cfg before blscfg that set
+    /// variables: 00_header's load_env of grubenv and of env_block
+    /// (util/grub.d/00_header.in:56-70), and 01_users's source of user.cfg
+    /// (util/grub.d/01_users.in:3-4).
+    const GENERATED_GRUB_CFG: &str = "\
+set pager=1
+
+if [ -f ${config_directory}/grubenv ]; then
+  load_env -f ${config_directory}/grubenv
+elif [ -s $prefix/grubenv ]; then
+  load_env
+fi
+
+if [ \"${env_block}\" ] ; then
+  if [ \"${dev}\" ]; then
+    set env_block=\"(${dev})${env_block}\"
+  else
+    set env_block=\"(${root})${env_block}\"
+  fi
+  export env_block
+  load_env -f \"${env_block}\"
+fi
+
+if [ -f ${prefix}/user.cfg ]; then
+  source ${prefix}/user.cfg
+  if [ -n \"${GRUB2_PASSWORD}\" ]; then
+    set superusers=\"root\"
+    export superusers
+    password_pbkdf2 root ${GRUB2_PASSWORD}
+  fi
+fi
+
+insmod blscfg
+blscfg
+";
+
+    const STUB_TOP_LEVEL_PREFIX: &str = "/root/boot/grub2";
+
+    /// The root subvolume laid out under top with Fedora's generated
+    /// grub.cfg and the grubenv variables vars, and the context GRUB
+    /// builds under Fedora's stub, which leaves btrfs_relative_path unset.
+    fn generated_layout(name: &str, vars: &str, entry: &str) -> (PathBuf, Result<GrubContext, GrubContextError>) {
+        let top = scratch(name);
+        install_subvol(&top, "root", vars, entry);
+        put(&top.join("root/boot/grub2/grub.cfg"), GENERATED_GRUB_CFG);
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+        (top, grub)
+    }
+
+    fn cannot_verify_naming(grub: Result<GrubContext, GrubContextError>, needle: &str) -> bool {
+        matches!(grub, Err(GrubContextError::CannotVerify(reason)) if reason.contains(needle))
+    }
+
+    #[test]
+    fn the_generated_grub_cfg_builds_a_context() {
+        let (top, grub) = generated_layout("phase-generated", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        assert!(passes(&bls_entries(&grub.unwrap())));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // grub.cfg loads grubenv before blscfg, and GRUB's Btrfs driver reads
+    // btrfs_relative_path at each mount (btrfs.c, grub_btrfs_mount and
+    // find_path): grub.cfg is looked up from the top level, as the stub
+    // leaves it, and the entries and kernels from the default subvolume.
+    #[test]
+    fn grubenv_btrfs_relative_path_applies_after_grub_cfg_is_read() {
+        let (top, grub) = generated_layout("phase-relative", "btrfs_relative_path=1\n", &entry_from_root_subvol());
+        let grub = grub.unwrap();
+
+        assert!(passes(&check_grub_cfg(&grub, None)), "{:?}", check_grub_cfg(&grub, None));
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn grubenv_btrfs_subvol_with_btrfs_relative_path_is_refused() {
+        let (top, grub) = generated_layout("phase-subvol", "btrfs_relative_path=1\nbtrfs_subvol=root\n",
+            &entry_from_root_subvol());
+        assert!(matches!(&grub, Err(GrubContextError::Other(msg)) if msg.contains("grubenv sets btrfs_subvol,")), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The stub's variables reach grub.cfg: configfile copies every
+    // variable into the context it opens (normal/context.c,
+    // grub_env_new_context).
+    #[test]
+    fn the_stubs_blsdir_reaches_blscfg() {
+        let top = scratch("phase-stub-blsdir");
+        install_subvol(&top, "root", "", &entry_from_top_level());
+        let stub = format!("{BLSDIR_TOP_LEVEL}{}", esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+        let grub = context_from_stub(&top, &stub).unwrap();
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The header loads env_block from the device the stub found
+    // (00_header.in:62-70), with the variables grubenv left.
+    #[test]
+    fn env_block_is_loaded_from_the_boot_filesystem() {
+        let (top, _) = generated_layout("phase-env-block", "env_block=/root/boot/grub2/envblock\n", &entry_from_top_level());
+        put(&top.join("root/boot/grub2/envblock"), &grubenv(BLSDIR_TOP_LEVEL));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // env_block is read from (${dev}); a grubenv that sets dev moves it to
+    // a device check does not read.
+    #[test]
+    fn grubenv_setting_dev_with_env_block_cannot_be_verified() {
+        let (top, grub) = generated_layout("phase-env-block-dev", "env_block=/root/boot/grub2/envblock\ndev=hd1,gpt2\n",
+            &entry_from_top_level());
+        assert!(cannot_verify_naming(grub, "dev"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn grub_cfg_setting_a_lookup_variable_before_blscfg_cannot_be_verified() {
+        for variable in ["btrfs_relative_path", "btrfs_subvol", "btrfs_subvolid", "blsdir"] {
+            let top = scratch(&format!("phase-script-{variable}"));
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("set {variable}=x\ninsmod blscfg\nblscfg\n"));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+            assert!(cannot_verify_naming(grub, variable), "{variable}");
+
+            // After blscfg, grub.cfg no longer decides where the entries are.
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("insmod blscfg\nblscfg\nset {variable}=x\n"));
+            assert!(context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).is_ok(), "{variable}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // load_env or source other than the generated header's and 01_users's
+    // can set any variable.
+    #[test]
+    fn grub_cfg_loading_other_variables_before_blscfg_cannot_be_verified() {
+        for line in ["load_env -f /root/boot/grub2/other", "source /root/boot/grub2/other.cfg"] {
+            let top = scratch("phase-script-load");
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{line}\ninsmod blscfg\nblscfg\n"));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+            assert!(cannot_verify_naming(grub, line), "{line}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // 01_users sources user.cfg before blscfg, after the header.
+    #[test]
+    fn user_cfg_setting_a_lookup_variable_cannot_be_verified() {
+        let (top, grub) = generated_layout("phase-user-cfg", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        assert!(grub.is_ok());
+        put(&top.join("root/boot/grub2/user.cfg"), "GRUB2_PASSWORD=grub.pbkdf2.sha512.10000.00\n");
+        assert!(context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).is_ok());
+
+        put(&top.join("root/boot/grub2/user.cfg"), "blsdir=/elsewhere\n");
+        assert!(cannot_verify_naming(context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)), "blsdir"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // --- refusals: each check fails on a seeded defect ---
 
     // The live root keeps its grub.cfg; the snapshot, whose prefix GRUB
@@ -1174,7 +1376,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let errors: Vec<&str> = results.iter().filter_map(|r| r.as_ref().err()).map(Finding::message).collect();
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains(grub_path)), "{errors:?}");
-        assert!(errors.iter().any(|e| e.contains(grub.starting_lookup_dir.describe())), "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains(grub.at_blscfg.describe())), "{errors:?}");
         assert!(errors.iter().all(|e| !e.contains(top)), "{errors:?}");
     }
 

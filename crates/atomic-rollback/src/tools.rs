@@ -486,16 +486,24 @@ pub fn parse_esp_stub(content: &str) -> Result<EspStub, String> {
         })
         .ok_or("ESP grub.cfg: no prefix= line")?;
 
-    // GRUB's Btrfs driver tests only the first character of the value:
-    // '1' or 'y' (Fedora's grub2 2.12 patches, grub-core/fs/btrfs.c,
-    // grub_btrfs_mount and find_path). The stub runs top to bottom, so the
-    // last assignment before configfile is the one grub.cfg runs with.
-    let btrfs_relative = before_configfile(content)
-        .filter_map(|line| grub_assignment(line, "btrfs_relative_path"))
-        .last()
-        .is_some_and(|value| value.starts_with(['1', 'y']));
+    let btrfs_relative = btrfs_relative_path_is_set(stub_assignment(content, "btrfs_relative_path"));
 
     Ok(EspStub { boot_uuid, grub_dir, btrfs_relative })
+}
+
+/// Whether GRUB's Btrfs driver resolves paths from the default subvolume
+/// with btrfs_relative_path holding value: it tests only the first
+/// character, for '1' or 'y' (Fedora's grub2 2.12 patches,
+/// grub-core/fs/btrfs.c, grub_btrfs_mount and find_path).
+pub fn btrfs_relative_path_is_set(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.starts_with(['1', 'y']))
+}
+
+/// The value the ESP stub leaves in the variable name when configfile
+/// hands over to grub.cfg: the stub runs top to bottom, so its last
+/// assignment before the configfile line holds.
+pub fn stub_assignment<'a>(content: &'a str, name: &str) -> Option<&'a str> {
+    before_configfile(content).filter_map(|line| grub_assignment(line, name)).last()
 }
 
 /// The stub's lines before the one running configfile, which hands over

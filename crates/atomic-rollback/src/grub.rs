@@ -11,6 +11,7 @@
 //! grub-core/fs/btrfs.c, find_path). Neither is necessarily the subvolume
 //! Linux mounts at /.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -44,12 +45,17 @@ const FSHELP_SYMLINK_LIMIT: u32 = 8;
 /// Errors from building a GrubContext. Each access only root has is its
 /// own cause, so the caller can tell "run as root" apart from a real
 /// boot-chain problem and name the access that was missing.
+#[derive(Debug)]
 pub enum GrubContextError {
     /// Reading the ESP grub.cfg was refused (EACCES); Fedora makes it
     /// readable only by root.
     EspUnreadable { path: PathBuf },
     /// Mounting the Btrfs top-level subvolume needs root (mount(2), EPERM).
     MountNotPermitted,
+    /// check cannot tell where GRUB looks the boot entries up: it could
+    /// not read a file GRUB reads first, or GRUB runs script there that
+    /// check does not interpret.
+    CannotVerify(String),
     Other(String),
 }
 
@@ -211,6 +217,7 @@ impl BlsDir {
 
 /// Where GRUB starts resolving an absolute path, and the Linux directory
 /// where that starting point is visible.
+#[derive(Clone)]
 pub enum StartingLookupDir {
     /// Not Btrfs: the filesystem's root, at this mount point.
     FilesystemRoot(PathBuf),
@@ -378,6 +385,30 @@ impl StartingLookupDir {
         }
     }
 
+    /// The Linux path of the regular file GRUB opens at grub_path.
+    pub fn find_file(&self, grub_path: &str) -> Result<PathBuf, LookupError> {
+        self.find(grub_path, NodeKind::RegularFile, LookupFailure::NotARegularFile)
+    }
+
+    /// The Linux path of the directory GRUB lists at grub_path.
+    pub fn find_dir(&self, grub_path: &str) -> Result<PathBuf, LookupError> {
+        self.find(grub_path, NodeKind::Directory, LookupFailure::NotADirectory)
+    }
+
+    /// Looks grub_path up and requires it to reach a node of kind
+    /// expected, failing with otherwise when it reaches another.
+    fn find(&self, grub_path: &str, expected: NodeKind, otherwise: LookupFailure) -> Result<PathBuf, LookupError> {
+        let failure = match self.relative_name_failure(grub_path, expected) {
+            Some(failure) => failure,
+            None => match self.lookup(grub_path, tools::is_btrfs_subvolume_root) {
+                Ok((linux_path, kind)) if kind == expected => return Ok(linux_path),
+                Ok(_) => otherwise,
+                Err(failure) => failure,
+            },
+        };
+        Err(LookupError { grub_path: grub_path.to_string(), failure, starting_lookup_dir: self.describe() })
+    }
+
     /// Names the starting point for check's output.
     pub fn describe(&self) -> &'static str {
         match self {
@@ -392,7 +423,16 @@ impl StartingLookupDir {
 /// Used by check.rs to verify that GRUB can find its configuration, its
 /// boot entries, and the kernels they name.
 pub struct GrubContext {
-    pub starting_lookup_dir: StartingLookupDir,
+    /// Where GRUB starts a lookup when the ESP stub hands over with
+    /// configfile: it looks grub.cfg and grubenv up from here.
+    pub at_configfile: StartingLookupDir,
+    /// Where GRUB starts a lookup when grub.cfg runs blscfg, once its
+    /// generated header has loaded grubenv: it looks the boot entry
+    /// directory, the entries, and their kernels and initramfs up from
+    /// here.
+    pub at_blscfg: StartingLookupDir,
+    /// The blsdir variable when grub.cfg runs blscfg.
+    blsdir: Option<String>,
     /// The GRUB directory the ESP stub sets $prefix to (gen_grub_cfgstub's
     /// GRUB_DIR). GRUB loads grub.cfg and grubenv from it.
     grub_dir: String,
@@ -423,32 +463,182 @@ fn boot_filesystem(content: &str) -> Result<(tools::EspStub, tools::DevicePath, 
 /// writes them.
 const BTRFS_SUBVOL_VARIABLES: [&str; 2] = ["btrfs_subvol", "btrfs_subvolid"];
 
-/// Refuses a stub that sets btrfs_subvol or btrfs_subvolid where GRUB reads
-/// them: on Btrfs, with btrfs_relative_path set, before configfile hands
-/// over (Fedora's grub2 2.12 patches, grub-core/fs/btrfs.c,
-/// grub_btrfs_mount and find_path). check does not model where GRUB
-/// resolves paths under either.
-fn reject_btrfs_subvol_variables(content: &str, stub: &tools::EspStub, fstype: &tools::FsType) -> Result<(), String> {
-    if *fstype != tools::FsType::Btrfs || !stub.btrfs_relative {
+/// Refuses btrfs_subvol or btrfs_subvolid where GRUB reads them: on Btrfs,
+/// with btrfs_relative_path set (Fedora's grub2 2.12 patches,
+/// grub-core/fs/btrfs.c, grub_btrfs_mount and find_path). check does not
+/// model where GRUB resolves paths under either.
+fn reject_btrfs_subvol_variables(variables: &GrubVariables, fstype: &tools::FsType) -> Result<(), String> {
+    if *fstype != tools::FsType::Btrfs || !variables.btrfs_relative() {
         return Ok(());
     }
-    match BTRFS_SUBVOL_VARIABLES.into_iter()
-        .find(|name| tools::before_configfile(content).any(|line| tools::grub_assignment(line, name).is_some()))
-    {
-        Some(name) => Err(format!(
-            "ESP grub.cfg sets {name}, which neither Fedora nor atomic-rollback writes, \
-             with btrfs_relative_path. check cannot tell which subvolume GRUB resolves paths from")),
+    match BTRFS_SUBVOL_VARIABLES.into_iter().find_map(|name| variables.source(name).map(|source| (name, source))) {
+        Some((name, source)) => Err(format!(
+            "{source} sets {name}, which neither Fedora nor atomic-rollback writes, \
+             while btrfs_relative_path is set. check cannot tell which subvolume GRUB resolves paths from")),
         None => Ok(()),
     }
 }
 
-impl GrubContext {
-    /// A context over directories already in place, with nothing mounted.
-    #[cfg(test)]
-    pub fn new(starting_lookup_dir: StartingLookupDir, grub_dir: String) -> Self {
-        Self { starting_lookup_dir, grub_dir, _mount: None }
+/// The variables whose values decide where GRUB looks the boot entries up.
+const LOOKUP_VARIABLES: [&str; 4] = ["btrfs_relative_path", "btrfs_subvol", "btrfs_subvolid", "blsdir"];
+
+/// The variables, besides LOOKUP_VARIABLES, that name where grub.cfg reads
+/// more variables before blscfg: env_block names a second environment
+/// block, read from the device in dev, and prefix the directory of user.cfg
+/// (util/grub.d/00_header.in:62-70, util/grub.d/01_users.in:3-4).
+const LOADING_VARIABLES: [&str; 3] = ["env_block", "dev", "prefix"];
+
+/// Where an assignment check follows was made.
+const ESP_STUB: &str = "ESP grub.cfg";
+const GRUBENV: &str = "grubenv";
+const ENV_BLOCK: &str = "env_block";
+
+/// The GRUB variables check follows from the ESP stub to blscfg, each with
+/// its last assignment and where that was made. configfile copies every
+/// variable into the context it opens for grub.cfg (normal/context.c,
+/// grub_env_new_context), so the stub's assignments reach blscfg unless
+/// grub.cfg makes another.
+#[derive(Default)]
+struct GrubVariables(HashMap<&'static str, (String, &'static str)>);
+
+impl GrubVariables {
+    /// The variables as the ESP stub leaves them at configfile. dev, set
+    /// by its search, and prefix are the stub's as check reads them.
+    fn from_stub(stub_text: &str) -> Self {
+        let mut variables = Self::default();
+        for name in LOOKUP_VARIABLES.into_iter().chain(["env_block"]) {
+            if let Some(value) = tools::stub_assignment(stub_text, name) {
+                variables.0.insert(name, (value.to_string(), ESP_STUB));
+            }
+        }
+        variables
     }
 
+    /// Makes the assignments load_env makes from the environment block
+    /// block, read from source (grub-core/commands/loadenv.c,
+    /// grub_cmd_load_env). A block GRUB refuses sets nothing.
+    fn load(&mut self, block: &[u8], source: &'static str) -> Result<(), GrubContextError> {
+        for (name, value) in envblk_assignments(block).unwrap_or_default() {
+            let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).find(|n| n.as_bytes() == name) else {
+                continue;
+            };
+            let value = String::from_utf8(value).map_err(|_| GrubContextError::CannotVerify(format!(
+                "{source} sets {name} to bytes that are not UTF-8, which check does not look up")))?;
+            self.0.insert(name, (value, source));
+        }
+        Ok(())
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(|(value, _)| value.as_str())
+    }
+
+    /// Where the assignment name holds was made.
+    fn source(&self, name: &str) -> Option<&'static str> {
+        self.0.get(name).map(|&(_, source)| source)
+    }
+
+    fn btrfs_relative(&self) -> bool {
+        tools::btrfs_relative_path_is_set(self.get("btrfs_relative_path"))
+    }
+}
+
+/// The lines of Fedora's generated grub.cfg before blscfg that load
+/// variables, which check follows: 00_header's load_env of grubenv and of
+/// env_block (util/grub.d/00_header.in:57, 59 and 69).
+const HEADER_LOAD_ENV: [&str; 3] = ["load_env -f ${config_directory}/grubenv", "load_env", "load_env -f \"${env_block}\""];
+
+/// 01_users's source of user.cfg, before blscfg (util/grub.d/01_users.in:4).
+const USERS_SOURCE: &str = "source ${prefix}/user.cfg";
+
+/// Commands that set variables check cannot see from their line: from a
+/// file (load_env, source) or from a string (eval).
+const LOADING_COMMANDS: [&str; 3] = ["load_env", "source", "eval"];
+
+/// Reads script, the text of the GRUB script file, up to its blscfg
+/// command, and says whether it sources user.cfg as 01_users generates it.
+/// check does not interpret GRUB script, so a line that names a lookup
+/// variable, or loads variables other than as the generated lines do, makes
+/// where GRUB looks the boot entries up unknown. generated says whether the
+/// generated lines may appear in file.
+fn script_before_blscfg(script: &str, file: &str, generated: bool) -> Result<bool, GrubContextError> {
+    let mut sources_user_cfg = false;
+    for line in script.lines().map(str::trim) {
+        let command = line.split_whitespace().next().unwrap_or_default();
+        if command == "blscfg" {
+            break;
+        }
+        if command.is_empty() || command.starts_with('#') {
+            continue;
+        }
+        if generated && HEADER_LOAD_ENV.contains(&line) {
+            continue;
+        }
+        if generated && line == USERS_SOURCE {
+            sources_user_cfg = true;
+            continue;
+        }
+        if LOADING_COMMANDS.contains(&command) {
+            return Err(GrubContextError::CannotVerify(format!(
+                "{file} runs '{line}' before blscfg, which can set where GRUB looks the boot entries up, \
+                 and check does not interpret GRUB script")));
+        }
+        if let Some(variable) = LOOKUP_VARIABLES.into_iter().find(|variable| names_word(line, variable)) {
+            return Err(GrubContextError::CannotVerify(format!(
+                "{file} names {variable} before blscfg, and check does not interpret GRUB script")));
+        }
+    }
+    Ok(sources_user_cfg)
+}
+
+/// Whether line holds word with no letter, digit or '_' on either side.
+fn names_word(line: &str, word: &str) -> bool {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.match_indices(word).any(|(at, _)| {
+        !line[..at].chars().next_back().is_some_and(is_name)
+            && !line[at + word.len()..].chars().next().is_some_and(is_name)
+    })
+}
+
+/// GRUB's starting lookup directory for each btrfs_relative_path setting,
+/// each selected once.
+struct LookupDirs<F> {
+    select: F,
+    selected: [Option<StartingLookupDir>; 2],
+}
+
+impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> LookupDirs<F> {
+    fn for_setting(&mut self, btrfs_relative: bool) -> Result<StartingLookupDir, String> {
+        let slot = &mut self.selected[usize::from(btrfs_relative)];
+        if let Some(dir) = slot {
+            return Ok(dir.clone());
+        }
+        let dir = (self.select)(btrfs_relative)?;
+        *slot = Some(dir.clone());
+        Ok(dir)
+    }
+}
+
+/// The bytes of the file GRUB opens at grub_path from start, or None when
+/// GRUB opens no file there. A Linux error, or a lookup check cannot
+/// verify, leaves what GRUB reads unknown.
+fn read_if_found(start: &StartingLookupDir, grub_path: &str) -> Result<Option<Vec<u8>>, GrubContextError> {
+    match start.find_file(grub_path) {
+        Ok(path) => fs::read(path).map(Some)
+            .map_err(|e| GrubContextError::CannotVerify(format!("cannot verify '{grub_path}': {e}"))),
+        Err(e) => match Finding::from(e) {
+            Finding::Fails(_) => Ok(None),
+            Finding::CannotVerify(reason) => Err(GrubContextError::CannotVerify(reason)),
+        },
+    }
+}
+
+/// GRUB path of file in the GRUB directory grub_dir.
+fn grub_dir_file(grub_dir: &str, file: &str) -> String {
+    format!("{}/{file}", grub_dir.trim_end_matches('/'))
+}
+
+impl GrubContext {
     /// Builds a context from the live system's ESP grub.cfg. On Btrfs,
     /// mounts the top-level subvolume read-only for the context's lifetime;
     /// otherwise uses the filesystem's mount point, mounting it at a
@@ -496,76 +686,84 @@ impl GrubContext {
     /// parsed from it, once the filesystem it names, of type fstype, is
     /// visible. select gives GRUB's starting lookup directory on that
     /// filesystem for a btrfs_relative_path setting.
+    ///
+    /// GRUB reads btrfs_relative_path, btrfs_subvol and btrfs_subvolid at
+    /// each mount and lookup (Fedora's grub2 2.12 patches,
+    /// grub-core/fs/btrfs.c, grub_btrfs_mount, btrfs_handle_subvol and
+    /// find_path), so a value set between the stub and blscfg moves the
+    /// lookups after it. grub.cfg is looked up with the stub's values; its
+    /// generated header loads grubenv and env_block with load_env
+    /// (util/grub.d/00_header.in:56-70), and 01_users sources user.cfg
+    /// (util/grub.d/01_users.in:3-4), before blscfg (util/grub.d/10_linux.in:
+    /// 282-283) lists the entries with the values they leave.
     pub fn build(
         stub_text: &str,
         stub: tools::EspStub,
         fstype: &tools::FsType,
-        mut select: impl FnMut(bool) -> Result<StartingLookupDir, String>,
+        select: impl FnMut(bool) -> Result<StartingLookupDir, String>,
         mount: Option<tools::MountPoint>,
     ) -> Result<Self, GrubContextError> {
-        reject_btrfs_subvol_variables(stub_text, &stub, fstype)?;
-        let starting_lookup_dir = select(stub.btrfs_relative)?;
-        Ok(Self { starting_lookup_dir, grub_dir: stub.grub_dir, _mount: mount })
+        let mut lookup_dirs = LookupDirs { select, selected: [None, None] };
+        let grub_dir = stub.grub_dir;
+        let mut variables = GrubVariables::from_stub(stub_text);
+        reject_btrfs_subvol_variables(&variables, fstype)?;
+        let at_configfile = lookup_dirs.for_setting(variables.btrfs_relative())?;
+
+        let sources_user_cfg = match read_if_found(&at_configfile, &grub_dir_file(&grub_dir, "grub.cfg"))? {
+            Some(script) => script_before_blscfg(&String::from_utf8_lossy(&script), "grub.cfg", true)?,
+            None => false,
+        };
+
+        // grubenv in the GRUB directory, which is grub.cfg's
+        // config_directory (normal/main.c, read_config_file), looked up as
+        // grub.cfg is.
+        if let Some(block) = read_if_found(&at_configfile, &grub_dir_file(&grub_dir, "grubenv"))? {
+            variables.load(&block, GRUBENV)?;
+        }
+        reject_btrfs_subvol_variables(&variables, fstype)?;
+
+        // env_block, when set, on the device the stub's search left in dev.
+        if let Some(env_block) = variables.get("env_block").filter(|value| !value.is_empty()).map(str::to_string) {
+            if let Some(source) = variables.source("dev") {
+                return Err(GrubContextError::CannotVerify(format!(
+                    "{source} sets dev, which names the device GRUB reads env_block from")));
+            }
+            let at_env_block = lookup_dirs.for_setting(variables.btrfs_relative())?;
+            if let Some(block) = read_if_found(&at_env_block, &env_block)? {
+                variables.load(&block, ENV_BLOCK)?;
+            }
+            reject_btrfs_subvol_variables(&variables, fstype)?;
+        }
+        let at_blscfg = lookup_dirs.for_setting(variables.btrfs_relative())?;
+
+        if sources_user_cfg {
+            if let Some(source) = variables.source("prefix") {
+                return Err(GrubContextError::CannotVerify(format!(
+                    "{source} sets prefix, which names the directory GRUB reads user.cfg from")));
+            }
+            if let Some(script) = read_if_found(&at_blscfg, &grub_dir_file(&grub_dir, "user.cfg"))? {
+                script_before_blscfg(&String::from_utf8_lossy(&script), "user.cfg", false)?;
+            }
+        }
+
+        let blsdir = variables.get("blsdir").map(str::to_string);
+        Ok(Self { at_configfile, at_blscfg, blsdir, grub_dir, _mount: mount })
     }
 
     /// GRUB path of a file in the stub's GRUB directory.
     pub fn grub_dir_file(&self, file: &str) -> String {
-        format!("{}/{file}", self.grub_dir.trim_end_matches('/'))
-    }
-
-    /// The Linux path of the regular file GRUB opens at grub_path.
-    pub fn find_file(&self, grub_path: &str) -> Result<PathBuf, LookupError> {
-        self.find(grub_path, NodeKind::RegularFile, LookupFailure::NotARegularFile)
-    }
-
-    /// The Linux path of the directory GRUB lists at grub_path.
-    fn find_dir(&self, grub_path: &str) -> Result<PathBuf, LookupError> {
-        self.find(grub_path, NodeKind::Directory, LookupFailure::NotADirectory)
-    }
-
-    /// Looks grub_path up and requires it to reach a node of kind
-    /// expected, failing with otherwise when it reaches another.
-    fn find(&self, grub_path: &str, expected: NodeKind, otherwise: LookupFailure) -> Result<PathBuf, LookupError> {
-        let failure = match self.starting_lookup_dir.relative_name_failure(grub_path, expected) {
-            Some(failure) => failure,
-            None => match self.starting_lookup_dir.lookup(grub_path, tools::is_btrfs_subvolume_root) {
-                Ok((linux_path, kind)) if kind == expected => return Ok(linux_path),
-                Ok(_) => otherwise,
-                Err(failure) => failure,
-            },
-        };
-        Err(LookupError {
-            grub_path: grub_path.to_string(),
-            failure,
-            starting_lookup_dir: self.starting_lookup_dir.describe(),
-        })
+        grub_dir_file(&self.grub_dir, file)
     }
 
     /// The directory blscfg reads boot entries from. blscfg (Fedora's grub2
     /// 2.12 patches, grub-core/commands/blscfg.c, find_entry) lists the
-    /// blsdir variable, which grub.cfg loads from $prefix/grubenv
-    /// (util/grub.d/00_header.in), or BLS_CONFIG_PATH when it is unset, then
+    /// blsdir variable, or BLS_CONFIG_PATH when it is unset, then
     /// BOOT_BLS_CONFIG_PATH if listing that fails.
     pub fn blsdir(&self) -> Result<BlsDir, Finding> {
-        // A grubenv GRUB cannot open loads nothing, as when it is absent.
-        let grubenv = match self.find_file(&self.grub_dir_file("grubenv")) {
-            Ok(path) => Some(fs::read(path).map_err(|e| Finding::CannotVerify(format!(
-                "cannot verify '{}': {e}", self.grub_dir_file("grubenv"))))?),
-            Err(e) if matches!(e.failure, LookupFailure::CannotRead(_)) => return Err(e.into()),
-            Err(_) => None,
-        };
-        let assigned = grubenv.as_deref().and_then(envblk_assignments).unwrap_or_default()
-            .into_iter().rev().find(|(name, _)| name == b"blsdir").map(|(_, value)| value);
-        let blsdir = match assigned {
-            Some(value) => String::from_utf8(value).map_err(|_| Finding::CannotVerify(
-                "grubenv sets blsdir to bytes that are not UTF-8, which check does not look up".into()))?,
-            None => BLS_CONFIG_PATH.to_string(),
-        };
-        let blsdir = blsdir.as_str();
-
+        let blsdir = self.blsdir.as_deref().unwrap_or(BLS_CONFIG_PATH);
         let mut tried = Vec::new();
         for dir in [blsdir, BOOT_BLS_CONFIG_PATH] {
-            match self.find_dir(dir) {
+            match self.at_blscfg.find_dir(dir) {
                 Ok(linux) => return Ok(BlsDir { grub_path: dir.to_string(), linux }),
                 // Whether GRUB lists this directory or falls back is unknown.
                 Err(e) if matches!(e.failure, LookupFailure::CannotRead(_)) => return Err(e.into()),
@@ -573,7 +771,7 @@ impl GrubContext {
             }
         }
         Err(Finding::Fails(format!("GRUB finds no boot entry directory: {}; GRUB starts the lookup at {}",
-            tried.join(", then "), self.starting_lookup_dir.describe())))
+            tried.join(", then "), self.at_blscfg.describe())))
     }
 }
 
@@ -845,7 +1043,7 @@ configfile $prefix/grub.cfg
     /// check's verdict on the stub content, on a boot filesystem of type
     /// fstype.
     fn btrfs_subvol_verdict(content: &str, fstype: FsType) -> Result<(), String> {
-        reject_btrfs_subvol_variables(content, &tools::parse_esp_stub(content).unwrap(), &fstype)
+        reject_btrfs_subvol_variables(&GrubVariables::from_stub(content), &fstype)
     }
 
     fn refused_naming(verdict: Result<(), String>, variable: &str) -> bool {
@@ -913,16 +1111,15 @@ configfile $prefix/grub.cfg
         std::os::unix::fs::symlink(target, at).unwrap();
     }
 
-    fn top_level(top: &Path) -> GrubContext {
-        GrubContext::new(StartingLookupDir::BtrfsTopLevel { toplevel: top.to_path_buf(), exchange: None },
-            "/root/boot/grub2".into())
+    fn top_level(top: &Path) -> StartingLookupDir {
+        StartingLookupDir::BtrfsTopLevel { toplevel: top.to_path_buf(), exchange: None }
     }
 
-    fn boot_partition(boot: &Path) -> GrubContext {
-        GrubContext::new(StartingLookupDir::FilesystemRoot(boot.to_path_buf()), "/grub2".into())
+    fn boot_partition(boot: &Path) -> StartingLookupDir {
+        StartingLookupDir::FilesystemRoot(boot.to_path_buf())
     }
 
-    fn failure(grub: &GrubContext, grub_path: &str) -> Option<LookupFailure> {
+    fn failure(grub: &StartingLookupDir, grub_path: &str) -> Option<LookupFailure> {
         grub.find_file(grub_path).err().map(|e| e.failure)
     }
 
@@ -1073,7 +1270,7 @@ configfile $prefix/grub.cfg
         fs::create_dir_all(top.join("root")).unwrap();
         put(&top.join("snap1/boot/vmlinuz"));
         link("/root/boot/vmlinuz", &top.join("snap1/vmlinuz"));
-        let grub = GrubContext::new(exchange_to_at(&top, "snap1"), "/root/boot/grub2".into());
+        let grub = exchange_to_at(&top, "snap1");
 
         assert_eq!(grub.find_file("/root/vmlinuz").ok(), Some(top.join("snap1/boot/vmlinuz")));
         fs::remove_dir_all(&top).unwrap();
