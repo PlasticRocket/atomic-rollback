@@ -506,14 +506,19 @@ impl GrubContext {
     pub fn blsdir(&self) -> Result<BlsDir, Finding> {
         // A grubenv GRUB cannot open loads nothing, as when it is absent.
         let grubenv = match self.find_file(&self.grub_dir_file("grubenv")) {
-            Ok(path) => Some(fs::read_to_string(path).map_err(|e| Finding::CannotVerify(format!(
+            Ok(path) => Some(fs::read(path).map_err(|e| Finding::CannotVerify(format!(
                 "cannot verify '{}': {e}", self.grub_dir_file("grubenv"))))?),
             Err(e) if matches!(e.failure, LookupFailure::CannotRead(_)) => return Err(e.into()),
             Err(_) => None,
         };
-        let blsdir = grubenv.as_deref()
-            .and_then(|env| grubenv_value(env, "blsdir"))
-            .unwrap_or(BLS_CONFIG_PATH);
+        let assigned = grubenv.as_deref().and_then(envblk_assignments).unwrap_or_default()
+            .into_iter().rev().find(|(name, _)| name == b"blsdir").map(|(_, value)| value);
+        let blsdir = match assigned {
+            Some(value) => String::from_utf8(value).map_err(|_| Finding::CannotVerify(
+                "grubenv sets blsdir to bytes that are not UTF-8, which check does not look up".into()))?,
+            None => BLS_CONFIG_PATH.to_string(),
+        };
+        let blsdir = blsdir.as_str();
 
         let mut tried = Vec::new();
         for dir in [blsdir, BOOT_BLS_CONFIG_PATH] {
@@ -544,14 +549,77 @@ fn boot_device(stub: &tools::EspStub) -> Result<(tools::DevicePath, tools::FsTyp
     Ok((device, fstype))
 }
 
-/// Value of a variable in a GRUB environment block (grub-core/lib/envblk.c:
-/// a "# GRUB Environment Block" header, name=value lines, '#' padding).
-fn grubenv_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
-    content.lines()
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.split_once('='))
-        .find(|(name, _)| *name == key)
-        .map(|(_, value)| value)
+/// The signature that starts every GRUB environment block
+/// (include/grub/lib/envblk.h, GRUB_ENVBLK_SIGNATURE).
+const ENVBLK_SIGNATURE: &[u8] = b"# GRUB Environment Block\n";
+
+/// The assignments load_env makes from an environment block, in the order
+/// it makes them, as grub-core/lib/envblk.c reads the block; None when GRUB
+/// refuses it. grub_envblk_open requires the signature and at least one
+/// byte after it, since it compares the size with the signature's sizeof,
+/// which counts the terminating NUL. grub_envblk_iterate skips a line
+/// starting with '#', reads a name up to '=' and its value up to the
+/// newline, where a backslash makes the next byte part of the value, and
+/// stops at an assignment with no '=' or no newline after it. A name and a
+/// value end at a NUL byte, as the C strings load_env sets do.
+fn envblk_assignments(block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    if block.len() <= ENVBLK_SIGNATURE.len() || !block.starts_with(ENVBLK_SIGNATURE) {
+        return None;
+    }
+    let end = block.len();
+    let mut p = ENVBLK_SIGNATURE.len();
+    let mut assignments = Vec::new();
+    while p < end {
+        if block[p] != b'#' {
+            let name_start = p;
+            while p < end && block[p] != b'=' {
+                p += 1;
+            }
+            if p == end {
+                break;
+            }
+            let name = c_string(&block[name_start..p]);
+            p += 1;
+            let value_start = p;
+            while p < end && block[p] != b'\n' {
+                p += if block[p] == b'\\' { 2 } else { 1 };
+            }
+            if p >= end {
+                break;
+            }
+            let mut value = Vec::new();
+            let mut q = value_start;
+            while block[q] != b'\n' {
+                if block[q] == b'\\' {
+                    q += 1;
+                }
+                value.push(block[q]);
+                q += 1;
+            }
+            assignments.push((name, c_string(&value)));
+        }
+        p = envblk_next_line(block, p);
+    }
+    Some(assignments)
+}
+
+/// The position after the newline that ends the line at p, where a
+/// backslash makes the next byte part of the line (grub-core/lib/envblk.c,
+/// find_next_line).
+fn envblk_next_line(block: &[u8], mut p: usize) -> usize {
+    while p < block.len() {
+        match block[p] {
+            b'\\' => p += 2,
+            b'\n' => break,
+            _ => p += 1,
+        }
+    }
+    p + 1
+}
+
+/// bytes up to their first NUL, as C reads a string.
+fn c_string(bytes: &[u8]) -> Vec<u8> {
+    bytes.split(|&b| b == 0).next().unwrap_or_default().to_vec()
 }
 
 #[cfg(test)]
@@ -1014,19 +1082,46 @@ configfile $prefix/grub.cfg
 
     // --- grubenv ---
 
-    #[test]
-    fn grubenv_value_reads_a_variable() {
-        let env = format!(
-            "# GRUB Environment Block\nboot_success=1\nblsdir=/root/boot/loader/entries\nsaved_entry=x\n{}",
-            "#".repeat(64));
-        assert_eq!(grubenv_value(&env, "blsdir"), Some("/root/boot/loader/entries"));
-        assert_eq!(grubenv_value(&env, "saved_entry"), Some("x"));
+    fn assignments(block: &str) -> Option<Vec<(String, String)>> {
+        envblk_assignments(block.as_bytes()).map(|all| all.into_iter()
+            .map(|(name, value)| (String::from_utf8(name).unwrap(), String::from_utf8(value).unwrap()))
+            .collect())
+    }
+
+    fn pair(name: &str, value: &str) -> (String, String) {
+        (name.to_string(), value.to_string())
     }
 
     #[test]
-    fn grubenv_value_absent_variable() {
-        let env = format!("# GRUB Environment Block\nboot_success=1\n{}", "#".repeat(64));
-        assert_eq!(grubenv_value(&env, "blsdir"), None);
-        assert_eq!(grubenv_value(&env, "boot"), None);
+    fn envblk_assignments_in_order() {
+        let block = format!(
+            "# GRUB Environment Block\nboot_success=1\nblsdir=/a\nblsdir=/b\n{}", "#".repeat(64));
+        assert_eq!(assignments(&block), Some(vec![pair("boot_success", "1"), pair("blsdir", "/a"), pair("blsdir", "/b")]));
+    }
+
+    // grub_envblk_iterate: '#' lines are padding, a backslash escapes the
+    // next byte, newline included, and an escaped '#' or '=' is plain text.
+    #[test]
+    fn envblk_comments_and_escapes() {
+        let block = "# GRUB Environment Block\n# comment\\\nstill comment\nx=a\\\\b\\\nc\\#\\=\n#";
+        assert_eq!(assignments(block), Some(vec![pair("x", "a\\b\nc#=")]));
+    }
+
+    // grub_envblk_iterate reads a name up to '=', across a newline, and
+    // stops at a name without '=' or a value without its newline, keeping
+    // what it set before.
+    #[test]
+    fn envblk_stops_at_a_broken_assignment() {
+        assert_eq!(assignments("# GRUB Environment Block\nx=1\ny=2"), Some(vec![pair("x", "1")]));
+        assert_eq!(assignments("# GRUB Environment Block\nx=1\nnoequals"), Some(vec![pair("x", "1")]));
+        assert_eq!(assignments("# GRUB Environment Block\nx\ny=2\n"), Some(vec![pair("x\ny", "2")]));
+    }
+
+    // grub_envblk_open needs the signature and one more byte.
+    #[test]
+    fn envblk_refuses_a_block_without_its_signature() {
+        assert_eq!(assignments("x=1\n"), None);
+        assert_eq!(assignments("# GRUB Environment Block\n"), None);
+        assert_eq!(assignments("# GRUB Environment Block\n#"), Some(vec![]));
     }
 }
