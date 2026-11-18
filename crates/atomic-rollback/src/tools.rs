@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::fs;
 
-use crate::consts::{BTRFS_FIRST_FREE_OBJECTID, BTRFS_TOPLEVEL_SUBVOLID, TEMPORARY_MOUNTPOINT_PARENT, TEMPORARY_MOUNTPOINT_TEMPLATE, TOPLEVEL_MOUNT};
+use crate::consts::{BTRFS_TOPLEVEL_SUBVOLID, TEMPORARY_MOUNTPOINT_PARENT, TEMPORARY_MOUNTPOINT_TEMPLATE, TOPLEVEL_MOUNT};
 
 /// Bare filesystem UUID extracted from BLS boot entries or grub2-probe.
 /// Convert via into_device_spec() before passing to resolve_fstab_device
@@ -324,6 +324,8 @@ pub fn is_btrfs_subvolume_root(path: &Path) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+
+    use crate::consts::BTRFS_FIRST_FREE_OBJECTID;
 
     let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else { return false };
     let mut sfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
