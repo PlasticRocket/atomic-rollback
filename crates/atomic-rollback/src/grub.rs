@@ -691,27 +691,34 @@ enum Step {
     LoadEnvBlock,
     /// 01_users's source of user.cfg from the prefix (util/grub.d/01_users.in:3-4).
     SourceUserCfg,
+    /// 41_custom's source of custom.cfg from config_directory, which is the
+    /// GRUB directory, when it is a file there (util/grub.d/41_custom.in:3-4).
+    SourceCustomCfg,
     /// Any other command, where it stands.
     Run(script::Command),
 }
 
 /// The step a line of Fedora's generated grub.cfg is, for the lines check
-/// follows as steps of their own; Some(None) for 00_header's lines that put
-/// the device in front of env_block, which LoadEnvBlock models.
+/// follows as steps of their own; Some(None) for a line that is no step:
+/// 00_header's lines that put the device in front of env_block, which
+/// LoadEnvBlock models, and 41_custom's source of $prefix/custom.cfg, which
+/// runs only when config_directory is empty, as normal mode never leaves it
+/// for grub.cfg (normal/main.c, read_config_file).
 fn generated_step(line: &str) -> Option<Option<Step>> {
     Some(match line {
         "load_env -f ${config_directory}/grubenv" | "load_env" => Some(Step::LoadGrubenv),
         "set env_block=\"(${dev})${env_block}\"" | "set env_block=\"(${root})${env_block}\"" => None,
         "load_env -f \"${env_block}\"" => Some(Step::LoadEnvBlock),
         "source ${prefix}/user.cfg" => Some(Step::SourceUserCfg),
+        "source ${config_directory}/custom.cfg" => Some(Step::SourceCustomCfg),
+        "source $prefix/custom.cfg" => None,
         _ => return None,
     })
 }
 
-/// The steps of the GRUB script file script, named file, up to and
-/// including its blscfg command. generated says whether Fedora's generated
-/// lines may appear in it. A line check cannot read leaves where GRUB looks
-/// the boot entries up unknown.
+/// The steps of the GRUB script file script, named file. generated says
+/// whether Fedora's generated lines may appear in it. A line check cannot
+/// read leaves what GRUB does unknown.
 fn steps(script: &str, file: &str, generated: bool) -> Result<Vec<Step>, GrubContextError> {
     let mut steps = Vec::new();
     let mut reader = script::Reader::default();
@@ -722,14 +729,8 @@ fn steps(script: &str, file: &str, generated: bool) -> Result<Vec<Step>, GrubCon
             continue;
         }
         let commands = reader.line(line).map_err(|why| GrubContextError::CannotVerify(format!(
-            "{file} has the line '{trimmed}' before blscfg, which check cannot read: {why}")))?;
-        for command in commands {
-            let blscfg = is_blscfg(&command);
-            steps.push(Step::Run(command));
-            if blscfg {
-                return Ok(steps);
-            }
-        }
+            "{file} has the line '{trimmed}', which check cannot read: {why}")))?;
+        steps.extend(commands.into_iter().map(Step::Run));
     }
     Ok(steps)
 }
@@ -738,6 +739,15 @@ fn steps(script: &str, file: &str, generated: bool) -> Result<Vec<Step>, GrubCon
 /// blscfg must not set: those naming where grub.cfg reads more variables,
 /// and config_directory, where it reads grubenv (00_header.in:56-57).
 const SCRIPT_LOADING_VARIABLES: [&str; 4] = ["env_block", "dev", "prefix", "config_directory"];
+
+/// The variables a script line after blscfg must not set: those GRUB reads
+/// when it boots an entry blscfg added, whose linux and initrd lines name
+/// ($root) (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c,
+/// create_entry) and whose files the Btrfs driver looks up with
+/// btrfs_relative_path, btrfs_subvol and btrfs_subvolid (btrfs.c,
+/// grub_btrfs_mount), and config_directory, where 41_custom reads
+/// custom.cfg (util/grub.d/41_custom.in:3-4).
+const AFTER_BLSCFG_VARIABLES: [&str; 5] = ["btrfs_relative_path", "btrfs_subvol", "btrfs_subvolid", "root", "config_directory"];
 
 /// GRUB running grub.cfg as check follows it (normal/main.c,
 /// grub_normal_execute): the variables in force, and where GRUB starts its
@@ -804,6 +814,14 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                     }
                 }
             }
+            Step::SourceCustomCfg => {
+                let at = self.starting_lookup_dir()?;
+                if let Some(script) = read_if_found(&at, &grub_dir_file(self.grub_dir, "custom.cfg"))? {
+                    for step in steps(&String::from_utf8_lossy(&script), "custom.cfg", false)? {
+                        self.step(step, "custom.cfg")?;
+                    }
+                }
+            }
             Step::Run(command) => self.run(&command, file)?,
         }
         Ok(())
@@ -819,7 +837,7 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
     fn run(&mut self, command: &script::Command, file: &str) -> Result<(), GrubContextError> {
         let line = command.line.trim();
         if self.at_blscfg.is_some() {
-            return Ok(());
+            return self.run_after_blscfg(command, file);
         }
         if is_blscfg(command) {
             if command.words.len() > 1 {
@@ -864,6 +882,31 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
         {
             return Err(GrubContextError::CannotVerify(format!(
                 "{file} sets {variable} before blscfg in '{line}', and check does not interpret GRUB script")));
+        }
+        Ok(())
+    }
+
+    /// Follows command, a command of file after blscfg. A second blscfg, a
+    /// command that sets a variable GRUB reads when it boots an entry, or
+    /// one that can set any variable, makes where GRUB looks the kernels up
+    /// unknown.
+    fn run_after_blscfg(&mut self, command: &script::Command, file: &str) -> Result<(), GrubContextError> {
+        let line = command.line.trim();
+        if is_blscfg(command) {
+            return Err(GrubContextError::CannotVerify(format!(
+                "{file} runs '{line}' after blscfg has run, adding entries read with the variables then in force, \
+                 which check does not model")));
+        }
+        let names = match script::sets(&command.words) {
+            script::Sets::Names(names) => names,
+            script::Sets::Any => return Err(GrubContextError::CannotVerify(format!(
+                "{file} runs '{line}' after blscfg, which can set where GRUB looks the kernels up when it boots \
+                 an entry, and check does not interpret GRUB script"))),
+        };
+        if let Some(variable) = AFTER_BLSCFG_VARIABLES.into_iter().find(|v| names.iter().any(|n| n == v)) {
+            return Err(GrubContextError::CannotVerify(format!(
+                "{file} sets {variable} after blscfg in '{line}', which moves where GRUB looks the kernels up \
+                 when it boots an entry, and check does not interpret GRUB script")));
         }
         Ok(())
     }
