@@ -20,14 +20,18 @@ pub struct RenameExchange {
 impl RenameExchange {
     /// Maps a path below the top-level subvolume, as it reads after the
     /// exchange, to the path naming the same file before it: a path through
-    /// the root subvolume's name reaches the snapshot.
+    /// the root subvolume's name reaches the snapshot, and a path through
+    /// the snapshot's name reaches the old root subvolume.
     pub fn before_exchange(&self, path: &str) -> String {
         let path = path.trim_start_matches('/');
         let root = self.root.as_str().trim_matches('/');
         let snapshot = self.snapshot.as_str().trim_matches('/');
-        match below(path, root) {
-            Some(rest) => format!("{snapshot}{rest}"),
-            None => path.to_string(),
+        if let Some(rest) = below(path, root) {
+            format!("{snapshot}{rest}")
+        } else if let Some(rest) = below(path, snapshot) {
+            format!("{root}{rest}")
+        } else {
+            path.to_string()
         }
     }
 }
