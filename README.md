@@ -97,7 +97,11 @@ A kernel-install hook is written by `migrate` as a migration artifact. When new 
 
 ## Automatic snapshots
 
-An RPM plugin snapshots the root subvolume before every RPM transaction (dnf, rpm, PackageKit, or any other RPM-based frontend). If the snapshot cannot be created, the transaction aborts. When the number of automatic snapshots exceeds MAX_SNAPSHOTS, the oldest are removed. User-named snapshots are never counted against this limit and are never automatically removed. MAX_SNAPSHOTS defaults to 50 and can be changed in `/etc/atomic-rollback.conf`.
+An RPM plugin snapshots the root subvolume before every RPM transaction (dnf, rpm, PackageKit, or any other RPM-based frontend). If the snapshot cannot be created, the transaction aborts.
+
+Before taking the snapshot, the plugin checks that the transaction fits. The snapshot keeps the old copy of every file the transaction replaces or removes, so none of that space comes back while it runs. The plugin therefore counts every file the transaction installs on the root's Btrfs filesystem (all of its subvolumes, including /var), credits nothing for replaced or removed files, and adds rpm's own 5% margin. If that does not fit in the free space, the transaction is refused before anything is written, with the amounts and how to free space. Snapshots are never deleted to make room.
+
+When the number of automatic snapshots exceeds MAX_SNAPSHOTS, the ones created first are removed. The default subvolume and the running root are never removed. User-named snapshots are never counted against this limit and are never automatically removed. MAX_SNAPSHOTS defaults to 50 and can be changed in `/etc/atomic-rollback.conf`.
 
 ## Guarantees
 
