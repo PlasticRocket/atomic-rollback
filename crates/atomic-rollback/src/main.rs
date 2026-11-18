@@ -3,6 +3,7 @@
 
 mod check;
 mod consts;
+mod diskspace;
 mod grub;
 mod kernel_hook;
 mod migrate;
@@ -15,6 +16,7 @@ mod snapshot;
 mod swap;
 mod tools;
 
+use std::io::Read;
 use std::path::Path;
 
 // --- Command types ---
@@ -28,6 +30,7 @@ enum Command {
     KernelHook { command: String, kver: String },
     EnsureHooks,
     RenameLegacySnapshot,
+    PreTransaction,
 }
 
 enum SnapshotCommand {
@@ -127,6 +130,9 @@ fn parse_args(args: &[String]) -> Command {
         }
         "ensure-hooks" => Command::EnsureHooks,
         "rename-legacy-snapshot" => Command::RenameLegacySnapshot,
+        // Run by the RPM plugin before each transaction, with the files of
+        // the packages it installs on stdin (diskspace::parse_package_files).
+        "pre-transaction" => Command::PreTransaction,
         "kernel-hook" => {
             // kernel-install calls hooks for events we may not handle.
             // Missing args = nothing to do.
@@ -265,6 +271,31 @@ fn main() {
         }
         Command::RenameLegacySnapshot => {
             snapshot::rename_legacy_snapshot();
+        }
+        Command::PreTransaction => {
+            let mut input = Vec::new();
+            if let Err(e) = std::io::stdin().read_to_end(&mut input) {
+                eprintln!("atomic-rollback: cannot read the transaction's files: {e}");
+                std::process::exit(1);
+            }
+            let files = match diskspace::parse_package_files(&input) {
+                Ok(files) => files,
+                Err(e) => {
+                    eprintln!("atomic-rollback: cannot read the transaction's files: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match snapshot::snapshot_before_transaction(&files) {
+                Ok(snapshot::SnapshotResult::Created(name, id)) =>
+                    eprintln!("Snapshot '{name}' with ID {id} created."),
+                Ok(snapshot::SnapshotResult::Existed(name, id)) =>
+                    eprintln!("Snapshot '{name}' with ID {id} already exists."),
+                Ok(snapshot::SnapshotResult::NotBtrfs) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Command::KernelHook { command, kver } => {
             if let Err(e) = kernel_hook::handle(&command, &kver) {

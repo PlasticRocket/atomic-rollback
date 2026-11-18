@@ -1,6 +1,7 @@
-//! Snapshot lifecycle: create, list, delete, retain. The RPM plugin
-//! calls create before every transaction. Retention evicts the oldest
-//! automatic snapshots when the count exceeds MAX_SNAPSHOTS. List and
+//! Snapshot lifecycle: create, list, delete, retain. Before every
+//! transaction the RPM plugin has the disk space checked, then a snapshot
+//! created. Retention evicts the oldest automatic snapshots when the count
+//! exceeds MAX_SNAPSHOTS. List and
 //! delete delegate to btrfs-progs; delete adds an fstab guard that
 //! btrfs-progs lacks. rename_legacy_snapshot is a one-shot migration
 //! for systems upgraded from the fixed-name era.
@@ -8,7 +9,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::{consts, parse, tools};
+use crate::{consts, diskspace, parse, tools};
 
 /// Returns true if a name matches the auto-generated snapshot format (YYYY-MM-DD_HH-MM-SS).
 fn is_auto_name(name: &str) -> bool {
@@ -164,7 +165,28 @@ pub fn snapshot(name: Option<&str>) -> Result<SnapshotResult, String> {
         Ok(s) => s,
         Err(_) => return Ok(SnapshotResult::NotBtrfs),
     };
+    create(name, is_auto, &root_subvol)
+}
 
+/// The RPM plugin's step before a transaction writes anything: refuses the
+/// transaction when the files it installs do not fit beside the snapshot
+/// (diskspace::check), else takes the automatic snapshot. Without a
+/// snapshot to take, rpm's own check is the right one and nothing is
+/// checked here.
+pub fn snapshot_before_transaction(files: &[diskspace::PackageFile]) -> Result<SnapshotResult, String> {
+    let (_, fstab) = tools::root_device()?;
+    let root_subvol = match tools::root_subvol_name(&fstab) {
+        Ok(s) => s,
+        Err(_) => return Ok(SnapshotResult::NotBtrfs),
+    };
+    diskspace::check(files)?;
+    create(generate_auto_name(), true, &root_subvol)
+        .map_err(|e| format!("Snapshot failed: {e}"))
+}
+
+/// Snapshots root_subvol at the top level under name, then applies
+/// retention when an automatic snapshot was created.
+fn create(name: String, is_auto: bool, root_subvol: &tools::SubvolName) -> Result<SnapshotResult, String> {
     let (name, created) = tools::with_toplevel(|toplevel| {
         let snap_path = format!("{toplevel}/{name}");
         if Path::new(&snap_path).exists() {

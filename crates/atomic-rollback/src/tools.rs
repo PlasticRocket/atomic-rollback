@@ -442,6 +442,106 @@ pub fn btrfs_subvolume_id(_path: &str) -> Result<u64, String> {
     unreachable!("atomic-rollback is a Linux-only tool")
 }
 
+// struct btrfs_ioctl_fs_info_args, 1024 bytes.
+#[cfg(target_os = "linux")]
+const BTRFS_FSID_SIZE: usize = 16;
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct BtrfsIoctlFsInfoArgs {
+    _max_id: u64,
+    _num_devices: u64,
+    fsid: [u8; BTRFS_FSID_SIZE],
+    _nodesize: u32,
+    _sectorsize: u32,
+    _clone_alignment: u32,
+    _csum_type: u16,
+    _csum_size: u16,
+    _flags: u64,
+    _generation: u64,
+    _metadata_uuid: [u8; BTRFS_FSID_SIZE],
+    _reserved: [u8; 944],
+}
+#[cfg(target_os = "linux")]
+const BTRFS_IOC_FS_INFO: u64 =
+    ioc(IOC_READ, 31, std::mem::size_of::<BtrfsIoctlFsInfoArgs>());
+
+/// The UUID of a Btrfs filesystem: the fsid BTRFS_IOC_FS_INFO reports,
+/// which `btrfs filesystem show` prints as its uuid. Every subvolume has
+/// its own device number and statfs f_fsid; all of them share this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BtrfsFsid(pub [u8; 16]);
+
+/// The UUID of the Btrfs filesystem holding the directory dir, or None
+/// when dir is not on Btrfs.
+#[cfg(target_os = "linux")]
+pub fn btrfs_fsid(dir: &Path) -> std::io::Result<Option<BtrfsFsid>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(dir)?;
+    let mut sfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs writes only into sfs, which has the size and
+    // alignment of a statfs.
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), sfs.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs returned 0, so it filled sfs.
+    if unsafe { sfs.assume_init() }.f_type != libc::BTRFS_SUPER_MAGIC {
+        return Ok(None);
+    }
+    let mut args = BtrfsIoctlFsInfoArgs {
+        _max_id: 0,
+        _num_devices: 0,
+        fsid: [0; BTRFS_FSID_SIZE],
+        _nodesize: 0,
+        _sectorsize: 0,
+        _clone_alignment: 0,
+        _csum_type: 0,
+        _csum_size: 0,
+        _flags: 0,
+        _generation: 0,
+        _metadata_uuid: [0; BTRFS_FSID_SIZE],
+        _reserved: [0; 944],
+    };
+    // SAFETY: args is a btrfs_ioctl_fs_info_args, the size the request
+    // number encodes, and the kernel writes only within it.
+    if unsafe { libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_FS_INFO as libc::Ioctl, &mut args) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(BtrfsFsid(args.fsid)))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn btrfs_fsid(_dir: &Path) -> std::io::Result<Option<BtrfsFsid>> {
+    unreachable!("atomic-rollback is a Linux-only tool")
+}
+
+/// The statvfs(3) fields rpm's disk accounting reads (rpm 6.1.0
+/// lib/transaction.cc, rpmtsCreateDSI).
+pub struct FreeSpace {
+    pub f_bsize: u64,
+    pub f_bavail: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn statvfs(path: &str) -> Result<FreeSpace, String> {
+    let c_path = std::ffi::CString::new(path).map_err(|e| format!("statvfs {path}: {e}"))?;
+    let mut sfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: statvfs reads the NUL-terminated c_path and writes only into
+    // sfs, which has the size and alignment of a statvfs.
+    if unsafe { libc::statvfs(c_path.as_ptr(), sfs.as_mut_ptr()) } != 0 {
+        return Err(format!("statvfs {path}: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: statvfs returned 0, so it filled sfs.
+    let sfs = unsafe { sfs.assume_init() };
+    Ok(FreeSpace { f_bsize: sfs.f_bsize, f_bavail: sfs.f_bavail })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn statvfs(_path: &str) -> Result<FreeSpace, String> {
+    unreachable!("atomic-rollback is a Linux-only tool")
+}
+
 /// Sets the default subvolume for the filesystem at mount_point.
 pub fn btrfs_subvol_set_default(id: u64, mount_point: &str) -> Result<(), String> {
     run_ok("btrfs", &["subvolume", "set-default", &id.to_string(), mount_point])
