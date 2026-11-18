@@ -455,14 +455,21 @@ pub fn parse_esp_stub(content: &str) -> Result<EspStub, String> {
         .ok_or("ESP grub.cfg: no prefix= line")?;
 
     // GRUB's Btrfs driver tests only the first character of the value:
-    // '1' or 'y' (grub-core/fs/btrfs.c, grub_btrfs_mount). The stub runs
-    // top to bottom, so the last assignment is the one configfile sees.
-    let btrfs_relative = content.lines()
+    // '1' or 'y' (Fedora's grub2 2.12 patches, grub-core/fs/btrfs.c,
+    // grub_btrfs_mount and find_path). The stub runs top to bottom, so the
+    // last assignment before configfile is the one grub.cfg runs with.
+    let btrfs_relative = before_configfile(content)
         .filter_map(|line| grub_assignment(line, "btrfs_relative_path"))
-        .next_back()
+        .last()
         .is_some_and(|value| value.starts_with(['1', 'y']));
 
     Ok(EspStub { boot_uuid, grub_dir, btrfs_relative })
+}
+
+/// The stub's lines before the one running configfile, which hands over
+/// to grub.cfg: GRUB runs grub.cfg with the variables these lines set.
+pub fn before_configfile(content: &str) -> impl Iterator<Item = &str> {
+    content.lines().take_while(|line| line.split_whitespace().next() != Some("configfile"))
 }
 
 /// The value a GRUB script line assigns to the variable name, either as
@@ -871,5 +878,19 @@ mod tests {
     fn esp_stub_btrfs_relative_last_assignment_wins() {
         assert!(!stub_with("set btrfs_relative_path=yes\nset btrfs_relative_path=no"));
         assert!(stub_with("set btrfs_relative_path=no\nset btrfs_relative_path=1"));
+    }
+
+    // configfile hands over to grub.cfg, which GRUB runs with the
+    // variables set so far; a later line in the stub does not run first.
+    #[test]
+    fn esp_stub_btrfs_relative_counts_only_before_configfile() {
+        let stub = "search --no-floppy --root-dev-only --fs-uuid --set=dev 3f2a9c41\n\
+            set prefix=($dev)/boot/grub2\n\
+            configfile $prefix/grub.cfg\n\
+            set btrfs_relative_path=y\n";
+        assert!(!parse_esp_stub(stub).unwrap().btrfs_relative);
+
+        let stub = format!("set btrfs_relative_path=y\n{stub}set btrfs_relative_path=n\n");
+        assert!(parse_esp_stub(&stub).unwrap().btrfs_relative);
     }
 }
