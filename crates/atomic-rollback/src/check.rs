@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::grub::{BlsDir, Finding, StartingLookupDir, GrubContext, GrubContextError};
+use crate::grub::{self, BlsDir, Finding, StartingLookupDir, GrubContext, GrubContextError};
 use crate::parse;
 use crate::platform::FEDORA as P;
 use crate::swap::RenameExchange;
@@ -256,11 +256,12 @@ fn check_grub_cfg(grub: &GrubContext, remedy: Option<&str>) -> Vec<CheckResult> 
         } else {
             Ok(())
         },
-        if content.contains("blscfg") {
-            Ok(())
-        } else {
-            Err(format!("GRUB configuration does not use Boot Loader Specification entries. \
-                         Kernel boot entries will not appear in the GRUB menu.{remedy}").into())
+        match grub::runs_blscfg(&content) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!("GRUB configuration does not use Boot Loader Specification entries: \
+                                      '{grub_path}' runs no blscfg command. \
+                                      Kernel boot entries will not appear in the GRUB menu.{remedy}").into()),
+            Err(why) => Err(Finding::CannotVerify(why)),
         },
     ]
 }
@@ -1350,6 +1351,38 @@ blscfg
         put(&top.join("snap1/boot/grub2/grub.cfg"), "set timeout=5\n");
         let results = check_grub_cfg(&grub, None);
         assert!(refuses(&results, "does not use Boot Loader Specification entries"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // grub.cfg lists the boot entries only by running blscfg, or bls_import,
+    // which blscfg.c registers as the same command (GRUB_MOD_INIT); loading
+    // the module, a comment, or the body of a menu entry does not.
+    #[test]
+    fn grub_cfg_that_does_not_run_blscfg_is_refused() {
+        let top = scratch("refuse-no-blscfg-command");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX);
+        let grub_cfg = top.join("root/boot/grub2/grub.cfg");
+        for script in ["insmod blscfg\n", "# blscfg\n", "menuentry 'other' {\n  blscfg\n}\n"] {
+            put(&grub_cfg, script);
+            let results = check_grub_cfg(&grub, None);
+            assert!(refuses(&results, "does not use Boot Loader Specification entries"), "{script}: {results:?}");
+        }
+        put(&grub_cfg, "insmod blscfg\nbls_import\n");
+        let results = check_grub_cfg(&grub, None);
+        assert!(passes(&results), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // blscfg with an argument lists only some entries, or entries from
+    // another directory (blscfg.c, grub_cmd_blscfg).
+    #[test]
+    fn grub_cfg_running_blscfg_with_an_argument_cannot_be_verified() {
+        let top = scratch("blscfg-argument");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/grub2/grub.cfg"), "insmod blscfg\nblscfg (hd0,gpt2)/loader/entries\n");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+        assert!(cannot_verify_naming(grub, "blscfg (hd0,gpt2)/loader/entries"));
         fs::remove_dir_all(&top).unwrap();
     }
 

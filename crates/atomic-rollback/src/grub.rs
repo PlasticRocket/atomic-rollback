@@ -574,7 +574,12 @@ fn script_before_blscfg(script: &str, file: &str, generated: bool) -> Result<boo
         let commands = reader.line(line).map_err(|why| GrubContextError::CannotVerify(format!(
             "{file} has the line '{trimmed}' before blscfg, which check cannot read: {why}")))?;
         for command in commands {
-            if command.words.first().is_some_and(|w| w.is("blscfg")) {
+            if is_blscfg(&command) {
+                if command.words.len() > 1 {
+                    return Err(GrubContextError::CannotVerify(format!(
+                        "{file} runs '{}', whose argument chooses the entries blscfg lists or where it reads them, \
+                         which check does not model", command.line.trim())));
+                }
                 return Ok(sources_user_cfg);
             }
             let names = match script::sets(&command.words) {
@@ -591,6 +596,29 @@ fn script_before_blscfg(script: &str, file: &str, generated: bool) -> Result<boo
         }
     }
     Ok(sources_user_cfg)
+}
+
+/// The names blscfg.c registers its command under (GRUB_MOD_INIT): the
+/// command that lists the boot entries in the menu.
+const BLSCFG_COMMANDS: [&str; 2] = ["blscfg", "bls_import"];
+
+fn is_blscfg(command: &script::Command) -> bool {
+    command.words.first().is_some_and(|w| BLSCFG_COMMANDS.iter().any(|name| w.is(name)))
+}
+
+/// Whether the GRUB script file script runs blscfg where it stands, not in
+/// the body of a menu entry or function that is never called. Err says why
+/// check cannot read a line before it.
+pub fn runs_blscfg(script: &str) -> Result<bool, String> {
+    let mut reader = script::Reader::default();
+    for line in script.lines() {
+        let commands = reader.line(line)
+            .map_err(|why| format!("grub.cfg has the line '{}', which check cannot read: {why}", line.trim()))?;
+        if commands.iter().any(is_blscfg) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// GRUB's starting lookup directory for each btrfs_relative_path setting,
