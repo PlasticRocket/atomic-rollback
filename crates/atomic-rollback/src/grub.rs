@@ -458,12 +458,6 @@ fn boot_filesystem(content: &str) -> Result<(tools::EspStub, tools::DevicePath, 
     Ok((stub, device, fstype))
 }
 
-/// Variables that point GRUB's Btrfs driver at a named subvolume
-/// (Fedora's grub2 2.12 patches, grub-core/fs/btrfs.c,
-/// btrfs_handle_subvol). Neither Fedora's gen_grub_cfgstub nor migrate
-/// writes them.
-const BTRFS_SUBVOL_VARIABLES: [&str; 2] = ["btrfs_subvol", "btrfs_subvolid"];
-
 /// Refuses btrfs_subvol or btrfs_subvolid where GRUB reads them: on Btrfs,
 /// with btrfs_relative_path set (Fedora's grub2 2.12 patches,
 /// grub-core/fs/btrfs.c, grub_btrfs_mount and find_path). check does not
@@ -472,7 +466,7 @@ fn reject_btrfs_subvol_variables(variables: &GrubVariables, fstype: &tools::FsTy
     if *fstype != tools::FsType::Btrfs || !variables.btrfs_relative() {
         return Ok(());
     }
-    match BTRFS_SUBVOL_VARIABLES.into_iter().find_map(|name| variables.source(name).map(|source| (name, source))) {
+    match variables.btrfs_subvol {
         Some((name, source)) => Err(format!(
             "{source} sets {name}, which neither Fedora nor atomic-rollback writes, \
              while btrfs_relative_path is set. check cannot tell which subvolume GRUB resolves paths from")),
@@ -500,19 +494,53 @@ const ENV_BLOCK: &str = "env_block";
 /// grub_env_new_context), so the stub's assignments reach blscfg unless
 /// grub.cfg makes another.
 #[derive(Default)]
-struct GrubVariables(HashMap<&'static str, (String, &'static str)>);
+struct GrubVariables {
+    values: HashMap<&'static str, (String, &'static str)>,
+    /// The variable that points GRUB's Btrfs driver at a subvolume, and
+    /// where it was set: btrfs_subvol naming one, or btrfs_subvolid other
+    /// than 0. Setting either replaces the other (Fedora's grub2 2.12
+    /// patches, grub-core/fs/btrfs.c, subvol_set_env and subvolid_set_env).
+    /// Neither Fedora's gen_grub_cfgstub nor migrate sets either.
+    btrfs_subvol: Option<(&'static str, &'static str)>,
+}
 
 impl GrubVariables {
     /// The variables as the ESP stub leaves them at configfile. dev, set
     /// by its search, and prefix are the stub's as check reads them.
     fn from_stub(stub_text: &str) -> Self {
         let mut variables = Self::default();
-        for name in LOOKUP_VARIABLES.into_iter().chain(["env_block"]) {
-            if let Some(value) = tools::stub_assignment(stub_text, name) {
-                variables.0.insert(name, (value.to_string(), ESP_STUB));
+        for line in tools::before_configfile(stub_text) {
+            for name in LOOKUP_VARIABLES.into_iter().chain(["env_block"]) {
+                if let Some(value) = tools::grub_assignment(line, name) {
+                    variables.assign(name, value.to_string(), ESP_STUB);
+                }
             }
         }
         variables
+    }
+
+    /// Sets name to value as GRUB's grub_env_set does, through the write
+    /// hooks the Btrfs driver registers for btrfs_subvol and btrfs_subvolid
+    /// (grub-core/kern/env.c, grub_env_set; btrfs.c, GRUB_MOD_INIT): an
+    /// empty btrfs_subvol names no subvolume, since lookup_root_by_name
+    /// keeps the default subvolume for an empty name; btrfs_subvolid is read
+    /// as grub_strtoull reads decimal digits, empty is 0, 0 names none, and
+    /// a value that is no number is refused, which leaves the variable as it
+    /// was.
+    fn assign(&mut self, name: &'static str, value: String, source: &'static str) {
+        match name {
+            "btrfs_subvol" => self.btrfs_subvol = (!value.is_empty()).then_some((name, source)),
+            "btrfs_subvolid" => {
+                let id = if value.is_empty() { Some(0) } else { grub_strtoull(value.as_bytes(), &mut 0, DECIMAL) };
+                match id {
+                    None => return,
+                    Some(0) => self.btrfs_subvol = None,
+                    Some(_) => self.btrfs_subvol = Some((name, source)),
+                }
+            }
+            _ => {}
+        }
+        self.values.insert(name, (value, source));
     }
 
     /// Makes the assignments load_env makes from the environment block
@@ -525,18 +553,18 @@ impl GrubVariables {
             };
             let value = String::from_utf8(value).map_err(|_| GrubContextError::CannotVerify(format!(
                 "{source} sets {name} to bytes that are not UTF-8, which check does not look up")))?;
-            self.0.insert(name, (value, source));
+            self.assign(name, value, source);
         }
         Ok(())
     }
 
     fn get(&self, name: &str) -> Option<&str> {
-        self.0.get(name).map(|(value, _)| value.as_str())
+        self.values.get(name).map(|(value, _)| value.as_str())
     }
 
     /// Where the assignment name holds was made.
     fn source(&self, name: &str) -> Option<&'static str> {
-        self.0.get(name).map(|&(_, source)| source)
+        self.values.get(name).map(|&(_, source)| source)
     }
 
     fn btrfs_relative(&self) -> bool {
@@ -687,13 +715,13 @@ fn parse_blocklist(name: &[u8]) -> Option<Vec<SectorRange>> {
     for _ in 0..count {
         let mut offset = 0;
         if at(p) != b'+' {
-            offset = grub_strtoull(name, &mut p)?;
+            offset = grub_strtoull(name, &mut p, BASE_FROM_PREFIX)?;
             if at(p) != b'+' {
                 return None;
             }
         }
         p += 1;
-        let length = if at(p) == 0 || at(p) == b',' { None } else { Some(grub_strtoull(name, &mut p)?) };
+        let length = if at(p) == 0 || at(p) == b',' { None } else { Some(grub_strtoull(name, &mut p, BASE_FROM_PREFIX)?) };
         if length == Some(0) || !(at(p) == 0 || at(p) == b',' || is_grub_space(at(p))) {
             return None;
         }
@@ -703,23 +731,36 @@ fn parse_blocklist(name: &[u8]) -> Option<Vec<SectorRange>> {
     Some(ranges)
 }
 
-/// The number grub_strtoull reads with base 0 from s at p, moving p past
-/// it (grub-core/kern/misc.c, grub_strtoull): spaces skipped, "0x" for
-/// base 16, a leading 0 before an octal digit for base 8, else base 10.
-/// None where GRUB sets an error: no digit, or a value above 64 bits.
-fn grub_strtoull(s: &[u8], p: &mut usize) -> Option<u64> {
+/// The base argument with which grub_strtoull takes the base from the
+/// number's prefix (grub-core/kern/misc.c, grub_strtoull).
+pub const BASE_FROM_PREFIX: u32 = 0;
+
+/// The base for decimal numbers.
+pub const DECIMAL: u32 = 10;
+
+/// The number grub_strtoull reads in base from s at p, moving p past it
+/// (grub-core/kern/misc.c, grub_strtoull): spaces skipped, then with
+/// BASE_FROM_PREFIX "0x" for base 16, a leading 0 before an octal digit for
+/// base 8, else base 10; with base 16, "0x" skipped. None where GRUB sets
+/// an error: no digit, or a value above 64 bits.
+pub fn grub_strtoull(s: &[u8], p: &mut usize, base: u32) -> Option<u64> {
     let at = |i: usize| s.get(i).copied().unwrap_or(0);
     while is_grub_space(at(*p)) {
         *p += 1;
     }
-    let mut base = 10;
+    let mut base = base;
     if at(*p) == b'0' {
         if at(*p + 1) == b'x' {
-            base = 16;
-            *p += 2;
-        } else if (b'0'..=b'7').contains(&at(*p + 1)) {
+            if base == BASE_FROM_PREFIX || base == 16 {
+                base = 16;
+                *p += 2;
+            }
+        } else if base == BASE_FROM_PREFIX && (b'0'..=b'7').contains(&at(*p + 1)) {
             base = 8;
         }
+    }
+    if base == BASE_FROM_PREFIX {
+        base = DECIMAL;
     }
     let mut number: u64 = 0;
     let mut found = false;
@@ -1246,6 +1287,40 @@ configfile $prefix/grub.cfg
     fn btrfs_subvol_variables_after_configfile_are_ignored() {
         let stub = format!("{STUB_MIGRATED}{BTRFS_SUBVOL}{BTRFS_SUBVOLID}");
         assert_eq!(btrfs_subvol_verdict(&stub, FsType::Btrfs), Ok(()));
+    }
+
+    // An empty btrfs_subvol names no subvolume: lookup_root_by_name keeps
+    // the default subvolume for an empty name. A btrfs_subvolid that reads
+    // as 0 sets neither variable, and one that is no number is refused,
+    // leaving both as they were (Fedora's grub2 2.12 patches,
+    // grub-core/fs/btrfs.c, lookup_root_by_name, subvol_set_env and
+    // subvolid_set_env; grub-core/kern/env.c, grub_env_set).
+    #[test]
+    fn btrfs_subvol_variables_that_name_no_subvolume_are_accepted() {
+        for set in [
+            "set btrfs_subvol=\"\"\n",
+            "set btrfs_subvolid=0\n",
+            "set btrfs_subvolid=\n",
+            "set btrfs_subvolid=abc\n",
+            "set btrfs_subvolid=256\nset btrfs_subvol=\"\"\n",
+            "set btrfs_subvol=@\nset btrfs_subvolid=0\n",
+        ] {
+            assert_eq!(btrfs_subvol_verdict(&format!("{set}{STUB_MIGRATED}"), FsType::Btrfs), Ok(()), "{set}");
+        }
+    }
+
+    // Setting either variable replaces the other's subvolume (btrfs.c,
+    // subvol_set_env and subvolid_set_env); grub_strtoull reads the digits
+    // that start btrfs_subvolid.
+    #[test]
+    fn the_btrfs_subvol_variable_set_last_is_refused() {
+        for (set, variable) in [
+            ("set btrfs_subvolid=256\nset btrfs_subvolid=abc\n", "btrfs_subvolid"),
+            ("set btrfs_subvolid=0\nset btrfs_subvol=@\n", "btrfs_subvol"),
+            ("set btrfs_subvol=@\nset btrfs_subvolid=12x\n", "btrfs_subvolid"),
+        ] {
+            assert!(refused_naming(btrfs_subvol_verdict(&format!("{set}{STUB_MIGRATED}"), FsType::Btrfs), variable), "{set}");
+        }
     }
 
     #[test]

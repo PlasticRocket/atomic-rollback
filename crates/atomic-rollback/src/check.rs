@@ -1183,6 +1183,16 @@ blscfg
         fs::remove_dir_all(&top).unwrap();
     }
 
+    // An empty btrfs_subvol, as grub2-editenv leaves it after unset, names
+    // no subvolume (btrfs.c, lookup_root_by_name).
+    #[test]
+    fn grubenv_empty_btrfs_subvol_with_btrfs_relative_path_is_followed() {
+        let (top, grub) = generated_layout("phase-subvol-empty", "btrfs_relative_path=1\nbtrfs_subvol=\n",
+            &entry_from_root_subvol());
+        assert!(grub.as_ref().is_ok_and(|grub| passes(&bls_entries(grub))), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // The stub's variables reach grub.cfg: configfile copies every
     // variable into the context it opens (normal/context.c,
     // grub_env_new_context).
