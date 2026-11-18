@@ -447,29 +447,54 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Gr
         Err(why) => {
             let mut picks: Vec<menu::Pick> = (0..menu.len()).map(menu::Pick::Bls).collect();
             if !config.added.entries.is_empty() {
-                picks.push(menu::Pick::Added);
+                picks.push(menu::Pick::Added(None));
             }
             (picks, format!("check cannot tell default: {why}"))
         }
     };
     let picked: Vec<usize> = picks.iter().filter_map(|pick| match pick {
         menu::Pick::Bls(i) => Some(*i),
-        menu::Pick::Added => None,
+        menu::Pick::Added(_) => None,
+    }).collect();
+    let added: Vec<Option<usize>> = picks.iter().filter_map(|pick| match pick {
+        menu::Pick::Added(k) => Some(*k),
+        menu::Pick::Bls(_) => None,
     }).collect();
     let warnings = not_booted_by_default(&picked);
     let verdict = |results: Vec<CheckResult>, counted: Vec<String>| Group { results, counted, warnings: warnings.clone() };
 
-    if picks.contains(&menu::Pick::Added) {
-        return verdict(vec![Err(Finding::NotEvaluated(format!(
-            "GRUB may boot by default an entry grub.cfg adds after the boot entries, which check does not verify: \
-             {chosen}.")))], vec![]);
-    }
-    let booted = match picked.as_slice() {
-        [one] => format!("GRUB boots {} when no key is pressed", menu[*one].describe(*one)),
-        several => format!("GRUB boots one of {} when no key is pressed",
-            several.iter().map(|&i| menu[i].describe(i)).collect::<Vec<_>>().join(", ")),
+    let mut named: Vec<String> = picked.iter().map(|&i| menu[i].describe(i)).collect();
+    named.extend(added.iter().map(|k| match k.and_then(|k| config.added.entries[k].title.as_deref()) {
+        Some(title) => format!("'{title}', an entry grub.cfg adds after the boot entries"),
+        None => "an entry grub.cfg adds after the boot entries".to_string(),
+    }));
+    let booted = match named.as_slice() {
+        [one] => format!("GRUB boots {one} when no key is pressed"),
+        several => format!("GRUB boots one of {} when no key is pressed", several.join("; ")),
     };
     let findings: Vec<&Finding> = picked.iter().filter_map(|&i| menu[i].verdict.as_ref().err()).collect();
+
+    // An entry grub.cfg adds, such as firmware setup or another system, is
+    // the user's choice and no boot entry check verifies: check says so and
+    // verifies the boot entries, which pass while one resolves.
+    if !added.is_empty() {
+        let resolving = menu.iter().filter(|entry| entry.verdict.is_ok()).count();
+        if resolving == 0 {
+            let message = format!("{booted}: {chosen}. check does not verify that entry, and no boot entry resolves.");
+            return if menu.iter().all(|entry| matches!(entry.verdict, Err(Finding::Fails(_)))) {
+                verdict(vec![Err(Finding::Fails(message))], vec![])
+            } else {
+                verdict(vec![Err(Finding::NotEvaluated(message))], vec![])
+            };
+        }
+        if findings.is_empty() {
+            return verdict(vec![Ok(())], vec![format!(
+                "{booted}: {chosen}. check does not verify that entry; {resolving} of the {} boot entries resolve. \
+                 check does not count the menu's timeout or a password an entry needs.", menu.len())]);
+        }
+        let detail = findings.iter().map(|finding| finding.message()).collect::<Vec<_>>().join(" ");
+        return verdict(vec![Err(Finding::NotEvaluated(format!("{booted}: {chosen}. {detail}")))], vec![]);
+    }
 
     if findings.is_empty() {
         return verdict(vec![Ok(())], vec![format!(
@@ -1795,13 +1820,22 @@ fi
         fs::remove_dir_all(&top).unwrap();
     }
 
-    // 30_uefi-firmware adds its entry only where fwsetup is supported
-    // (util/grub.d/30_uefi-firmware.in:34-40), so a default naming it boots
-    // that entry or, without it, the first.
+    // 30_uefi-firmware adds its entry on EFI, as its test
+    // [ fwsetup --is-supported ] is two words test reads as true strings
+    // (util/grub.d/30_uefi-firmware.in:34-40; commands/test.c): a default
+    // naming it boots firmware setup, a choice of the user's. check says
+    // so, verifies the boot entries, and passes while one resolves.
     #[test]
-    fn a_default_naming_an_entry_grub_cfg_adds_cannot_be_verified() {
+    fn a_default_naming_the_firmware_entry_passes_while_a_boot_entry_resolves() {
         let (top, grub) = two_kernels("default-firmware", "uefi-firmware", "");
-        assert!(cannot_verify(kernel_entry_status(&grub), "uefi-firmware"));
+        let group = check_bls_entries(&grub, &grub.blsdir());
+        let counted = group.counted.join(" ");
+        assert!(counted.contains("GRUB boots 'UEFI Firmware Settings'") && counted.contains("does not verify that entry"),
+            "{counted}");
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
+
+        fs::remove_file(top.join(format!("root/boot/vmlinuz-{KVER}"))).unwrap();
+        assert!(fails_naming(kernel_entry_status(&grub), "no boot entry resolves"));
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -1860,23 +1894,28 @@ menuentry 'Windows Boot Manager (on /dev/nvme0n1p1)' --class windows --class os 
 }
 ";
 
-    // An entry grub.cfg adds after blscfg on every run is in the menu, with
-    // the id after --id (00_header.in:108-112 sets menuentry_id_option).
+    // An entry grub.cfg adds after blscfg is in the menu with the id after
+    // --id (00_header.in:108-112 sets menuentry_id_option): a default
+    // naming the Windows entry os-prober writes, by id, title or place,
+    // boots it, and check verifies the boot entries.
     #[test]
-    fn a_default_naming_an_entry_grub_cfg_always_adds_cannot_be_verified() {
-        for (grub_default, by_default) in [("osprober-efi-0A1B-2C3D", false), ("Windows Boot Manager (on /dev/nvme0n1p1)", false), ("2", false), ("0", true)] {
+    fn a_default_naming_an_entry_grub_cfg_adds_passes_while_a_boot_entry_resolves() {
+        for (grub_default, booted) in [
+            ("osprober-efi-0A1B-2C3D", "'Windows Boot Manager (on /dev/nvme0n1p1)'"),
+            ("Windows Boot Manager (on /dev/nvme0n1p1)", "'Windows Boot Manager (on /dev/nvme0n1p1)'"),
+            ("3", "'Windows Boot Manager (on /dev/nvme0n1p1)'"),
+            ("2", "'UEFI Firmware Settings'"),
+            ("0", &format!("'Fedora Linux ({KVER})'")),
+        ] {
             let top = scratch("default-os-prober");
             install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
             put(&top.join(format!("root/boot/loader/entries/{OLDER}.conf")), &older_entry());
             put(&top.join("root/boot/grub2/grub.cfg"), &format!("{}{OS_PROBER_ENTRY}",
                 GENERATED_GRUB_CFG.replace("set default=\"${saved_entry}\"", &format!("set default=\"{grub_default}\""))));
             let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
-            let status = kernel_entry_status(&grub);
-            if by_default {
-                assert!(matches!(status, BootStatus::Warn), "{grub_default}");
-            } else {
-                assert!(cannot_verify(status, "an entry grub.cfg adds"), "{grub_default}");
-            }
+            let counted = check_bls_entries(&grub, &grub.blsdir()).counted.join(" ");
+            assert!(counted.contains(&format!("GRUB boots {booted}")), "{grub_default}: {counted}");
+            assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn), "{grub_default}");
             fs::remove_dir_all(&top).unwrap();
         }
     }

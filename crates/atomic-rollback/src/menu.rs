@@ -232,8 +232,9 @@ pub enum Pick {
     /// The entry at this index among the entries blscfg adds, which come
     /// first in the menu.
     Bls(usize),
-    /// An entry a script adds after blscfg.
-    Added,
+    /// An entry a script adds after blscfg: the one at this index among
+    /// them, or None when check cannot tell which.
+    Added(Option<usize>),
 }
 
 /// Whether an entry check reads only in part matches: Some(answer), or
@@ -268,11 +269,11 @@ pub fn default_picks(default: Option<&str>, bls: &[MenuItem], added: &AddedEntri
     if let Some(i) = bls.iter().position(|e| menuentry_eq(e.id.as_bytes(), spec, Some(word))) {
         return vec![by_id(Pick::Bls(i))];
     }
-    for entry in &added.entries {
+    for (k, entry) in added.entries.iter().enumerate() {
         match matches(entry.id.as_deref(), spec, Some(word)) {
             Some(false) => {}
             found => {
-                pick(&mut picks, by_id(Pick::Added));
+                pick(&mut picks, by_id(Pick::Added(Some(k))));
                 if found == Some(true) && entry.certain {
                     return picks;
                 }
@@ -284,11 +285,11 @@ pub fn default_picks(default: Option<&str>, bls: &[MenuItem], added: &AddedEntri
         pick(&mut picks, Pick::Bls(i));
         return picks;
     }
-    for entry in &added.entries {
+    for (k, entry) in added.entries.iter().enumerate() {
         match matches(entry.title.as_deref(), spec, None) {
             Some(false) => {}
             found => {
-                pick(&mut picks, Pick::Added);
+                pick(&mut picks, Pick::Added(Some(k)));
                 if found == Some(true) && entry.certain {
                     return picks;
                 }
@@ -304,11 +305,21 @@ pub fn default_picks(default: Option<&str>, bls: &[MenuItem], added: &AddedEntri
     };
     let certain_size = bls.len() + added.entries.iter().filter(|e| e.certain).count();
     let largest_size = bls.len() + added.entries.len();
+    // The added entry at place i, when every added entry up to it is in
+    // the menu on every run.
+    let at = |i: usize| {
+        let k = i - bls.len();
+        (added.countable && added.entries[..=k].iter().all(|e| e.certain)).then_some(k)
+    };
     match usize::try_from(index) {
         Ok(i) if i < bls.len() => pick(&mut picks, Pick::Bls(i)),
-        Ok(i) if i < certain_size => pick(&mut picks, Pick::Added),
-        Ok(i) if i < largest_size || !added.countable => {
-            pick(&mut picks, Pick::Added);
+        Ok(i) if i < certain_size => pick(&mut picks, Pick::Added(at(i))),
+        Ok(i) if i < largest_size => {
+            pick(&mut picks, Pick::Added(None));
+            pick(&mut picks, first);
+        }
+        Ok(_) if !added.countable => {
+            pick(&mut picks, Pick::Added(None));
             pick(&mut picks, first);
         }
         _ => pick(&mut picks, first),
@@ -412,10 +423,10 @@ mod tests {
     #[test]
     fn default_past_the_boot_entries_depends_on_the_added_entries() {
         let bls = items(&[("k7", "Fedora 7")]);
-        assert_eq!(default_picks(Some("uefi-firmware"), &bls, &firmware(true)), vec![Pick::Added]);
-        assert_eq!(default_picks(Some("uefi-firmware"), &bls, &firmware(false)), vec![Pick::Added, Pick::Bls(0)]);
-        assert_eq!(default_picks(Some("1"), &bls, &firmware(true)), vec![Pick::Added]);
-        assert_eq!(default_picks(Some("1"), &bls, &firmware(false)), vec![Pick::Added, Pick::Bls(0)]);
+        assert_eq!(default_picks(Some("uefi-firmware"), &bls, &firmware(true)), vec![Pick::Added(Some(0))]);
+        assert_eq!(default_picks(Some("uefi-firmware"), &bls, &firmware(false)), vec![Pick::Added(Some(0)), Pick::Bls(0)]);
+        assert_eq!(default_picks(Some("1"), &bls, &firmware(true)), vec![Pick::Added(Some(0))]);
+        assert_eq!(default_picks(Some("1"), &bls, &firmware(false)), vec![Pick::Added(None), Pick::Bls(0)]);
         assert_eq!(default_picks(Some("2"), &bls, &firmware(false)), vec![Pick::Bls(0)]);
         assert_eq!(default_picks(Some("1"), &bls, &none_added()), vec![Pick::Bls(0)]);
     }
