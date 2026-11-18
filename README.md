@@ -19,7 +19,7 @@ Running outside these requirements is running outside what the tool has been ver
 Starting with Fedora 44, every GRUB package update replaces `/boot/efi/EFI/fedora/grub.cfg`
 with Fedora's default version. On a system where `atomic-rollback migrate` moved `/boot` onto
 Btrfs, that default looks for the kernels in the wrong place, and every menu entry fails with
-`file '/vmlinuz-...' not found`. Fedora 43 left this file alone, so the problem first appears
+`` file `/vmlinuz-...' not found ``. Fedora 43 left this file alone, so the problem first appears
 with Fedora 44, including on the upgrade from 43.
 
 - Systems set up with `atomic-rollback setup` only are not affected.
@@ -28,9 +28,9 @@ with Fedora 44, including on the upgrade from 43.
   `set btrfs_relative_path=1`, press Enter, then press Esc and choose your entry. This is needed
   on each boot until the fix is released.
 
-From the next release, `atomic-rollback check` detects this: it resolves boot paths the way
-GRUB does, so it reports each menu entry GRUB cannot find. A fix for the GRUB updates
-themselves is in progress, and Fedora 44 and 45 builds will follow it.
+`atomic-rollback check` detects this from the release recorded in the [CHANGELOG](CHANGELOG.md)
+entry on looking up the files GRUB reads: it looks up each boot entry's kernel and initramfs
+paths the way GRUB's Btrfs driver does, and fails on each one GRUB cannot find.
 
 ## Install
 
@@ -83,9 +83,9 @@ Each change is necessary for atomic rollback to work.
 
 /var becomes a separate Btrfs subvolume. Without this, rolling back root would also roll back /var, which contains databases, logs, and container state. Separating /var means rollback affects the OS but not application data.
 
-The Btrfs default subvolume is set to match the root subvolume. GRUB resolves file paths from the default subvolume. This must match what Linux mounts as /.
+The Btrfs default subvolume is set to match the root subvolume. When the ESP grub.cfg sets `btrfs_relative_path`, which `migrate` writes, GRUB resolves file paths from the default subvolume, so it must match what Linux mounts as /.
 
-Symlinks are created at / for each kernel. `/vmlinuz-6.x` points to `boot/vmlinuz-6.x`. This allows GRUB to find kernels using the same path regardless of the boot layout.
+Symlinks are created at / for each kernel. `/vmlinuz-6.x` points to `boot/vmlinuz-6.x`. With `btrfs_relative_path` set, GRUB looks `/vmlinuz-6.x` up in the default subvolume and follows the symlink, so a boot entry names a kernel by the same path as on an ext4 /boot.
 
 The ESP grub.cfg is updated. The UUID changes from the ext4 partition to the Btrfs partition. `btrfs_relative_path` is added. The stub is regenerated from the same template as `gen_grub_cfgstub` (the tool that created the original).
 
@@ -93,7 +93,7 @@ The /boot/grub2 directory is set to NOCOW (chattr +C) and grubenv is recreated. 
 
 save_env is stripped from grub.cfg. GRUB's Btrfs driver is read-only. save_env requires write access. Since writing is impossible, save_env is a guaranteed failure. Removing it prevents an error message on every boot.
 
-A kernel-install hook is written by `migrate` as a migration artifact. When new kernels are installed, the hook creates symlinks and ensures boot entry paths are correct. This keeps the boot chain valid across kernel updates. The hook persists after package removal because `migrate` owns it, not the RPM.
+A kernel-install hook is written by `migrate` as a migration artifact. When new kernels are installed, the hook creates symlinks and writes boot entry paths relative to the default subvolume; GRUB resolves them from there only when the ESP grub.cfg sets `btrfs_relative_path`. This keeps the boot chain valid across kernel updates on such a system. The hook persists after package removal because `migrate` owns it, not the RPM.
 
 ## Automatic snapshots
 
