@@ -9,6 +9,7 @@ use std::path::Path;
 use crate::grub::{StartingLookupDir, GrubContext, GrubContextError};
 use crate::parse;
 use crate::platform::FEDORA as P;
+use crate::swap::RenameExchange;
 use crate::tools;
 
 type CheckResult = Result<(), String>;
@@ -80,10 +81,10 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
 
 /// Skips ESP checks (vfat, external to the btrfs snapshot) and
 /// default subvol match (set-default comes after the exchange).
-/// root is the snapshot's directory under the top-level subvolume mount,
-/// as rollback lays it out.
-pub fn verify_snapshot_bootable(root: &Path) -> BootStatus {
-    let grub = match GrubContext::for_snapshot(root) {
+/// toplevel is where rollback mounted the top-level subvolume, and
+/// exchange is the rename rollback makes once the snapshot passes.
+pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> BootStatus {
+    let grub = match GrubContext::for_snapshot(toplevel, exchange) {
         Ok(g) => g,
         Err(GrubContextError::PermissionDenied { reason }) => return BootStatus::Inaccessible {
             reason,
@@ -96,11 +97,12 @@ pub fn verify_snapshot_bootable(root: &Path) -> BootStatus {
     };
     println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
 
+    let snapshot = toplevel.join(exchange.snapshot.as_str());
     evaluate_checks(vec![
         ("GRUB configuration", check_snapshot_grub_config(&grub)),
         ("Kernel boot entry", check_bls_entries(&grub)),
-        ("Root filesystem", check_root_mountable(root, &grub)),
-        ("System mounts", check_fstab_mounts(root)),
+        ("Root filesystem", check_root_mountable(&snapshot, &grub)),
+        ("System mounts", check_fstab_mounts(&snapshot)),
     ])
 }
 
@@ -602,7 +604,6 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     // Each scratch directory stands in for the directory GRUB starts from
     // (the mounted top-level subvolume, or the boot partition's root).
 
-    use crate::grub::RenameExchange;
     use std::path::PathBuf;
 
     const KVER: &str = "6.19.9-200.fc45.x86_64";
@@ -845,8 +846,11 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         fs::create_dir_all(snapshot.join("boot")).unwrap();
         put(&snapshot.join("etc/fstab"), "UUID=3f2a9c41 / btrfs subvol=root 0 0\n");
 
-        let starting_lookup_dir = StartingLookupDir::after_rollback(&tools::FsType::Ext4, false, boot.clone(), &snapshot,
-            || panic!("the root subvolume's name matters only from the top level")).unwrap();
+        let exchange = RenameExchange {
+            root: tools::SubvolName::new("root".into()),
+            snapshot: tools::SubvolName::new("snap1".into()),
+        };
+        let starting_lookup_dir = StartingLookupDir::after_rollback(&tools::FsType::Ext4, false, boot.clone(), &exchange);
         let grub = GrubContext::new(starting_lookup_dir, "/grub2".into());
 
         assert!(passes(&check_snapshot_grub_config(&grub)), "{:?}", check_snapshot_grub_config(&grub));
