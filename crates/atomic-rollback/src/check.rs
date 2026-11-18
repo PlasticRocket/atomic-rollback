@@ -233,22 +233,18 @@ fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckRes
 
     let fstab_content = fs::read_to_string(root.join("etc/fstab"))
         .map_err(|e| format!("Cannot read /etc/fstab: {e}"))?;
-    let lines = tools::parse_fstab(&fstab_content);
-
-    let root_subvol_name = tools::fstab_entries(&lines).into_iter()
-        .find(|e| e.fs_file == "/")
-        .and_then(|e| parse::extract_mount_option(&e.fs_mntops, "subvol"))
-        .map(|s| tools::SubvolName::new(s.to_string()));
-
-    let root_subvol_name = match root_subvol_name {
-        Some(name) => name,
-        None => return Err(
-            "Cannot determine root subvolume name from /etc/fstab. \
-             The fstab entry for / must include subvol=<name>.".into()),
-    };
+    let root_subvol_name = tools::root_subvol_name(&fstab_content)
+        .map_err(|e| format!("{e}. The fstab entry for / must include subvol=<name>."))?;
 
     let root_subvol_id = tools::btrfs_subvol_id_by_name(mount_point, &root_subvol_name)?;
 
+    default_subvol_is_root(default_id, &root_subvol_name, root_subvol_id)
+}
+
+/// GRUB, starting at the default subvolume default_id, and Linux, which
+/// mounts root_subvol_name (ID root_subvol_id) as /, see the same root
+/// filesystem only when they are the same subvolume.
+fn default_subvol_is_root(default_id: u64, root_subvol_name: &tools::SubvolName, root_subvol_id: u64) -> CheckResult {
     if default_id == root_subvol_id {
         Ok(())
     } else {
