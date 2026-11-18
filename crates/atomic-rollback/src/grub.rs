@@ -75,6 +75,12 @@ pub enum LookupFailure {
     /// error. GRUB reads the disk itself, so check cannot tell what it
     /// finds.
     CannotRead(String),
+    /// A file name that does not start with '/' and is no block list:
+    /// invalid file name `PATH'.
+    InvalidFileName,
+    /// A file name that does not start with '/' and may be a block list,
+    /// which GRUB reads as sectors of the device; check does not model it.
+    BlockList,
 }
 
 impl LookupFailure {
@@ -86,6 +92,9 @@ impl LookupFailure {
             LookupFailure::NotARegularFile => format!("'{grub_path}': not a regular file"),
             LookupFailure::SymlinkLoop => format!("'{grub_path}': too deep nesting of symlinks"),
             LookupFailure::CannotRead(error) => format!("cannot verify '{grub_path}': {error}"),
+            LookupFailure::InvalidFileName => format!("invalid file name `{grub_path}'"),
+            LookupFailure::BlockList => format!(
+                "cannot verify '{grub_path}': GRUB reads it as a block list of the device, which check does not model"),
         }
     }
 }
@@ -156,7 +165,7 @@ impl std::fmt::Display for Finding {
 impl From<LookupError> for Finding {
     fn from(e: LookupError) -> Self {
         match e.failure {
-            LookupFailure::CannotRead(_) => Finding::CannotVerify(e.to_string()),
+            LookupFailure::CannotRead(_) | LookupFailure::BlockList => Finding::CannotVerify(e.to_string()),
             _ => Finding::Fails(e.to_string()),
         }
     }
@@ -350,6 +359,25 @@ impl StartingLookupDir {
         Ok((self.linux_path(&below), kind))
     }
 
+    /// GRUB's verdict on a name that does not start with '/', reached before
+    /// any lookup. grub_file_open reads such a name as a block list of the
+    /// device (kern/file.c, grub_file_open), and a name without '+' is no
+    /// block list (kern/fs.c, grub_fs_blocklist_open), so no file opens;
+    /// a name with '+' may be one. Listing a directory skips that step:
+    /// Btrfs walks the name from its start, and fshelp refuses it
+    /// (fshelp.c, grub_fshelp_find_file_real).
+    fn relative_name_failure(&self, grub_path: &str, expected: NodeKind) -> Option<LookupFailure> {
+        if grub_path.starts_with('/') {
+            return None;
+        }
+        match expected {
+            NodeKind::RegularFile if grub_path.contains('+') => Some(LookupFailure::BlockList),
+            NodeKind::RegularFile => Some(LookupFailure::InvalidFileName),
+            _ if matches!(self, Self::FilesystemRoot(_)) => Some(LookupFailure::InvalidFileName),
+            _ => None,
+        }
+    }
+
     /// Names the starting point for check's output.
     pub fn describe(&self) -> &'static str {
         match self {
@@ -486,10 +514,13 @@ impl GrubContext {
     /// Looks grub_path up and requires it to reach a node of kind
     /// expected, failing with otherwise when it reaches another.
     fn find(&self, grub_path: &str, expected: NodeKind, otherwise: LookupFailure) -> Result<PathBuf, LookupError> {
-        let failure = match self.starting_lookup_dir.lookup(grub_path, tools::is_btrfs_subvolume_root) {
-            Ok((linux_path, kind)) if kind == expected => return Ok(linux_path),
-            Ok(_) => otherwise,
-            Err(failure) => failure,
+        let failure = match self.starting_lookup_dir.relative_name_failure(grub_path, expected) {
+            Some(failure) => failure,
+            None => match self.starting_lookup_dir.lookup(grub_path, tools::is_btrfs_subvolume_root) {
+                Ok((linux_path, kind)) if kind == expected => return Ok(linux_path),
+                Ok(_) => otherwise,
+                Err(failure) => failure,
+            },
         };
         Err(LookupError {
             grub_path: grub_path.to_string(),
@@ -1038,6 +1069,40 @@ configfile $prefix/grub.cfg
 
     fn exchange_to_at(top: &Path, snapshot: &str) -> StartingLookupDir {
         StartingLookupDir::BtrfsTopLevel { toplevel: top.to_path_buf(), exchange: Some(exchange_of_root_and(snapshot)) }
+    }
+
+    // --- names that do not start with '/' ---
+
+    // grub_file_open reads a name that does not start with '/' as a block
+    // list of the device (kern/file.c, grub_file_open), and a name without
+    // '+' is no block list (kern/fs.c, grub_fs_blocklist_open): GRUB opens
+    // no file there, whatever the filesystem holds. A name with '+' may be
+    // one, and check does not read sectors.
+    #[test]
+    fn grub_opens_no_file_by_a_relative_name() {
+        let top = scratch("relative-file");
+        put(&top.join("vmlinuz"));
+        put(&top.join("0+1"));
+
+        for grub in [top_level(&top), boot_partition(&top)] {
+            assert_eq!(failure(&grub, "vmlinuz"), Some(LookupFailure::InvalidFileName));
+            assert_eq!(failure(&grub, "0+1"), Some(LookupFailure::BlockList));
+        }
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // blscfg lists its directory through the filesystem driver: Btrfs walks
+    // a relative name from its start, fshelp refuses it (fshelp.c,
+    // grub_fshelp_find_file_real).
+    #[test]
+    fn only_btrfs_lists_a_directory_by_a_relative_name() {
+        let top = scratch("relative-dir");
+        fs::create_dir_all(top.join("loader/entries")).unwrap();
+
+        assert_eq!(top_level(&top).find_dir("loader/entries").ok(), Some(top.join("loader/entries")));
+        assert_eq!(boot_partition(&top).find_dir("loader/entries").err().map(|e| e.failure),
+            Some(LookupFailure::InvalidFileName));
+        fs::remove_dir_all(&top).unwrap();
     }
 
     // --- what Linux will not let check read ---
