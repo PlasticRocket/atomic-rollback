@@ -380,7 +380,8 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Gr
         let Some(id) = menu::bls_menu_id(&entry.name) else {
             return vec![Err(format!(
                 "GRUB never shows its menu: blscfg's create_entry loops forever stripping \".conf\" from \
-                 the name of '{}', whose first \".conf\" is not its last. Rename the entry.", entry.conf).into())].into();
+                 the name of '{}', which without its final \".conf\" still holds \".conf\" before its end. \
+                 Rename the entry.", entry.conf).into())].into();
         };
         menu.push(MenuEntry {
             conf: entry.conf.clone(),
