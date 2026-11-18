@@ -220,6 +220,7 @@ fragments! {
     KernelHookOwnedByMigrate,
     Libdnf5ActionsPluginRemoved,
     LegacyRootPreUpdateRenamed,
+    CheckResolvesPathsLikeGrub,
 }
 
 impl Fragment {
@@ -487,6 +488,10 @@ impl Fragment {
             Self::CheckDistinguishesPermissionDeniedFromBootFailure => Status::Unreleased {
                 section: Section::Fixed,
                 text: "`check` now distinguishes \"cannot verify\" from \"boot chain has problems.\" Running as non-root on Fedora (where the ESP grub.cfg is root-readable only) previously reported a boot-chain failure with exit 1, misleading users about the actual system state. The tool now reports \"cannot verify boot chain\" with a prompt to run as root, and exits with code 3 to let scripts distinguish the case. Closes #14.",
+            },
+            Self::CheckResolvesPathsLikeGrub => Status::Unreleased {
+                section: Section::Fixed,
+                text: "`check` resolves the files GRUB reads (the ESP stub's prefix, `grub.cfg`, the BLS directory named in `grubenv`, and each entry's kernel and initramfs) as GRUB's Btrfs driver does, from the top-level subvolume unless the ESP stub sets `btrfs_relative_path` and from the default subvolume when it does, and names the mode in its output. It previously resolved them inside the subvolume mounted at `/`, so on a migrated system whose ESP stub Fedora 44 or later had replaced, it reported a valid boot chain while every menu entry failed with `file '/vmlinuz-...' not found`.",
             },
         }
     }

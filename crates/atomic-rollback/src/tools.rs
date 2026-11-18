@@ -209,13 +209,13 @@ pub fn blkid_fstype(uuid: &BareUuid) -> Result<FsType, String> {
 
 // --- findmnt ---
 
-/// Find the mount point for a device that GRUB path resolution should use.
+/// Find the mount point of a device.
 /// Accepts any device spec findmnt supports: UUID=, LABEL=, PARTUUID=,
 /// PARTLABEL=, /dev/ path (findmnt(8) source specification).
 /// - ext4/vfat: single mount point (e.g., /boot). Return it.
 /// - Btrfs: multiple mount points (/, /home, /var). Return / specifically,
-///   because that's where the root subvolume is mounted and where GRUB
-///   paths resolve to Linux paths.
+///   where the root subvolume is mounted. GRUB does not necessarily
+///   resolve paths from there (see grub.rs).
 pub fn findmnt_target(device_spec: &DeviceSpec) -> Result<String, String> {
     let spec_str = device_spec.to_string();
     let out = run_stdout("findmnt", &["-n", "-o", "TARGET", "-S", &spec_str])?;
@@ -277,19 +277,46 @@ pub fn btrfs_subvol_list(mount_point: &str) -> Result<Vec<SubvolEntry>, String> 
         .collect()
 }
 
-/// Returns the default subvolume ID for the filesystem at mount_point.
+/// The default subvolume, as btrfs subvolume get-default reports it.
+pub enum DefaultSubvol {
+    /// The top-level subvolume itself.
+    TopLevel,
+    /// Another subvolume. Its path is relative to the top-level subvolume.
+    Subvol(SubvolEntry),
+}
+
+impl DefaultSubvol {
+    pub fn id(&self) -> u64 {
+        match self {
+            DefaultSubvol::TopLevel => BTRFS_TOPLEVEL_SUBVOLID,
+            DefaultSubvol::Subvol(entry) => entry.id,
+        }
+    }
+
+    /// Path below the top-level subvolume; empty for the top level itself.
+    pub fn path(&self) -> &str {
+        match self {
+            DefaultSubvol::TopLevel => "",
+            DefaultSubvol::Subvol(entry) => &entry.path,
+        }
+    }
+}
+
 /// Two productions (cmds/subvolume.c:789-823):
-///   FS_TREE: literal "ID 5 (FS_TREE)" -> BTRFS_TOPLEVEL_SUBVOLID
-///   Subvol:  standard subvol line format -> parsed entry ID
-pub fn btrfs_subvol_get_default(mount_point: &str) -> Result<u64, String> {
+///   FS_TREE: literal "ID 5 (FS_TREE)" -> TopLevel
+///   Subvol:  standard subvol line format, path from the top level -> Subvol
+fn parse_default_subvol(out: &str) -> Option<DefaultSubvol> {
+    if let Some(entry) = parse_subvol_line(out) {
+        return Some(DefaultSubvol::Subvol(entry));
+    }
+    (out.trim() == "ID 5 (FS_TREE)").then_some(DefaultSubvol::TopLevel)
+}
+
+/// Returns the default subvolume for the filesystem at mount_point.
+pub fn btrfs_subvol_get_default(mount_point: &str) -> Result<DefaultSubvol, String> {
     let out = run_stdout("btrfs", &["subvolume", "get-default", mount_point])?;
-    if let Some(entry) = parse_subvol_line(&out) {
-        return Ok(entry.id);
-    }
-    if out.trim() == "ID 5 (FS_TREE)" {
-        return Ok(BTRFS_TOPLEVEL_SUBVOLID);
-    }
-    Err(format!("cannot parse default subvol ID from: {out}"))
+    parse_default_subvol(&out)
+        .ok_or_else(|| format!("cannot parse default subvol ID from: {out}"))
 }
 
 /// Sets the default subvolume for the filesystem at mount_point.
@@ -338,6 +365,29 @@ pub fn mount_subvolid(device: &DevicePath, target: &str, subvolid: u64) -> Resul
     run_ok("mount", &["-o", &format!("subvolid={subvolid}"), device.as_str(), target])
 }
 
+/// Mounts the top-level subvolume (subvolid=5) of the Btrfs filesystem
+/// with this UUID read-only, at a directory of its own so it never
+/// collides with TOPLEVEL_MOUNT. Unmounted when the MountPoint drops.
+pub fn mount_toplevel_ro(uuid: &BareUuid) -> Result<MountPoint, String> {
+    let device = blkid_device_for_uuid(uuid)?;
+    let suffix = &uuid.as_str()[uuid.as_str().len().saturating_sub(8)..];
+    let dir = format!("{PROBE_MOUNT_PREFIX}toplevel-{suffix}");
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
+    let options = format!("ro,subvolid={BTRFS_TOPLEVEL_SUBVOLID}");
+    if let Err(e) = run_ok("mount", &["-o", &options, device.as_str(), &dir]) {
+        let _ = fs::remove_dir(&dir);
+        return Err(e);
+    }
+    Ok(MountPoint::Probed(dir))
+}
+
+/// Whether the process runs with root's effective UID, which mount(8)
+/// requires.
+pub fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail (geteuid(2)).
+    unsafe { libc::geteuid() == 0 }
+}
+
 pub fn umount(target: &str) -> Result<(), String> {
     run_ok("umount", &[target])
 }
@@ -382,10 +432,25 @@ pub fn parse_esp_stub(content: &str) -> Result<EspStub, String> {
         })
         .ok_or("ESP grub.cfg: no prefix= line")?;
 
+    // GRUB's Btrfs driver tests only the first character of the value:
+    // '1' or 'y' (grub-core/fs/btrfs.c, grub_btrfs_mount). The stub runs
+    // top to bottom, so the last assignment is the one configfile sees.
     let btrfs_relative = content.lines()
-        .any(|l| l.contains("btrfs_relative_path") && l.contains("yes"));
+        .filter_map(btrfs_relative_path_value)
+        .next_back()
+        .is_some_and(|value| value.starts_with(['1', 'y']));
 
     Ok(EspStub { boot_uuid, grub_dir, btrfs_relative })
+}
+
+/// The value a GRUB script line assigns to btrfs_relative_path, either as
+/// "set btrfs_relative_path=<value>" or "btrfs_relative_path=<value>",
+/// with its quotes removed.
+fn btrfs_relative_path_value(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let assignment = line.strip_prefix("set ").map_or(line, str::trim_start);
+    let value = assignment.strip_prefix("btrfs_relative_path=")?;
+    Some(value.trim_matches(|c| c == '"' || c == '\''))
 }
 
 /// Renders an ESP grub.cfg stub from the contract values.
@@ -651,5 +716,56 @@ impl Drop for MountPoint {
             let _ = Command::new("umount").arg(p.as_str()).output();
             let _ = fs::remove_dir(p.as_str());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_subvol_parses_a_subvolume() {
+        let default = parse_default_subvol("ID 273 gen 98765 top level 5 path root").unwrap();
+        assert_eq!(default.id(), 273);
+        assert_eq!(default.path(), "root");
+    }
+
+    #[test]
+    fn default_subvol_parses_the_top_level() {
+        let default = parse_default_subvol("ID 5 (FS_TREE)").unwrap();
+        assert_eq!(default.id(), BTRFS_TOPLEVEL_SUBVOLID);
+        assert_eq!(default.path(), "");
+    }
+
+    #[test]
+    fn default_subvol_rejects_other_output() {
+        assert!(parse_default_subvol("ERROR: not a btrfs filesystem").is_none());
+    }
+
+    fn stub_with(assignment: &str) -> bool {
+        let stub = format!("{assignment}\n\
+            search --no-floppy --root-dev-only --fs-uuid --set=dev 3f2a9c41\n\
+            set prefix=($dev)/boot/grub2\n\
+            configfile $prefix/grub.cfg\n");
+        parse_esp_stub(&stub).unwrap().btrfs_relative
+    }
+
+    // GRUB's Btrfs driver tests only the value's first character for '1'
+    // or 'y' (grub-core/fs/btrfs.c, grub_btrfs_mount).
+    #[test]
+    fn esp_stub_btrfs_relative_follows_grub_value_rule() {
+        assert!(stub_with("set btrfs_relative_path=\"yes\""));
+        assert!(stub_with("set btrfs_relative_path=1"));
+        assert!(stub_with("set btrfs_relative_path='y'"));
+        assert!(stub_with("btrfs_relative_path=yes"));
+        assert!(!stub_with("set btrfs_relative_path=\"no\""));
+        assert!(!stub_with("set btrfs_relative_path=0"));
+        assert!(!stub_with(""));
+    }
+
+    #[test]
+    fn esp_stub_btrfs_relative_last_assignment_wins() {
+        assert!(!stub_with("set btrfs_relative_path=yes\nset btrfs_relative_path=no"));
+        assert!(stub_with("set btrfs_relative_path=no\nset btrfs_relative_path=1"));
     }
 }
