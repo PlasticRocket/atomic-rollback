@@ -388,10 +388,18 @@ configfile $prefix/grub.cfg
     }
 
     #[test]
+    fn exchange_maps_snapshot_paths_to_the_old_root() {
+        let starting_lookup_dir = exchange_to("snap1");
+        assert_eq!(starting_lookup_dir.resolve("/snap1/boot/vmlinuz-6.19.9"), Path::new("/top/root/boot/vmlinuz-6.19.9"));
+        assert_eq!(starting_lookup_dir.resolve("/snap1"), Path::new("/top/root"));
+    }
+
+    #[test]
     fn exchange_leaves_other_top_level_paths_alone() {
         let starting_lookup_dir = exchange_to("snap1");
         assert_eq!(starting_lookup_dir.resolve("/home/user"), Path::new("/top/home/user"));
         assert_eq!(starting_lookup_dir.resolve("/rootfs/boot"), Path::new("/top/rootfs/boot"));
+        assert_eq!(starting_lookup_dir.resolve("/snap10/boot"), Path::new("/top/snap10/boot"));
         assert_eq!(starting_lookup_dir.resolve("/vmlinuz-6.19.9"), Path::new("/top/vmlinuz-6.19.9"));
     }
 
