@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::grub::{GrubContext, GrubContextError};
+use crate::grub::{Base, GrubContext, GrubContextError};
 use crate::parse;
 use crate::platform::FEDORA as P;
 use crate::tools;
@@ -56,20 +56,23 @@ fn evaluate_checks(checks: Vec<(&str, Vec<CheckResult>)>) -> BootStatus {
 pub fn verify_bootable(root: &Path) -> BootStatus {
     let grub = match GrubContext::from_system(root) {
         Ok(g) => g,
-        Err(GrubContextError::PermissionDenied { path }) => return BootStatus::Inaccessible {
-            reason: format!("permission denied reading {}", path.display()),
-            hint: "The ESP grub.cfg is root-readable only on Fedora. Run: sudo atomic-rollback check".into(),
+        Err(GrubContextError::PermissionDenied { reason }) => return BootStatus::Inaccessible {
+            reason,
+            hint: "check reads the ESP grub.cfg, which is root-readable only on Fedora, \
+                   and mounts the Btrfs top-level subvolume read-only. \
+                   Run: sudo atomic-rollback check".into(),
         },
         Err(GrubContextError::Other(msg)) => return BootStatus::Fail(vec![format!(
             "Cannot determine how GRUB boots this system: {msg}. \
              Ensure {}/grub.cfg exists and the root filesystem is mounted.", P.esp_dir
         )]),
     };
+    println!("  GRUB resolves paths from {}", grub.base.describe());
 
     evaluate_checks(vec![
         ("EFI boot files", check_esp(root)),
         ("GRUB configuration", check_grub_config(root, &grub)),
-        ("Kernel boot entry", check_bls_entries(root, &grub)),
+        ("Kernel boot entry", check_bls_entries(&grub)),
         ("Root filesystem", check_root_mountable(root)),
         ("System mounts", check_fstab_mounts(root)),
     ])
@@ -77,11 +80,13 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
 
 /// Skips ESP checks (vfat, external to the btrfs snapshot) and
 /// default subvol match (set-default comes after the swap).
+/// root is the snapshot's directory under the top-level subvolume mount,
+/// as rollback lays it out.
 pub fn verify_snapshot_bootable(root: &Path) -> BootStatus {
     let grub = match GrubContext::for_snapshot(root) {
         Ok(g) => g,
-        Err(GrubContextError::PermissionDenied { path }) => return BootStatus::Inaccessible {
-            reason: format!("permission denied reading {}", path.display()),
+        Err(GrubContextError::PermissionDenied { reason }) => return BootStatus::Inaccessible {
+            reason,
             hint: "The ESP grub.cfg is root-readable only on Fedora. Run as root.".into(),
         },
         Err(GrubContextError::Other(msg)) => return BootStatus::Fail(vec![format!(
@@ -89,8 +94,9 @@ pub fn verify_snapshot_bootable(root: &Path) -> BootStatus {
              Ensure {}/grub.cfg exists.", P.esp_dir
         )]),
     };
+    println!("  GRUB resolves paths from {}", grub.base.describe());
 
-    let grub_cfg = root.join(&P.grub_dir[1..]).join("grub.cfg");
+    let grub_cfg = grub.resolve(&grub.prefix_path("grub.cfg"));
     let grub_checks = vec![
         check_file_exists_nonempty(&grub_cfg).map_err(|_|
             format!("{} does not exist. \
@@ -99,12 +105,12 @@ pub fn verify_snapshot_bootable(root: &Path) -> BootStatus {
                     grub_cfg.display())),
         check_file_contains(&grub_cfg, "blscfg",
             "Snapshot's GRUB configuration does not use Boot Loader Specification entries. \
-             Kernel boot entries will not appear in the GRUB menu.".into()),
+             Kernel boot entries will not appear in the GRUB menu."),
     ];
 
     evaluate_checks(vec![
         ("GRUB configuration", grub_checks),
-        ("Kernel boot entry", check_bls_entries(root, &grub)),
+        ("Kernel boot entry", check_bls_entries(&grub)),
         ("Root filesystem", check_root_mountable(root)),
         ("System mounts", check_fstab_mounts(root)),
     ])
@@ -182,32 +188,30 @@ fn check_esp(root: &Path) -> Vec<CheckResult> {
 fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
-    // Check grub.cfg exists where it always is on Fedora.
-    // The ESP's configfile directive (whether $prefix/grub.cfg or ($root)/boot/grub2/grub.cfg)
-    // is GRUB's mechanism for reaching this file. The other checks (--fs-uuid, default subvol,
-    // btrfs_relative_path) guarantee GRUB can reach it. We verify the file, not the mechanism.
-    let grub_cfg = root.join(&P.grub_dir[1..]).join("grub.cfg");
+    // The ESP stub runs configfile $prefix/grub.cfg, and GRUB resolves the
+    // prefix like every other path.
+    let grub_path = grub.prefix_path("grub.cfg");
+    let grub_cfg = grub.resolve(&grub_path);
     let grub_cfg_path = format!("{}/grub.cfg", P.grub_dir);
-    results.push(check_file_exists_nonempty(&grub_cfg).map_err(|_|
-        format!("{} does not exist. \
+    results.push(check_file_exists_nonempty(&grub_cfg).map_err(|fact|
+        format!("GRUB loads its configuration from '{grub_path}': {fact}. \
                  GRUB will drop to a rescue shell on next boot. \
-                 Regenerate with: sudo grub2-mkconfig -o {grub_cfg_path}",
-                grub_cfg.display())));
+                 Regenerate with: sudo grub2-mkconfig -o {grub_cfg_path}")));
 
     results.push(check_file_contains(&grub_cfg, "blscfg",
         &format!("GRUB configuration does not use Boot Loader Specification entries. \
          Kernel boot entries will not appear in the GRUB menu. \
          Regenerate with: sudo grub2-mkconfig -o {grub_cfg_path}")));
 
-    if matches!(grub.target_fstype, tools::FsType::Btrfs) && grub.btrfs_relative {
-        results.push(check_default_subvol_matches_root(&grub.linux_mount_point, root));
+    if let Base::BtrfsDefaultSubvol(default_subvol) = &grub.base {
+        results.push(check_default_subvol_matches_root(&default_subvol.to_string_lossy(), root));
     }
 
     results
 }
 
 fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckResult {
-    let default_id = tools::btrfs_subvol_get_default(mount_point)?;
+    let default_id = tools::btrfs_subvol_get_default(mount_point)?.id();
 
     let fstab_content = fs::read_to_string(root.join("etc/fstab"))
         .map_err(|e| format!("Cannot read /etc/fstab: {e}"))?;
@@ -242,8 +246,11 @@ fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckRes
 
 // --- Kernel boot entry ---
 
-fn check_bls_entries(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
-    let entries_dir = root.join(&P.bls_dir[1..]);
+fn check_bls_entries(grub: &GrubContext) -> Vec<CheckResult> {
+    let entries_dir = match grub.bls_dir() {
+        Ok(dir) => dir,
+        Err(e) => return vec![Err(format!("{e}. GRUB will show an empty menu."))],
+    };
 
     let confs: Vec<_> = match fs::read_dir(&entries_dir) {
         Ok(entries) => entries
@@ -584,5 +591,269 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
     fn root_subvol_name_errors_without_subvol_option() {
         let fstab = "UUID=abc / btrfs defaults 0 0";
         assert!(tools::root_subvol_name(fstab).is_err());
+    }
+
+    // --- GRUB path resolution through the checks ---
+    //
+    // Each scratch directory stands in for the directory GRUB starts from
+    // (the mounted top-level subvolume, or the boot partition's root).
+
+    use crate::grub::PendingSwap;
+    use std::path::PathBuf;
+
+    const KVER: &str = "6.19.9-200.fc45.x86_64";
+
+    // Where 10_linux points blsdir on Btrfs: grub2-mkrelpath of
+    // /boot/loader/entries, relative to the top-level subvolume.
+    const BLSDIR_TOP_LEVEL: &str = "blsdir=/root/boot/loader/entries\n";
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atomic-rollback-test-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn put(path: &Path, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    fn grubenv(vars: &str) -> String {
+        format!("# GRUB Environment Block\n{vars}{}", "#".repeat(256))
+    }
+
+    fn bls_entry(linux: &str, initrds: &[&str]) -> String {
+        let mut entry = format!("title Fedora Linux ({KVER})\nversion {KVER}\nlinux {linux}\n");
+        for initrd in initrds {
+            entry.push_str(&format!("initrd {initrd}\n"));
+        }
+        entry.push_str("options root=UUID=3f2a9c41 ro rootflags=subvol=root\n");
+        entry
+    }
+
+    /// Paths Fedora's 20-grub.install writes on Btrfs: from the top level.
+    fn entry_from_top_level() -> String {
+        bls_entry(&format!("/root/boot/vmlinuz-{KVER}"), &[&format!("/root/boot/initramfs-{KVER}.img")])
+    }
+
+    /// Paths the kernel hook writes after migrate: from the root subvolume.
+    fn entry_from_root_subvol() -> String {
+        bls_entry(&format!("/vmlinuz-{KVER}"), &[&format!("/initramfs-{KVER}.img")])
+    }
+
+    /// Lays out the subvolume <top>/<subvol> as migrate leaves the root
+    /// subvolume: kernel and initramfs in boot/, symlinks to them at the
+    /// subvolume's root, grub.cfg and grubenv in boot/grub2, and one BLS
+    /// entry in boot/loader/entries.
+    fn install_subvol(top: &Path, subvol: &str, grubenv_vars: &str, entry: &str) {
+        let dir = top.join(subvol);
+        put(&dir.join(format!("boot/vmlinuz-{KVER}")), "kernel");
+        put(&dir.join(format!("boot/initramfs-{KVER}.img")), "initramfs");
+        std::os::unix::fs::symlink(format!("boot/vmlinuz-{KVER}"), dir.join(format!("vmlinuz-{KVER}"))).unwrap();
+        std::os::unix::fs::symlink(format!("boot/initramfs-{KVER}.img"), dir.join(format!("initramfs-{KVER}.img"))).unwrap();
+        put(&dir.join("boot/grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&dir.join("boot/grub2/grubenv"), &grubenv(grubenv_vars));
+        put(&dir.join(format!("boot/loader/entries/{KVER}.conf")), entry);
+    }
+
+    /// GRUB's view of a Btrfs filesystem whose top level is visible at top
+    /// and whose default subvolume is root, selected as from_system selects.
+    fn btrfs_context(top: &Path, btrfs_relative: bool, prefix: &str) -> GrubContext {
+        let base = Base::select(&tools::FsType::Btrfs, btrfs_relative, top.to_path_buf(),
+            || Ok("root".into())).unwrap();
+        GrubContext::new(base, prefix.into())
+    }
+
+    fn snapshot_context(top: &Path, snapshot: &str) -> GrubContext {
+        let swap = PendingSwap {
+            root: tools::SubvolName::new("root".into()),
+            snapshot: tools::SubvolName::new(snapshot.into()),
+        };
+        let base = Base::BtrfsTopLevel { toplevel: top.to_path_buf(), swap: Some(swap) };
+        GrubContext::new(base, "/root/boot/grub2".into())
+    }
+
+    fn passes(results: &[CheckResult]) -> bool {
+        !results.is_empty() && results.iter().all(|r| r.is_ok())
+    }
+
+    fn fails_with(results: &[CheckResult], needle: &str) -> bool {
+        !results.is_empty()
+            && results.iter().all(|r| r.is_err())
+            && results.iter().any(|r| r.as_ref().err().is_some_and(|e| e.contains(needle)))
+    }
+
+    #[test]
+    fn top_level_accepts_paths_from_the_top_level() {
+        let top = scratch("grub-top-level-accepts");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+
+        assert!(passes(&check_grub_config(&top, &grub)));
+        assert!(passes(&check_bls_entries(&grub)));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The Fedora 44 failure: Fedora's ESP stub, which does not set
+    // btrfs_relative_path, over a migrated system whose entries name
+    // /vmlinuz-<ver>. Linux finds that file through the symlink in the root
+    // subvolume; GRUB looks in the top level, which has no such entry.
+    #[test]
+    fn top_level_refuses_paths_from_the_root_subvolume() {
+        let top = scratch("grub-top-level-refuses");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_root_subvol());
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+
+        let results = check_bls_entries(&grub);
+        assert!(fails_with(&results, &format!("'/vmlinuz-{KVER}'")), "{:?}", results);
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The same system under the stub migrate writes: btrfs_relative_path
+    // set, so GRUB starts at the default subvolume. Its grubenv blsdir is
+    // the top-level form, which does not resolve there; blscfg falls back
+    // to /boot/loader/entries.
+    #[test]
+    fn default_subvol_accepts_paths_from_the_default_subvolume() {
+        let top = scratch("grub-default-subvol-accepts");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_root_subvol());
+        let grub = btrfs_context(&top, true, "/boot/grub2");
+
+        assert!(passes(&check_bls_entries(&grub)));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn default_subvol_refuses_paths_from_the_top_level() {
+        let top = scratch("grub-default-subvol-refuses");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = btrfs_context(&top, true, "/boot/grub2");
+
+        let results = check_bls_entries(&grub);
+        assert!(fails_with(&results, &format!("'/root/boot/vmlinuz-{KVER}'")), "{:?}", results);
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // migrate's prefix /boot/grub2 is relative to the root subvolume.
+    // Without btrfs_relative_path, GRUB looks for it in the top level.
+    #[test]
+    fn top_level_refuses_prefix_from_the_root_subvolume() {
+        let top = scratch("grub-top-level-prefix");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = btrfs_context(&top, false, "/boot/grub2");
+
+        let results = check_grub_config(&top, &grub);
+        assert!(fails_with(&results, "'/boot/grub2/grub.cfg'"), "{:?}", results);
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // migrate recreates grubenv without blsdir. From the top level, GRUB
+    // then finds neither /loader/entries nor /boot/loader/entries.
+    #[test]
+    fn top_level_without_blsdir_finds_no_entries() {
+        let top = scratch("grub-top-level-no-blsdir");
+        install_subvol(&top, "root", "", &entry_from_top_level());
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+
+        let results = check_bls_entries(&grub);
+        assert!(fails_with(&results, "'/boot/loader/entries'"), "{:?}", results);
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn default_subvol_without_blsdir_uses_the_fallback_directory() {
+        let top = scratch("grub-default-subvol-no-blsdir");
+        install_subvol(&top, "root", "", &entry_from_root_subvol());
+        let grub = btrfs_context(&top, true, "/boot/grub2");
+
+        assert!(passes(&check_bls_entries(&grub)));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // Stock Fedora and setup-only systems: the stub names the ext4 /boot,
+    // whose root holds grub2/, loader/entries/ and the kernels.
+    #[test]
+    fn filesystem_root_accepts_boot_partition_layout() {
+        let boot = scratch("grub-filesystem-root");
+        put(&boot.join("grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&boot.join("grub2/grubenv"), &grubenv(""));
+        put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
+        put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
+        put(&boot.join(format!("loader/entries/{KVER}.conf")), &entry_from_root_subvol());
+        // Fedora cloud images set btrfs_relative_path on an ext4 /boot.
+        let base = Base::select(&tools::FsType::Ext4, true, boot.clone(),
+            || panic!("no default subvolume off Btrfs")).unwrap();
+        let grub = GrubContext::new(base, "/grub2".into());
+
+        assert!(passes(&check_grub_config(&boot, &grub)));
+        assert!(passes(&check_bls_entries(&grub)));
+        fs::remove_dir_all(&boot).unwrap();
+    }
+
+    // Rollback renames the snapshot to the root subvolume's name, so a
+    // path through /root/ reaches the snapshot after the swap.
+    #[test]
+    fn snapshot_check_follows_root_paths_into_the_snapshot() {
+        let top = scratch("grub-snapshot-swap");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        install_subvol(&top, "snap1", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = snapshot_context(&top, "snap1");
+
+        assert!(passes(&check_bls_entries(&grub)));
+
+        // The live root still has the kernel; the snapshot does not.
+        fs::remove_file(top.join(format!("snap1/boot/vmlinuz-{KVER}"))).unwrap();
+        let results = check_bls_entries(&grub);
+        assert!(fails_with(&results, &format!("snap1/boot/vmlinuz-{KVER}")), "{:?}", results);
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn snapshot_check_reads_the_snapshot_entries() {
+        let top = scratch("grub-snapshot-entries");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        install_subvol(&top, "snap1", BLSDIR_TOP_LEVEL, &entry_from_root_subvol());
+        let grub = snapshot_context(&top, "snap1");
+
+        // The snapshot's entries name /vmlinuz-<ver>, which the top level
+        // does not hold, although the live root's entries resolve.
+        let results = check_bls_entries(&grub);
+        assert!(fails_with(&results, &format!("'/vmlinuz-{KVER}'")), "{:?}", results);
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // initrd may repeat, a value may list several files, and $variables
+    // are GRUB's to expand at boot.
+    #[test]
+    fn every_initrd_path_must_resolve_and_variables_are_skipped() {
+        let top = scratch("grub-initrd");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/microcode.img"), "microcode");
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+        let conf = top.join("root/boot/loader/entries/initrd.conf");
+        let linux = format!("/root/boot/vmlinuz-{KVER}");
+        let initramfs = format!("/root/boot/initramfs-{KVER}.img");
+
+        put(&conf, &bls_entry(&linux, &[&format!("{initramfs} $tuned_initrd"), "/root/boot/microcode.img"]));
+        assert!(validate_bls_entry(&grub, &conf).is_ok());
+
+        put(&conf, &bls_entry(&linux, &[&format!("$tuned_initrd {initramfs} /root/boot/microcode.img")]));
+        assert!(validate_bls_entry(&grub, &conf).is_ok());
+
+        put(&conf, &bls_entry(&linux, &[&initramfs, "/root/boot/absent.img"]));
+        let err = validate_bls_entry(&grub, &conf).unwrap_err();
+        assert!(err.contains("'/root/boot/absent.img'"), "{err}");
+
+        put(&conf, &bls_entry(&linux, &[&format!("{initramfs} /root/boot/absent.img $tuned_initrd")]));
+        let err = validate_bls_entry(&grub, &conf).unwrap_err();
+        assert!(err.contains("'/root/boot/absent.img'"), "{err}");
+
+        // The Fedora 44 failure reaches initrd too.
+        put(&conf, &bls_entry(&linux, &[&format!("/initramfs-{KVER}.img")]));
+        let err = validate_bls_entry(&grub, &conf).unwrap_err();
+        assert!(err.contains(&format!("'/initramfs-{KVER}.img'")), "{err}");
+
+        fs::remove_dir_all(&top).unwrap();
     }
 }
