@@ -4,9 +4,9 @@
 //!   UEFI -> shim -> GRUB -> grub.cfg -> BLS entries -> kernel -> root mount -> fstab
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::grub::{StartingLookupDir, GrubContext, GrubContextError};
+use crate::grub::{BlsDir, StartingLookupDir, GrubContext, GrubContextError};
 use crate::parse;
 use crate::platform::FEDORA as P;
 use crate::swap::RenameExchange;
@@ -88,7 +88,7 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
         ("EFI boot files", check_esp(root)),
         ("GRUB configuration", check_grub_config(root, &grub)),
         ("Kernel boot entry", check_bls_entries(&grub, &blsdir)),
-        ("Root filesystem", check_root_mountable(root, &blsdir)),
+        ("Root filesystem", check_root_mountable(root, &grub, &blsdir)),
         ("System mounts", check_fstab_mounts(root)),
     ])
 }
@@ -111,7 +111,7 @@ pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> B
     evaluate_checks(vec![
         ("GRUB configuration", check_grub_cfg(&grub, None)),
         ("Kernel boot entry", check_bls_entries(&grub, &blsdir)),
-        ("Root filesystem", check_root_mountable(&snapshot, &blsdir)),
+        ("Root filesystem", check_root_mountable(&snapshot, &grub, &blsdir)),
         ("System mounts", check_fstab_mounts(&snapshot)),
     ])
 }
@@ -204,15 +204,28 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
 fn check_grub_cfg(grub: &GrubContext, remedy: Option<&str>) -> Vec<CheckResult> {
     let remedy = remedy.map(|r| format!(" {r}")).unwrap_or_default();
     let grub_path = grub.grub_dir_file("grub.cfg");
-    let grub_cfg = grub.resolve(&grub_path);
+    let grub_cfg = read_grub_file(grub, &grub_path);
     vec![
-        check_file_exists_nonempty(&grub_cfg).map_err(|fact| format!(
-            "GRUB loads its configuration from '{grub_path}': {fact}. \
-             GRUB will drop to a rescue shell on next boot.{remedy}")),
-        check_file_contains(&grub_cfg, "blscfg", &format!(
-            "GRUB configuration does not use Boot Loader Specification entries. \
-             Kernel boot entries will not appear in the GRUB menu.{remedy}")),
+        match &grub_cfg {
+            Ok(content) if !content.is_empty() => Ok(()),
+            Ok(_) => Err(format!("GRUB loads its configuration from '{grub_path}', which is empty. \
+                                  GRUB will drop to a rescue shell on next boot.{remedy}")),
+            Err(fact) => Err(format!("GRUB loads its configuration from '{grub_path}': {fact}. \
+                                      GRUB will drop to a rescue shell on next boot.{remedy}")),
+        },
+        match &grub_cfg {
+            Ok(content) if content.contains("blscfg") => Ok(()),
+            Ok(_) => Err(format!("GRUB configuration does not use Boot Loader Specification entries. \
+                                  Kernel boot entries will not appear in the GRUB menu.{remedy}")),
+            Err(fact) => Err(format!("Cannot read the GRUB configuration: {fact}")),
+        },
     ]
+}
+
+/// The content of the file GRUB opens at grub_path.
+fn read_grub_file(grub: &GrubContext, grub_path: &str) -> Result<String, String> {
+    let path = grub.find_file(grub_path).map_err(|e| e.to_string())?;
+    fs::read_to_string(path).map_err(|e| format!("cannot read '{grub_path}': {e}"))
 }
 
 fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckResult {
@@ -253,32 +266,28 @@ fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckRes
 
 /// blsdir is the directory blscfg reads boot entries from, as
 /// GrubContext::blsdir finds it.
-fn check_bls_entries(grub: &GrubContext, blsdir: &Result<PathBuf, String>) -> Vec<CheckResult> {
-    let entries_dir = match blsdir {
+fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, String>) -> Vec<CheckResult> {
+    let blsdir = match blsdir {
         Ok(dir) => dir,
         Err(e) => return vec![Err(format!("{e}. GRUB will show an empty menu."))],
     };
 
-    let confs: Vec<_> = match fs::read_dir(&entries_dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "conf"))
-            .collect(),
+    let confs = match bls_entry_paths(blsdir) {
+        Ok(confs) => confs,
         Err(e) => {
             return vec![Err(format!(
-                "Cannot read boot entries at {}: {e}. \
+                "Cannot read boot entries in '{}': {e}. \
                  GRUB will show an empty menu.",
-                entries_dir.display()))];
+                blsdir.grub_path))];
         }
     };
 
     if confs.is_empty() {
         return vec![Err(format!(
-            "No boot entries found in {}. \
+            "No boot entries found in '{}'. \
              GRUB will show an empty menu with no kernels to boot. \
              Reinstall the kernel: sudo dnf reinstall kernel-core",
-            entries_dir.display()))];
+            blsdir.grub_path))];
     }
 
     // Validate ALL entries, not just until the first valid one
@@ -315,23 +324,34 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<PathBuf, String>) -> Ve
     results
 }
 
+/// The GRUB paths of the boot entries in blsdir.
+fn bls_entry_paths(blsdir: &BlsDir) -> std::io::Result<Vec<String>> {
+    Ok(fs::read_dir(&blsdir.linux)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "conf"))
+        .map(|name| blsdir.entry(&name))
+        .collect())
+}
+
 // BLS fields may contain GRUB variables after the file path:
 //   initrd /initramfs-6.19.9.img $tuned_initrd
 // Only the first token is a file path. The rest is GRUB's concern.
-fn validate_bls_entry(grub: &GrubContext, conf: &Path) -> Result<(), String> {
-    let content = fs::read_to_string(conf)
-        .map_err(|e| format!("Cannot read boot entry {}: {e}", conf.display()))?;
+// conf is the entry's GRUB path.
+fn validate_bls_entry(grub: &GrubContext, conf: &str) -> Result<(), String> {
+    let content = read_grub_file(grub, conf)
+        .map_err(|e| format!("Cannot read boot entry: {e}"))?;
 
     let linux = parse::bls_field(&content, "linux")
         .ok_or_else(|| format!(
-            "Boot entry {} has no 'linux' field. \
-             GRUB does not know which kernel to load.", conf.display()))?;
+            "Boot entry '{conf}' has no 'linux' field. \
+             GRUB does not know which kernel to load."))?;
     let options = parse::bls_field(&content, "options")
         .ok_or_else(|| format!(
-            "Boot entry {} has no 'options' field. \
-             The kernel will not know which root filesystem to mount.", conf.display()))?;
+            "Boot entry '{conf}' has no 'options' field. \
+             The kernel will not know which root filesystem to mount."))?;
 
-    grub.check_path_exists(linux).map_err(|fact| format!(
+    grub.find_file(linux).map_err(|fact| format!(
         "GRUB cannot find the kernel ({fact}). \
          The system will not boot with this entry."))?;
 
@@ -341,13 +361,13 @@ fn validate_bls_entry(grub: &GrubContext, conf: &Path) -> Result<(), String> {
     let initrd_values = parse::bls_field_all(&content, "initrd");
     if initrd_values.is_empty() {
         return Err(format!(
-            "Boot entry {} has no 'initrd' field. \
-             The kernel will panic without an initial ramdisk.", conf.display()));
+            "Boot entry '{conf}' has no 'initrd' field. \
+             The kernel will panic without an initial ramdisk."));
     }
     for initrd_val in &initrd_values {
         for path in initrd_val.split_whitespace() {
             if path.starts_with('$') { continue; } // GRUB variable
-            grub.check_path_exists(path).map_err(|fact| format!(
+            grub.find_file(path).map_err(|fact| format!(
                 "GRUB cannot find the initial ramdisk ({fact}). \
                  The kernel will panic during boot."))?;
         }
@@ -357,9 +377,8 @@ fn validate_bls_entry(grub: &GrubContext, conf: &Path) -> Result<(), String> {
     // /dev/ paths (kernel early_lookup_bdev, block/early-lookup.c:244).
     if !options.contains("root=") {
         return Err(format!(
-            "Boot entry {} does not specify a root filesystem (missing root= parameter). \
-             The kernel will not know what to mount.",
-            conf.display()));
+            "Boot entry '{conf}' does not specify a root filesystem (missing root= parameter). \
+             The kernel will not know what to mount."));
     }
 
     Ok(())
@@ -367,10 +386,10 @@ fn validate_bls_entry(grub: &GrubContext, conf: &Path) -> Result<(), String> {
 
 // --- Root filesystem ---
 
-fn check_root_mountable(root: &Path, blsdir: &Result<PathBuf, String>) -> Vec<CheckResult> {
+fn check_root_mountable(root: &Path, grub: &GrubContext, blsdir: &Result<BlsDir, String>) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
-    let root_uuid = match extract_root_uuid(blsdir) {
+    let root_uuid = match extract_root_uuid(grub, blsdir) {
         Some(uuid) => uuid,
         None => {
             results.push(Err(
@@ -536,14 +555,11 @@ pub fn print_rollback_scope(fstab: &str) {
 }
 
 /// The root= UUID of the first boot entry GRUB reads.
-fn extract_root_uuid(blsdir: &Result<PathBuf, String>) -> Option<tools::BareUuid> {
-    let entries_dir = blsdir.as_ref().ok()?;
-    for entry in fs::read_dir(entries_dir).ok()?.flatten() {
-        if entry.path().extension().is_some_and(|ext| ext == "conf") {
-            let content = fs::read_to_string(entry.path()).ok()?;
-            if let Some(options) = parse::bls_field(&content, "options") {
-                return parse::extract_root_uuid_from_options(options);
-            }
+fn extract_root_uuid(grub: &GrubContext, blsdir: &Result<BlsDir, String>) -> Option<tools::BareUuid> {
+    for conf in bls_entry_paths(blsdir.as_ref().ok()?).ok()? {
+        let content = read_grub_file(grub, &conf).ok()?;
+        if let Some(options) = parse::bls_field(&content, "options") {
+            return parse::extract_root_uuid_from_options(options);
         }
     }
     None
@@ -553,6 +569,7 @@ fn extract_root_uuid(blsdir: &Result<PathBuf, String>) -> Option<tools::BareUuid
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     fn hint(status: BootStatus) -> String {
         match status {
@@ -735,7 +752,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let grub = btrfs_context(&top, false, "/root/boot/grub2");
 
         let results = bls_entries(&grub);
-        assert!(fails_with(&results, &format!("'/vmlinuz-{KVER}'")), "{:?}", results);
+        assert!(fails_with(&results, &format!("`/vmlinuz-{KVER}'")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -760,7 +777,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let grub = btrfs_context(&top, true, "/boot/grub2");
 
         let results = bls_entries(&grub);
-        assert!(fails_with(&results, &format!("'/root/boot/vmlinuz-{KVER}'")), "{:?}", results);
+        assert!(fails_with(&results, &format!("`/root/boot/vmlinuz-{KVER}'")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -786,7 +803,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let grub = btrfs_context(&top, false, "/root/boot/grub2");
 
         let results = bls_entries(&grub);
-        assert!(fails_with(&results, "'/boot/loader/entries'"), "{:?}", results);
+        assert!(fails_with(&results, "`/boot/loader/entries'"), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -834,7 +851,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         // The live root still has the kernel; the snapshot does not.
         fs::remove_file(top.join(format!("snap1/boot/vmlinuz-{KVER}"))).unwrap();
         let results = bls_entries(&grub);
-        assert!(fails_with(&results, &format!("snap1/boot/vmlinuz-{KVER}")), "{:?}", results);
+        assert!(fails_with(&results, &format!("`/root/boot/vmlinuz-{KVER}' not found")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -848,7 +865,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         // The snapshot's entries name /vmlinuz-<ver>, which the top level
         // does not hold, although the live root's entries resolve.
         let results = bls_entries(&grub);
-        assert!(fails_with(&results, &format!("'/vmlinuz-{KVER}'")), "{:?}", results);
+        assert!(fails_with(&results, &format!("`/vmlinuz-{KVER}'")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -879,8 +896,66 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
 
         assert!(passes(&check_grub_cfg(&grub, None)), "{:?}", check_grub_cfg(&grub, None));
         assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
-        assert_eq!(extract_root_uuid(&grub.blsdir()).map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
+        assert_eq!(extract_root_uuid(&grub, &grub.blsdir()).map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
         fs::remove_dir_all(&scratch_dir).unwrap();
+    }
+
+    // --- what a failure names ---
+    //
+    // The scratch directory stands in for a temporary mount point, which
+    // is gone when the user reads the report: a failure names the GRUB
+    // path and where GRUB starts the lookup, never a path below it.
+
+    fn names_grub_path_not_mount(results: &[CheckResult], grub: &GrubContext, top: &Path, grub_path: &str) {
+        let top = top.to_str().unwrap();
+        let errors: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains(grub_path)), "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains(grub.starting_lookup_dir.describe())), "{errors:?}");
+        assert!(errors.iter().all(|e| !e.contains(top)), "{errors:?}");
+    }
+
+    #[test]
+    fn missing_kernel_is_named_by_its_grub_path() {
+        let top = scratch("grub-names-kernel");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_root_subvol());
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+
+        names_grub_path_not_mount(&bls_entries(&grub), &grub, &top, &format!("file `/vmlinuz-{KVER}' not found"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn missing_grub_cfg_is_named_by_its_grub_path() {
+        let top = scratch("grub-names-grub-cfg");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub = btrfs_context(&top, false, "/boot/grub2");
+
+        names_grub_path_not_mount(&check_grub_cfg(&grub, None), &grub, &top, "file `/boot/grub2/grub.cfg' not found");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn missing_entry_directory_is_named_by_its_grub_paths() {
+        let top = scratch("grub-names-blsdir");
+        install_subvol(&top, "root", "", &entry_from_top_level());
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+
+        names_grub_path_not_mount(&bls_entries(&grub), &grub, &top, "/boot/loader/entries");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn boot_entry_without_linux_is_named_by_its_grub_path() {
+        let top = scratch("grub-names-entry");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, "title Fedora Linux\noptions root=UUID=3f2a9c41\n");
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+
+        let results = bls_entries(&grub);
+        let entry = format!("'/root/boot/loader/entries/{KVER}.conf'");
+        assert!(fails_with(&results, &entry), "{results:?}");
+        assert!(results.iter().all(|r| r.as_ref().err().is_none_or(|e| !e.contains(top.to_str().unwrap()))), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
     }
 
     // initrd may repeat, a value may list several files, and $variables
@@ -892,27 +967,28 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         put(&top.join("root/boot/microcode.img"), "microcode");
         let grub = btrfs_context(&top, false, "/root/boot/grub2");
         let conf = top.join("root/boot/loader/entries/initrd.conf");
+        let entry = "/root/boot/loader/entries/initrd.conf";
         let linux = format!("/root/boot/vmlinuz-{KVER}");
         let initramfs = format!("/root/boot/initramfs-{KVER}.img");
 
         put(&conf, &bls_entry(&linux, &[&format!("{initramfs} $tuned_initrd"), "/root/boot/microcode.img"]));
-        assert!(validate_bls_entry(&grub, &conf).is_ok());
+        assert!(validate_bls_entry(&grub, entry).is_ok());
 
         put(&conf, &bls_entry(&linux, &[&format!("$tuned_initrd {initramfs} /root/boot/microcode.img")]));
-        assert!(validate_bls_entry(&grub, &conf).is_ok());
+        assert!(validate_bls_entry(&grub, entry).is_ok());
 
         put(&conf, &bls_entry(&linux, &[&initramfs, "/root/boot/absent.img"]));
-        let err = validate_bls_entry(&grub, &conf).unwrap_err();
-        assert!(err.contains("'/root/boot/absent.img'"), "{err}");
+        let err = validate_bls_entry(&grub, entry).unwrap_err();
+        assert!(err.contains("`/root/boot/absent.img'"), "{err}");
 
         put(&conf, &bls_entry(&linux, &[&format!("{initramfs} /root/boot/absent.img $tuned_initrd")]));
-        let err = validate_bls_entry(&grub, &conf).unwrap_err();
-        assert!(err.contains("'/root/boot/absent.img'"), "{err}");
+        let err = validate_bls_entry(&grub, entry).unwrap_err();
+        assert!(err.contains("`/root/boot/absent.img'"), "{err}");
 
         // The Fedora 44 failure reaches initrd too.
         put(&conf, &bls_entry(&linux, &[&format!("/initramfs-{KVER}.img")]));
-        let err = validate_bls_entry(&grub, &conf).unwrap_err();
-        assert!(err.contains(&format!("'/initramfs-{KVER}.img'")), "{err}");
+        let err = validate_bls_entry(&grub, entry).unwrap_err();
+        assert!(err.contains(&format!("`/initramfs-{KVER}.img'")), "{err}");
 
         fs::remove_dir_all(&top).unwrap();
     }
