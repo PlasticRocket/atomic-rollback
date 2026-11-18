@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -378,7 +378,7 @@ impl StartingLookupDir {
             return None;
         }
         match expected {
-            NodeKind::RegularFile if grub_path.contains('+') => Some(LookupFailure::BlockList),
+            NodeKind::RegularFile if parse_blocklist(grub_path.as_bytes()).is_some() => Some(LookupFailure::BlockList),
             NodeKind::RegularFile => Some(LookupFailure::InvalidFileName),
             _ if matches!(self, Self::FilesystemRoot(_)) => Some(LookupFailure::InvalidFileName),
             _ => None,
@@ -633,6 +633,134 @@ fn read_if_found(start: &StartingLookupDir, grub_path: &str) -> Result<Option<Ve
     }
 }
 
+/// The size of the sectors a block list counts in (include/grub/disk.h,
+/// GRUB_DISK_SECTOR_SIZE).
+const GRUB_DISK_SECTOR_SIZE: u64 = 512;
+
+/// The heap GRUB's EFI build starts with (grub-core/kern/efi/mm.c,
+/// DEFAULT_HEAP_SIZE). load_env allocates the whole block at once
+/// (grub-core/commands/loadenv.h, read_envblk_file); beyond this size,
+/// whether that succeeds depends on the firmware's memory.
+const GRUB_EFI_DEFAULT_HEAP_SIZE: u64 = 0x2000000;
+
+/// One range of a block list: offset and length in 512-byte sectors, the
+/// length None where the list leaves it out.
+#[derive(Debug, PartialEq)]
+struct SectorRange {
+    offset: u64,
+    length: Option<u64>,
+}
+
+/// A block list as grub_fs_blocklist_open parses it (grub-core/kern/fs.c,
+/// lines 147-201), or None where GRUB reports an invalid file name. The
+/// list has one range per comma, plus one. A range is [OFFSET]+[LENGTH]:
+/// a left-out offset is 0, and a left-out length, before ',' or the end,
+/// runs to the end of the disk. A length is not 0, and ends at ',', the
+/// end, or a space, after which the rest of that range is skipped. Numbers
+/// are read as grub_strtoull reads them with base 0.
+fn parse_blocklist(name: &[u8]) -> Option<Vec<SectorRange>> {
+    let at = |p: usize| name.get(p).copied().unwrap_or(0);
+    let count = name.iter().filter(|&&b| b == b',').count() + 1;
+    let mut p = 0;
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut offset = 0;
+        if at(p) != b'+' {
+            offset = grub_strtoull(name, &mut p)?;
+            if at(p) != b'+' {
+                return None;
+            }
+        }
+        p += 1;
+        let length = if at(p) == 0 || at(p) == b',' { None } else { Some(grub_strtoull(name, &mut p)?) };
+        if length == Some(0) || !(at(p) == 0 || at(p) == b',' || is_grub_space(at(p))) {
+            return None;
+        }
+        ranges.push(SectorRange { offset, length });
+        p += 1;
+    }
+    Some(ranges)
+}
+
+/// The number grub_strtoull reads with base 0 from s at p, moving p past
+/// it (grub-core/kern/misc.c, grub_strtoull): spaces skipped, "0x" for
+/// base 16, a leading 0 before an octal digit for base 8, else base 10.
+/// None where GRUB sets an error: no digit, or a value above 64 bits.
+fn grub_strtoull(s: &[u8], p: &mut usize) -> Option<u64> {
+    let at = |i: usize| s.get(i).copied().unwrap_or(0);
+    while is_grub_space(at(*p)) {
+        *p += 1;
+    }
+    let mut base = 10;
+    if at(*p) == b'0' {
+        if at(*p + 1) == b'x' {
+            base = 16;
+            *p += 2;
+        } else if (b'0'..=b'7').contains(&at(*p + 1)) {
+            base = 8;
+        }
+    }
+    let mut number: u64 = 0;
+    let mut found = false;
+    while let Some(digit) = char::from(at(*p)).to_digit(base) {
+        found = true;
+        number = number.checked_mul(u64::from(base))?.checked_add(u64::from(digit))?;
+        *p += 1;
+    }
+    found.then_some(number)
+}
+
+/// The characters grub_isspace accepts (grub-core/kern/misc.c).
+fn is_grub_space(c: u8) -> bool {
+    matches!(c, b'\n' | b'\r' | b' ' | b'\t')
+}
+
+/// The bytes load_env reads through the block list name on partition, the
+/// device that dev names: its ranges in order (grub-core/kern/fs.c,
+/// grub_fs_blocklist_read), or None when it reads nothing. An invalid name
+/// fails the open. A range past the partition's end fails the open when it
+/// also passes the disk's end (kern/fs.c:193-197), and the read otherwise
+/// (kern/disk_common.c, grub_disk_adjust_range).
+fn read_blocklist(partition: &Path, name: &str) -> Result<Option<Vec<u8>>, GrubContextError> {
+    let Some(ranges) = parse_blocklist(name.as_bytes()) else {
+        return Ok(None);
+    };
+    let unverified = |reason: String| GrubContextError::CannotVerify(format!("cannot verify the block list '{name}': {reason}"));
+    let linux_error = |e: io::Error| unverified(format!("{}: {e}", partition.display()));
+    let mut device = fs::File::open(partition).map_err(linux_error)?;
+    let partition_sectors = device.seek(SeekFrom::End(0)).map_err(linux_error)? / GRUB_DISK_SECTOR_SIZE;
+
+    let mut size: u64 = 0;
+    for range in &ranges {
+        let Some(length) = range.length else {
+            return Err(unverified("a range without a length runs to the end of the disk, whose size check does not read".into()));
+        };
+        let (Some(end), Some(bytes)) = (range.offset.checked_add(length), length.checked_mul(GRUB_DISK_SECTOR_SIZE)) else {
+            return Err(unverified("its sectors pass the 64-bit arithmetic GRUB computes them in".into()));
+        };
+        size = size.checked_add(bytes)
+            .ok_or_else(|| unverified("its size passes the 64-bit arithmetic GRUB computes it in".into()))?;
+        if end > partition_sectors {
+            return Ok(None);
+        }
+    }
+    if size > GRUB_EFI_DEFAULT_HEAP_SIZE {
+        return Err(unverified(format!(
+            "GRUB allocates {size} bytes for it, more than its initial heap, and whether that succeeds depends on the firmware")));
+    }
+
+    let mut block = Vec::new();
+    for range in &ranges {
+        let length = range.length.unwrap_or_default();
+        device.seek(SeekFrom::Start(range.offset * GRUB_DISK_SECTOR_SIZE)).map_err(linux_error)?;
+        (&mut device).take(length * GRUB_DISK_SECTOR_SIZE).read_to_end(&mut block).map_err(linux_error)?;
+    }
+    if block.len() as u64 != size {
+        return Err(unverified(format!("{} ended before the block list did", partition.display())));
+    }
+    Ok(Some(block))
+}
+
 /// GRUB path of file in the GRUB directory grub_dir.
 fn grub_dir_file(grub_dir: &str, file: &str) -> String {
     format!("{}/{file}", grub_dir.trim_end_matches('/'))
@@ -646,6 +774,7 @@ impl GrubContext {
     pub fn from_system(root: &Path) -> Result<Self, GrubContextError> {
         let content = read_esp_stub(&root.join(&P.esp_dir[1..]).join("grub.cfg"))?;
         let (stub, device, fstype) = boot_filesystem(&content)?;
+        let partition = PathBuf::from(device.as_str());
 
         let mount = if fstype == tools::FsType::Btrfs {
             if !tools::is_root() {
@@ -659,7 +788,7 @@ impl GrubContext {
         let fs_root = mount.path().to_string();
         let select = |btrfs_relative| StartingLookupDir::select(&fstype, btrfs_relative, PathBuf::from(&fs_root),
             || tools::btrfs_subvol_get_default(&fs_root).map(|d| d.path().to_string()));
-        Self::build(&content, stub, &fstype, select, Some(mount))
+        Self::build(&content, stub, &fstype, &partition, select, Some(mount))
     }
 
     /// Builds a context for verifying a snapshot before rollback makes the
@@ -671,6 +800,7 @@ impl GrubContext {
     pub fn for_snapshot(toplevel: &Path, exchange: &RenameExchange) -> Result<Self, GrubContextError> {
         let content = read_esp_stub(&Path::new(P.esp_dir).join("grub.cfg"))?;
         let (stub, device, fstype) = boot_filesystem(&content)?;
+        let partition = PathBuf::from(device.as_str());
 
         let mount = if fstype == tools::FsType::Btrfs {
             None
@@ -679,13 +809,15 @@ impl GrubContext {
         };
         let fs_root = mount.as_ref().map_or_else(|| toplevel.to_path_buf(), |m| PathBuf::from(m.path()));
         let select = |btrfs_relative| Ok(StartingLookupDir::after_rollback(&fstype, btrfs_relative, fs_root.clone(), exchange));
-        Self::build(&content, stub, &fstype, select, mount)
+        Self::build(&content, stub, &fstype, &partition, select, mount)
     }
 
     /// Builds the context from the ESP stub, its text and the contract values
     /// parsed from it, once the filesystem it names, of type fstype, is
-    /// visible. select gives GRUB's starting lookup directory on that
-    /// filesystem for a btrfs_relative_path setting.
+    /// visible. partition is the block device holding that filesystem, the
+    /// one the stub's search leaves in dev. select gives GRUB's starting
+    /// lookup directory on that filesystem for a btrfs_relative_path
+    /// setting.
     ///
     /// GRUB reads btrfs_relative_path, btrfs_subvol and btrfs_subvolid at
     /// each mount and lookup (Fedora's grub2 2.12 patches,
@@ -700,6 +832,7 @@ impl GrubContext {
         stub_text: &str,
         stub: tools::EspStub,
         fstype: &tools::FsType,
+        partition: &Path,
         select: impl FnMut(bool) -> Result<StartingLookupDir, String>,
         mount: Option<tools::MountPoint>,
     ) -> Result<Self, GrubContextError> {
@@ -728,8 +861,16 @@ impl GrubContext {
                 return Err(GrubContextError::CannotVerify(format!(
                     "{source} sets dev, which names the device GRUB reads env_block from")));
             }
-            let at_env_block = lookup_dirs.for_setting(variables.btrfs_relative())?;
-            if let Some(block) = read_if_found(&at_env_block, &env_block)? {
+            // A name that does not start with '/' is a block list of the
+            // device (kern/file.c, grub_file_open), as grub2-editenv writes
+            // env_block on Btrfs.
+            let block = if env_block.starts_with('/') {
+                let at_env_block = lookup_dirs.for_setting(variables.btrfs_relative())?;
+                read_if_found(&at_env_block, &env_block)?
+            } else {
+                read_blocklist(partition, &env_block)?
+            };
+            if let Some(block) = block {
                 variables.load(&block, ENV_BLOCK)?;
             }
             reject_btrfs_subvol_variables(&variables, fstype)?;
@@ -1364,6 +1505,66 @@ configfile $prefix/grub.cfg
 
     fn pair(name: &str, value: &str) -> (String, String) {
         (name.to_string(), value.to_string())
+    }
+
+    fn ranges(list: &[(u64, Option<u64>)]) -> Option<Vec<SectorRange>> {
+        Some(list.iter().map(|&(offset, length)| SectorRange { offset, length }).collect())
+    }
+
+    // grub-core/kern/fs.c:147-201, with numbers as grub_strtoull reads them.
+    #[test]
+    fn blocklist_syntax() {
+        assert_eq!(parse_blocklist(b"512+1"), ranges(&[(512, Some(1))]));
+        assert_eq!(parse_blocklist(b"+2"), ranges(&[(0, Some(2))]));
+        assert_eq!(parse_blocklist(b"0x200+1,01000+2"), ranges(&[(512, Some(1)), (512, Some(2))]));
+        assert_eq!(parse_blocklist(b"08+1"), ranges(&[(8, Some(1))]));
+        assert_eq!(parse_blocklist(b"512+"), ranges(&[(512, None)]));
+        assert_eq!(parse_blocklist(b"512+,1+1"), ranges(&[(512, None), (1, Some(1))]));
+        assert_eq!(parse_blocklist(b"+"), ranges(&[(0, None)]));
+        assert_eq!(parse_blocklist(b" 512+1 and more"), ranges(&[(512, Some(1))]));
+        for invalid in ["512", "512+0", "a+1", "512+1x", "1+1,", "18446744073709551616+1", ""] {
+            assert_eq!(parse_blocklist(invalid.as_bytes()), None, "{invalid}");
+        }
+    }
+
+    fn partition_with(name: &str, sectors: usize, at: usize, content: &[u8]) -> PathBuf {
+        let dir = scratch(name);
+        let mut partition = vec![0u8; sectors * 512];
+        partition[at * 512..at * 512 + content.len()].copy_from_slice(content);
+        fs::write(dir.join("partition"), &partition).unwrap();
+        dir.join("partition")
+    }
+
+    // grub_fs_blocklist_read: the ranges' sectors, in order.
+    #[test]
+    fn blocklist_reads_its_ranges_in_order() {
+        let partition = partition_with("blocklist-ranges", 8, 2, b"first");
+        let mut sectors = fs::read(&partition).unwrap();
+        sectors[512..518].copy_from_slice(b"second");
+        fs::write(&partition, &sectors).unwrap();
+        let block = read_blocklist(&partition, "2+1,1+1").unwrap().unwrap();
+        assert_eq!(block.len(), 1024);
+        assert_eq!(&block[..5], b"first");
+        assert_eq!(&block[512..518], b"second");
+        fs::remove_dir_all(partition.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn blocklist_past_the_partition_reads_nothing() {
+        let partition = partition_with("blocklist-past", 8, 0, b"");
+        assert_eq!(read_blocklist(&partition, "7+2").unwrap(), None);
+        assert_eq!(read_blocklist(&partition, "not a block list").unwrap(), None);
+        assert!(read_blocklist(&partition, "7+1").unwrap().is_some());
+        fs::remove_dir_all(partition.parent().unwrap()).unwrap();
+    }
+
+    // A range without a length runs to the end of the disk, not of the
+    // partition (kern/fs.c:179-180), and check does not read the disk.
+    #[test]
+    fn blocklist_without_a_length_cannot_be_verified() {
+        let partition = partition_with("blocklist-open-end", 8, 0, b"");
+        assert!(matches!(read_blocklist(&partition, "1+"), Err(GrubContextError::CannotVerify(_))));
+        fs::remove_dir_all(partition.parent().unwrap()).unwrap();
     }
 
     #[test]
