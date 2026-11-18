@@ -759,9 +759,15 @@ elif [ -s $prefix/grubenv ]; then
 fi
 ";
 
-    /// A grub.cfg that loads grubenv, then lists the boot entries.
+    /// The line of Fedora's generated grub.cfg that sets root to the boot
+    /// filesystem, which the stubs here name by UUID 3f2a9c41
+    /// (util/grub-mkconfig_lib.in, prepare_grub_to_access_device).
+    const SEARCH_ROOT: &str = "search --no-floppy --fs-uuid --set=root 3f2a9c41\n";
+
+    /// A grub.cfg that loads grubenv, sets root, then lists the boot
+    /// entries.
     fn grub_cfg() -> String {
-        format!("{LOAD_GRUBENV}insmod blscfg\nblscfg\n")
+        format!("{LOAD_GRUBENV}{SEARCH_ROOT}insmod blscfg\nblscfg\n")
     }
 
     fn bls_entry(linux: &str, initrds: &[&str]) -> String {
@@ -869,7 +875,7 @@ fi
     /// subvolume, and holds grub2/, loader/entries/ and the kernels. The
     /// context is the snapshot check's, which reads that live /boot.
     fn separate_boot(boot: &Path) -> GrubContext {
-        put(&boot.join("grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&boot.join("grub2/grub.cfg"), &grub_cfg());
         put(&boot.join("grub2/grubenv"), &grubenv(""));
         put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
         put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
@@ -969,7 +975,7 @@ fi
     #[test]
     fn filesystem_root_accepts_boot_partition_layout() {
         let boot = scratch("grub-filesystem-root");
-        put(&boot.join("grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&boot.join("grub2/grub.cfg"), &grub_cfg());
         put(&boot.join("grub2/grubenv"), &grubenv(""));
         put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
         put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
@@ -1099,7 +1105,7 @@ fi
         let top = scratch("grubenv-where-loaded");
         install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
         let grub_cfg_path = top.join("root/boot/grub2/grub.cfg");
-        for script in ["insmod blscfg\nblscfg\n".to_string(), format!("insmod blscfg\nblscfg\n{LOAD_GRUBENV}")] {
+        for script in [format!("{SEARCH_ROOT}insmod blscfg\nblscfg\n"), format!("{SEARCH_ROOT}insmod blscfg\nblscfg\n{LOAD_GRUBENV}")] {
             put(&grub_cfg_path, &script);
             let results = bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX));
             assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{script}: {results:?}");
@@ -1152,8 +1158,9 @@ fi
 
     /// The lines of Fedora's generated grub.cfg before blscfg that set
     /// variables: 00_header's load_env of grubenv and of env_block
-    /// (util/grub.d/00_header.in:56-70), and 01_users's source of user.cfg
-    /// (util/grub.d/01_users.in:3-4).
+    /// (util/grub.d/00_header.in:56-70), 01_users's source of user.cfg
+    /// (util/grub.d/01_users.in:3-4), and 10_linux's search that sets root
+    /// (util/grub-mkconfig_lib.in, prepare_grub_to_access_device).
     const GENERATED_GRUB_CFG: &str = "\
 set pager=1
 
@@ -1182,6 +1189,9 @@ if [ -f ${prefix}/user.cfg ]; then
   fi
 fi
 
+insmod part_gpt
+insmod btrfs
+search --no-floppy --fs-uuid --set=root 3f2a9c41
 insmod blscfg
 blscfg
 ";
@@ -1314,10 +1324,52 @@ blscfg
             assert!(cannot_verify_naming(grub, variable), "{variable}");
 
             // After blscfg, grub.cfg no longer decides where the entries are.
-            put(&top.join("root/boot/grub2/grub.cfg"), &format!("insmod blscfg\nblscfg\nset {variable}=x\n"));
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{}set {variable}=x\n", grub_cfg()));
             assert!(context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).is_ok(), "{variable}");
             fs::remove_dir_all(&top).unwrap();
         }
+    }
+
+    // blscfg reads the boot entries from the device in root (Fedora's grub2
+    // 2.12 patches, grub-core/commands/blscfg.c, bls_load_entries), which
+    // 10_linux's search sets to the boot filesystem by its UUID
+    // (util/grub-mkconfig_lib.in, prepare_grub_to_access_device). Before
+    // that, root is the device GRUB started from, the EFI system partition
+    // (grub-core/kern/main.c, grub_set_prefix_and_root).
+    #[test]
+    fn blscfg_reads_the_entries_from_the_device_in_root() {
+        let top = scratch("root-device");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let grub_cfg_path = top.join("root/boot/grub2/grub.cfg");
+        let stub = esp_stub(false, STUB_TOP_LEVEL_PREFIX);
+        for (script, needle) in [
+            (format!("{LOAD_GRUBENV}insmod blscfg\nblscfg\n"), "EFI system partition"),
+            (format!("{LOAD_GRUBENV}search --no-floppy --fs-uuid --set=root 0badc0de\nblscfg\n"), "UUID=0badc0de"),
+            (format!("{LOAD_GRUBENV}{SEARCH_ROOT}set root=hd1,gpt2\nblscfg\n"), "set root=hd1,gpt2"),
+            (format!("{LOAD_GRUBENV}{SEARCH_ROOT}search --set 0badc0de\nblscfg\n"), "search --set 0badc0de"),
+        ] {
+            put(&grub_cfg_path, &script);
+            assert!(cannot_verify_naming(context_from_stub(&top, &stub), needle), "{script}");
+        }
+
+        // grubenv sets root where grub.cfg loads it: before the search, the
+        // search replaces it; after, it holds.
+        put(&top.join("root/boot/grub2/grubenv"), &grubenv(&format!("{BLSDIR_TOP_LEVEL}root=hd1,gpt2\n")));
+        put(&grub_cfg_path, &format!("{SEARCH_ROOT}{LOAD_GRUBENV}blscfg\n"));
+        assert!(cannot_verify_naming(context_from_stub(&top, &stub), "grubenv sets root"));
+        put(&grub_cfg_path, &grub_cfg());
+        assert!(context_from_stub(&top, &stub).is_ok());
+        put(&top.join("root/boot/grub2/grubenv"), &grubenv(BLSDIR_TOP_LEVEL));
+
+        // The compatibility line before the search, hints, and the case of
+        // the UUID, which search compares without it (commands/search.c).
+        put(&grub_cfg_path, &format!("{LOAD_GRUBENV}set root='hd0,gpt2'\n\
+            if [ x$feature_platform_search_hint = xy ]; then\n\
+              search --no-floppy --fs-uuid --set=root --hint-efi=hd0,gpt2 3F2A9C41\n\
+            else\n  search --no-floppy --fs-uuid --set=root 3f2a9c41\nfi\nblscfg\n"));
+        let grub = context_from_stub(&top, &stub);
+        assert!(grub.as_ref().is_ok_and(|grub| passes(&bls_entries(grub))), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
     }
 
     // env_block and dev name where the header loads env_block, prefix where
@@ -1349,7 +1401,7 @@ blscfg
         ] {
             let top = scratch("phase-script-read");
             install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
-            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{LOAD_GRUBENV}{script}\ninsmod blscfg\nblscfg\n"));
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{LOAD_GRUBENV}{script}\n{SEARCH_ROOT}insmod blscfg\nblscfg\n"));
             let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
             assert!(grub.is_ok(), "{script}: {:?}", grub.as_ref().err());
             assert!(passes(&bls_entries(&grub.unwrap())), "{script}");

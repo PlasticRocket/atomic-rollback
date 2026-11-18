@@ -529,6 +529,47 @@ struct GrubVariables {
     /// patches, grub-core/fs/btrfs.c, subvol_set_env and subvolid_set_env).
     /// Neither Fedora's gen_grub_cfgstub nor migrate sets either.
     btrfs_subvol: Option<(&'static str, &'static str)>,
+    root: Root,
+}
+
+/// The device in the root variable, as check tells it apart.
+#[derive(Default)]
+enum Root {
+    /// The device GRUB started from, the EFI system partition, where GRUB
+    /// sets root when it starts (grub-core/kern/main.c,
+    /// grub_set_prefix_and_root).
+    #[default]
+    BootLocation,
+    /// The device holding the filesystem of this UUID, as 10_linux's search
+    /// sets it.
+    FilesystemUuid(String),
+    /// A device set where check does not follow, as this says.
+    Other(String),
+}
+
+/// The filesystem UUID a search line as 10_linux generates it sets root to:
+/// search --no-floppy --fs-uuid --set=root, any --hint options, then the
+/// UUID (util/grub-mkconfig_lib.in, prepare_grub_to_access_device). GRUB
+/// sets root to the first device holding a filesystem of that UUID
+/// (grub-core/commands/search.c), which check takes to be the one the ESP
+/// stub's search finds when both name the same UUID.
+fn root_search(command: &script::Command) -> Option<String> {
+    let (first, rest) = command.words.split_first()?;
+    let (uuid, options) = rest.split_last()?;
+    if !first.is("search") || command.words.iter().any(|w| w.expansion.is_some()) || uuid.text.starts_with('-') {
+        return None;
+    }
+    let (mut by_uuid, mut sets_root) = (false, false);
+    for option in options {
+        match option.text.as_str() {
+            "--no-floppy" => {}
+            "--fs-uuid" => by_uuid = true,
+            "--set=root" => sets_root = true,
+            hint if hint.starts_with("--hint") && hint.contains('=') => {}
+            _ => return None,
+        }
+    }
+    (by_uuid && sets_root).then(|| uuid.text.clone())
 }
 
 impl GrubVariables {
@@ -565,7 +606,9 @@ impl GrubVariables {
     /// module starts, which is later (grub-core/kern/main.c, grub_main), and
     /// registering a hook keeps a value without running it
     /// (grub-core/kern/env.c, grub_register_variable_hook), so GRUB_ENV's
-    /// values of those point the driver at no subvolume.
+    /// values of those point the driver at no subvolume. GRUB then sets root
+    /// to the device it started from (grub-core/kern/main.c,
+    /// grub_set_prefix_and_root), so GRUB_ENV's root does not hold either.
     fn load_grub_env(&mut self, data: &[u8]) -> Result<(), GrubContextError> {
         for (name, value) in envblk_iterate(data) {
             let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).find(|n| n.as_bytes() == name) else {
@@ -591,6 +634,7 @@ impl GrubVariables {
     /// was.
     fn assign(&mut self, name: &'static str, value: String, source: &'static str) {
         match name {
+            "root" => self.root = Root::Other(format!("{source} sets root")),
             "btrfs_subvol" => self.btrfs_subvol = (!value.is_empty()).then_some((name, source)),
             "btrfs_subvolid" => {
                 let id = if value.is_empty() { Some(0) } else { grub_strtoull(value.as_bytes(), &mut 0, DECIMAL) };
@@ -610,7 +654,8 @@ impl GrubVariables {
     /// grub_cmd_load_env). A block GRUB refuses sets nothing.
     fn load(&mut self, block: &[u8], source: &'static str) -> Result<(), GrubContextError> {
         for (name, value) in envblk_assignments(block).unwrap_or_default() {
-            let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).find(|n| n.as_bytes() == name) else {
+            let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).chain(["root"])
+                .find(|n| n.as_bytes() == name) else {
                 continue;
             };
             let value = String::from_utf8(value).map_err(|_| GrubContextError::CannotVerify(format!(
@@ -703,6 +748,8 @@ struct ConfigRun<'a, F> {
     fstype: &'a tools::FsType,
     partition: &'a Path,
     grub_dir: &'a str,
+    /// The UUID of the filesystem the ESP stub's search names.
+    boot_uuid: &'a str,
     /// Where blscfg starts its lookups, and the blsdir variable, once
     /// grub.cfg runs it.
     at_blscfg: Option<(StartingLookupDir, Option<String>)>,
@@ -780,8 +827,27 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                     "{file} runs '{line}', whose argument chooses the entries blscfg lists or where it reads them, \
                      which check does not model")));
             }
+            // blscfg reads the entries from the device in root (Fedora's
+            // grub2 2.12 patches, grub-core/commands/blscfg.c,
+            // bls_load_entries).
+            match &self.variables.root {
+                Root::FilesystemUuid(uuid) if uuid.eq_ignore_ascii_case(self.boot_uuid) => {}
+                Root::FilesystemUuid(uuid) => return Err(GrubContextError::CannotVerify(format!(
+                    "{file}'s search sets root to the filesystem UUID={uuid}, from which blscfg reads the boot entries, \
+                     while the ESP stub's search names UUID={}, the filesystem check reads", self.boot_uuid))),
+                Root::BootLocation => return Err(GrubContextError::CannotVerify(format!(
+                    "{file} sets no root before blscfg, so blscfg reads the boot entries from the device GRUB \
+                     started from, the EFI system partition, which check does not read"))),
+                Root::Other(how) => return Err(GrubContextError::CannotVerify(format!(
+                    "{how} before blscfg, which reads the boot entries from the device in root, \
+                     and check does not interpret GRUB script"))),
+            }
             let at = self.starting_lookup_dir()?;
             self.at_blscfg = Some((at, self.variables.get("blsdir").map(str::to_string)));
+            return Ok(());
+        }
+        if let Some(uuid) = root_search(command) {
+            self.variables.root = Root::FilesystemUuid(uuid);
             return Ok(());
         }
         let names = match script::sets(&command.words) {
@@ -790,6 +856,9 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                 "{file} runs '{line}' before blscfg, which can set where GRUB looks the boot entries up, \
                  and check does not interpret GRUB script"))),
         };
+        if names.iter().any(|n| n == "root") {
+            self.variables.root = Root::Other(format!("{file} sets root in '{line}'"));
+        }
         if let Some(variable) = LOOKUP_VARIABLES.into_iter().chain(SCRIPT_LOADING_VARIABLES)
             .find(|v| names.iter().any(|n| n == v))
         {
@@ -1089,6 +1158,7 @@ impl GrubContext {
             fstype,
             partition,
             grub_dir: &stub.grub_dir,
+            boot_uuid: stub.boot_uuid.as_str(),
             at_blscfg: None,
         };
         let at_configfile = run.starting_lookup_dir()?;
