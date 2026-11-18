@@ -107,7 +107,7 @@ pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> B
 
     let snapshot = toplevel.join(exchange.snapshot.as_str());
     evaluate_checks(vec![
-        ("GRUB configuration", check_snapshot_grub_config(&grub)),
+        ("GRUB configuration", check_grub_cfg(&grub, None)),
         ("Kernel boot entry", check_bls_entries(&grub)),
         ("Root filesystem", check_root_mountable(&snapshot, &grub)),
         ("System mounts", check_fstab_mounts(&snapshot)),
@@ -184,22 +184,8 @@ fn check_esp(root: &Path) -> Vec<CheckResult> {
 // --- GRUB configuration ---
 
 fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
-    let mut results = Vec::new();
-
-    // The ESP stub runs configfile $prefix/grub.cfg, and GRUB resolves the
-    // prefix like every other path.
-    let grub_path = grub.grub_dir_file("grub.cfg");
-    let grub_cfg = grub.resolve(&grub_path);
-    let grub_cfg_path = format!("{}/grub.cfg", P.grub_dir);
-    results.push(check_file_exists_nonempty(&grub_cfg).map_err(|fact|
-        format!("GRUB loads its configuration from '{grub_path}': {fact}. \
-                 GRUB will drop to a rescue shell on next boot. \
-                 Regenerate with: sudo grub2-mkconfig -o {grub_cfg_path}")));
-
-    results.push(check_file_contains(&grub_cfg, "blscfg",
-        &format!("GRUB configuration does not use Boot Loader Specification entries. \
-         Kernel boot entries will not appear in the GRUB menu. \
-         Regenerate with: sudo grub2-mkconfig -o {grub_cfg_path}")));
+    let regenerate = format!("Regenerate with: sudo grub2-mkconfig -o {}/grub.cfg", P.grub_dir);
+    let mut results = check_grub_cfg(grub, Some(&regenerate));
 
     if let StartingLookupDir::BtrfsDefaultSubvol(default_subvol) = &grub.starting_lookup_dir {
         results.push(check_default_subvol_matches_root(&default_subvol.to_string_lossy(), root));
@@ -208,18 +194,22 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
     results
 }
 
-/// The grub.cfg GRUB loads after rollback: the snapshot's on Btrfs, the
-/// live boot filesystem's otherwise.
-fn check_snapshot_grub_config(grub: &GrubContext) -> Vec<CheckResult> {
+/// The grub.cfg GRUB loads, which must list the boot entries with blscfg.
+/// The ESP stub runs configfile $prefix/grub.cfg, and GRUB resolves the
+/// prefix like every other path; in the snapshot check, from where it will
+/// start after the exchange. remedy, when given, says how to regenerate
+/// the file.
+fn check_grub_cfg(grub: &GrubContext, remedy: Option<&str>) -> Vec<CheckResult> {
+    let remedy = remedy.map(|r| format!(" {r}")).unwrap_or_default();
     let grub_path = grub.grub_dir_file("grub.cfg");
     let grub_cfg = grub.resolve(&grub_path);
     vec![
-        check_file_exists_nonempty(&grub_cfg).map_err(|fact|
-            format!("After rollback, GRUB loads its configuration from '{grub_path}': {fact}. \
-                     GRUB will drop to a rescue shell on next boot.")),
-        check_file_contains(&grub_cfg, "blscfg",
-            "The GRUB configuration used after rollback does not use Boot Loader \
-             Specification entries. Kernel boot entries will not appear in the GRUB menu."),
+        check_file_exists_nonempty(&grub_cfg).map_err(|fact| format!(
+            "GRUB loads its configuration from '{grub_path}': {fact}. \
+             GRUB will drop to a rescue shell on next boot.{remedy}")),
+        check_file_contains(&grub_cfg, "blscfg", &format!(
+            "GRUB configuration does not use Boot Loader Specification entries. \
+             Kernel boot entries will not appear in the GRUB menu.{remedy}")),
     ]
 }
 
@@ -880,7 +870,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let starting_lookup_dir = StartingLookupDir::after_rollback(&tools::FsType::Ext4, false, boot.clone(), &exchange);
         let grub = GrubContext::new(starting_lookup_dir, "/grub2".into());
 
-        assert!(passes(&check_snapshot_grub_config(&grub)), "{:?}", check_snapshot_grub_config(&grub));
+        assert!(passes(&check_grub_cfg(&grub, None)), "{:?}", check_grub_cfg(&grub, None));
         assert!(passes(&check_bls_entries(&grub)), "{:?}", check_bls_entries(&grub));
         assert_eq!(extract_root_uuid(&grub).map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
         fs::remove_dir_all(&scratch_dir).unwrap();
