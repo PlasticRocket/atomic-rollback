@@ -226,6 +226,11 @@ fragments! {
     TemporaryMountsInUniqueRunDirectory,
     SnapshotRetentionByCreationGeneration,
     PreTransactionDiskSpaceCheck,
+    CheckReadsGrubScriptAsGrubRunsIt,
+    CheckReadsGrubEnvEfiVariable,
+    CheckReadsBootEntriesFromRootDevice,
+    CheckCountsOnlyMenuEntries,
+    CheckJudgesDefaultBootEntry,
 }
 
 impl Fragment {
@@ -504,7 +509,7 @@ impl Fragment {
             },
             Self::CheckRefusesBtrfsSubvolVariables => Status::Unreleased {
                 section: Section::Changed,
-                text: "`check` fails when `btrfs_subvol` or `btrfs_subvolid` is set while `btrfs_relative_path` is, on a Btrfs boot filesystem, by the ESP `grub.cfg` or by the `grubenv` that `grub.cfg` loads, naming the variable and where it is set. GRUB reads them only then, neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.",
+                text: "`check` fails when `btrfs_subvol` or `btrfs_subvolid` names a subvolume while `btrfs_relative_path` is set, on a Btrfs boot filesystem, by the ESP `grub.cfg` or by the `grubenv` that `grub.cfg` loads, naming the variable and where it is set. An empty `btrfs_subvol` or a `btrfs_subvolid` of 0 names none, as GRUB reads them. GRUB reads them only when `btrfs_relative_path` is set, neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.",
             },
             Self::TemporaryMountsInUniqueRunDirectory => Status::Unreleased {
                 section: Section::Security,
@@ -517,6 +522,26 @@ impl Fragment {
             Self::PreTransactionDiskSpaceCheck => Status::Unreleased {
                 section: Section::Fixed,
                 text: "An RPM transaction whose files do not fit beside the snapshot taken before it is refused before anything is written, with the amount it needs, the amount free, and how to free space. The snapshot keeps the old copy of every file the transaction replaces, which rpm's own disk space check counts as freed, and rpm counts each Btrfs subvolume apart, so such a transaction passed rpm's check and failed part way with `No space left on device`, leaving some packages upgraded and others not. The RPM plugin now adds up every file of every package the transaction installs that lands on the Btrfs filesystem holding `/`, in any of its subvolumes, rounded to whole blocks and with rpm's 5% margin as rpm counts, and credits nothing for replaced or removed files. Snapshots are never deleted to make room.",
+            },
+            Self::CheckReadsGrubScriptAsGrubRunsIt => Status::Unreleased {
+                section: Section::Fixed,
+                text: "The boot chain check reads `grub.cfg`, and the `user.cfg` and `custom.cfg` it sources, to its end by what each command assigns, as GRUB runs them: a line that only reads a variable no longer leaves the boot chain unverified, while a command whose variable name is the value of a variable, such as `set ${x}=...`, does; `grubenv`, `env_block` and `user.cfg` apply only where `grub.cfg` loads them; `grub.cfg` must run the `blscfg` command, not only mention it; and a command after `blscfg` that sets `root` or a Btrfs subvolume variable, which move where GRUB finds a booted entry's kernel, leaves the boot chain unverified.",
+            },
+            Self::CheckReadsGrubEnvEfiVariable => Status::Unreleased {
+                section: Section::Fixed,
+                text: "The boot chain check reads the `GRUB_ENV` EFI variable, whose variables Fedora's GRUB sets when it starts, before the ESP `grub.cfg` runs, so a `blsdir`, `btrfs_relative_path` or `saved_entry` there is followed. It reports that it cannot verify the boot chain when it cannot read efivarfs.",
+            },
+            Self::CheckReadsBootEntriesFromRootDevice => Status::Unreleased {
+                section: Section::Fixed,
+                text: "The boot chain check reads the boot entries from the filesystem that the `search --set=root` line `grub2-mkconfig` writes into `grub.cfg` names, where `blscfg` reads them, instead of assuming the filesystem the ESP `grub.cfg` names. It reports that it cannot verify the boot chain when `grub.cfg` sets `root` another way or to another filesystem.",
+            },
+            Self::CheckCountsOnlyMenuEntries => Status::Unreleased {
+                section: Section::Fixed,
+                text: "`check` counts as boot entries only the entries `blscfg` adds to GRUB's menu: a file without a `linux` line, which `blscfg` leaves out, is no longer reported as a broken entry; two files `blscfg` compares as the same version, of which GRUB keeps the one it reads first, leave the boot chain unverified; and a file whose name, without its final `.conf`, still holds `.conf` before its end, on which `blscfg` loops forever, fails the boot chain.",
+            },
+            Self::CheckJudgesDefaultBootEntry => Status::Unreleased {
+                section: Section::Fixed,
+                text: "`check` judges the boot entries by the entry GRUB boots when no key is pressed, which it finds as Fedora's GRUB does from `next_entry`, `saved_entry` and the boot counter in `grubenv`, the `GRUB_DEFAULT` that `grub2-mkconfig` writes into `grub.cfg`, and the order of the menu, and it fails when GRUB cannot find that entry's kernel or initramfs; other entries that do not resolve are warnings. It previously reported the boot chain valid, with warnings, when any entry resolved, so a broken default entry beside a working one read as valid while the system could not boot unattended. The verdict names the entry it counted. `check` reports that it cannot verify the boot chain where that entry depends on what it does not read, such as a `default` set in `user.cfg`, an entry `grub.cfg` adds only where the firmware supports it, or the `fallback` entries GRUB tries after a broken default, and it does not count the menu timeout or entry passwords.",
             },
         }
     }
