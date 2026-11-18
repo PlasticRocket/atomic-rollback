@@ -26,13 +26,15 @@ const BLS_CONFIG_PATH: &str = "/loader/entries";
 /// (grub-core/commands/blscfg.c, find_entry).
 const BOOT_BLS_CONFIG_PATH: &str = "/boot/loader/entries";
 
-/// Errors from building a GrubContext. Distinguishes a missing privilege
-/// (non-root invocation) from other errors, so the caller can surface
-/// "try sudo" vs a real boot-chain problem.
+/// Errors from building a GrubContext. Each access only root has is its
+/// own cause, so the caller can tell "run as root" apart from a real
+/// boot-chain problem and name the access that was missing.
 pub enum GrubContextError {
-    /// Reading the root-only ESP grub.cfg, or mounting the Btrfs
-    /// top-level subvolume, was refused.
-    PermissionDenied { reason: String },
+    /// Reading the ESP grub.cfg was refused (EACCES); Fedora makes it
+    /// readable only by root.
+    EspUnreadable { path: PathBuf },
+    /// Mounting the Btrfs top-level subvolume needs root (mount(2), EPERM).
+    MountNotPermitted,
     Other(String),
 }
 
@@ -131,9 +133,7 @@ pub struct GrubContext {
 
 fn read_esp_stub(path: &Path) -> Result<tools::EspStub, GrubContextError> {
     let content = fs::read_to_string(path).map_err(|e| match e.kind() {
-        io::ErrorKind::PermissionDenied => GrubContextError::PermissionDenied {
-            reason: format!("permission denied reading {}", path.display()),
-        },
+        io::ErrorKind::PermissionDenied => GrubContextError::EspUnreadable { path: path.to_path_buf() },
         _ => GrubContextError::Other(format!("cannot read ESP grub.cfg: {e}")),
     })?;
     reject_btrfs_subvol_variables(&content)?;
@@ -175,9 +175,7 @@ impl GrubContext {
 
         let mount = if fstype == tools::FsType::Btrfs {
             if !tools::is_root() {
-                return Err(GrubContextError::PermissionDenied {
-                    reason: "mounting the Btrfs top-level subvolume requires root".into(),
-                });
+                return Err(GrubContextError::MountNotPermitted);
             }
             tools::mount_toplevel_ro(&stub.boot_uuid)?
         } else {
