@@ -4,6 +4,7 @@
 //!   UEFI -> shim -> GRUB -> grub.cfg -> BLS entries -> kernel -> root mount -> fstab
 
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::grub::{BlsDir, Finding, StartingLookupDir, GrubContext, GrubContextError};
@@ -293,31 +294,40 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Ve
 
     let confs = match bls_entry_paths(blsdir) {
         Ok(confs) => confs,
-        Err(e) => return vec![Err(Finding::CannotVerify(format!(
-            "cannot verify the boot entries in '{}': {e}", blsdir.grub_path)))],
+        Err(finding) => return vec![Err(finding)],
     };
-
-    if confs.is_empty() {
-        return vec![Err(format!(
-            "No boot entries found in '{}'. \
-             GRUB will show an empty menu with no kernels to boot. \
-             Reinstall the kernel: sudo dnf reinstall kernel-core",
-            blsdir.grub_path).into())];
-    }
 
     // Validate ALL entries, not just until the first valid one
     let mut valid = 0;
     let mut failures: Vec<String> = Vec::new();
     let mut unverified: Vec<String> = Vec::new();
     for conf in &confs {
-        match validate_bls_entry(grub, conf) {
+        let content = match read_grub_file(grub, conf) {
+            Ok(content) => content,
+            // blscfg skips a file it cannot open (Fedora's grub2 2.12
+            // patches, grub-core/commands/blscfg.c, read_entry).
+            Err(Finding::Fails(_)) => continue,
+            Err(Finding::CannotVerify(e)) => {
+                unverified.push(e);
+                continue;
+            }
+        };
+        match validate_bls_entry(grub, conf, &content) {
             Ok(()) => valid += 1,
             Err(Finding::Fails(e)) => failures.push(e),
             Err(Finding::CannotVerify(e)) => unverified.push(e),
         }
     }
 
-    let total = confs.len();
+    let total = valid + failures.len() + unverified.len();
+
+    if total == 0 {
+        return vec![Err(format!(
+            "No boot entries found in '{}'. \
+             GRUB will show an empty menu with no kernels to boot. \
+             Reinstall the kernel: sudo dnf reinstall kernel-core",
+            blsdir.grub_path).into())];
+    }
 
     if valid == total {
         return vec![Ok(())];
@@ -348,32 +358,44 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Ve
     results
 }
 
-/// The GRUB paths of the boot entries in blsdir.
-fn bls_entry_paths(blsdir: &BlsDir) -> std::io::Result<Vec<String>> {
+/// The GRUB paths of the files in blsdir whose names blscfg reads as boot
+/// entries.
+fn bls_entry_paths(blsdir: &BlsDir) -> Result<Vec<String>, Finding> {
+    let unverified = |e: std::io::Error| Finding::CannotVerify(format!(
+        "cannot verify the boot entries in '{}': {e}", blsdir.grub_path));
     let mut confs = Vec::new();
-    for entry in fs::read_dir(&blsdir.linux)? {
-        if let Ok(name) = entry?.file_name().into_string() {
-            if Path::new(&name).extension().is_some_and(|ext| ext == "conf") {
-                confs.push(blsdir.entry(&name));
-            }
+    for entry in fs::read_dir(&blsdir.linux).map_err(unverified)? {
+        let name = entry.map_err(unverified)?.file_name();
+        if !is_bls_entry_name(name.as_bytes()) {
+            continue;
         }
+        let name = name.into_string().map_err(|name| Finding::CannotVerify(format!(
+            "cannot verify the boot entry {name:?} in '{}': its name is not UTF-8, which check does not look up",
+            blsdir.grub_path)))?;
+        confs.push(blsdir.entry(&name));
     }
     Ok(confs)
+}
+
+/// Whether blscfg reads the file of this name in the boot entry directory:
+/// it skips a name that starts with '.', has 5 bytes or fewer, or does not
+/// end in ".conf" (Fedora's grub2 2.12 patches,
+/// grub-core/commands/blscfg.c, read_entry).
+fn is_bls_entry_name(name: &[u8]) -> bool {
+    const BLS_ENTRY_SUFFIX: &[u8] = b".conf";
+    name.first() != Some(&b'.') && name.len() > BLS_ENTRY_SUFFIX.len() && name.ends_with(BLS_ENTRY_SUFFIX)
 }
 
 // BLS fields may contain GRUB variables after the file path:
 //   initrd /initramfs-6.19.9.img $tuned_initrd
 // Only the first token is a file path. The rest is GRUB's concern.
-// conf is the entry's GRUB path.
-fn validate_bls_entry(grub: &GrubContext, conf: &str) -> CheckResult {
-    let content = read_grub_file(grub, conf)
-        .map_err(|finding| finding.map_fails(|e| format!("Cannot read boot entry: {e}")))?;
-
-    let linux = parse::bls_field(&content, "linux")
+// conf is the entry's GRUB path, and content what GRUB reads there.
+fn validate_bls_entry(grub: &GrubContext, conf: &str, content: &str) -> CheckResult {
+    let linux = parse::bls_field(content, "linux")
         .ok_or_else(|| format!(
             "Boot entry '{conf}' has no 'linux' field. \
              GRUB does not know which kernel to load."))?;
-    let options = parse::bls_field(&content, "options")
+    let options = parse::bls_field(content, "options")
         .ok_or_else(|| format!(
             "Boot entry '{conf}' has no 'options' field. \
              The kernel will not know which root filesystem to mount."))?;
@@ -385,7 +407,7 @@ fn validate_bls_entry(grub: &GrubContext, conf: &str) -> CheckResult {
     // initrd may appear on multiple lines (BLS spec). Each value may contain
     // GRUB variables ($tuned_initrd) which are resolved at boot, not checkable here.
     // GRUB stores everything after the first delimiter as the value (blsuki.c:316).
-    let initrd_values = parse::bls_field_all(&content, "initrd");
+    let initrd_values = parse::bls_field_all(content, "initrd");
     if initrd_values.is_empty() {
         return Err(format!(
             "Boot entry '{conf}' has no 'initrd' field. \
@@ -592,12 +614,11 @@ fn extract_root_uuid(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Re
         Err(Finding::Fails(_)) => return Ok(None),
         Err(unverified) => return Err(unverified.clone()),
     };
-    let confs = bls_entry_paths(blsdir).map_err(|e| Finding::CannotVerify(format!(
-        "cannot verify the boot entries in '{}': {e}", blsdir.grub_path)))?;
-    for conf in confs {
+    for conf in bls_entry_paths(blsdir)? {
         let content = match read_grub_file(grub, &conf) {
             Ok(content) => content,
-            Err(Finding::Fails(_)) => return Ok(None),
+            // blscfg skips a file it cannot open.
+            Err(Finding::Fails(_)) => continue,
             Err(unverified) => return Err(unverified),
         };
         if let Some(options) = parse::bls_field(&content, "options") {
@@ -760,6 +781,10 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
 
     fn bls_entries(grub: &GrubContext) -> Vec<CheckResult> {
         check_bls_entries(grub, &grub.blsdir())
+    }
+
+    fn validate(grub: &GrubContext, conf: &str) -> CheckResult {
+        validate_bls_entry(grub, conf, &read_grub_file(grub, conf)?)
     }
 
     fn passes(results: &[CheckResult]) -> bool {
@@ -951,6 +976,47 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         fs::remove_dir_all(&scratch_dir).unwrap();
     }
 
+    // --- the files blscfg reads ---
+
+    /// Adds files blscfg does not read as entries to dir: a name starting
+    /// with '.', a name not ending in ".conf", and two it cannot open.
+    fn put_files_blscfg_skips(dir: &Path) {
+        put(&dir.join(".hidden.conf"), "title not read\n");
+        put(&dir.join("notes.txt"), "title not read\n");
+        std::os::unix::fs::symlink("gone.conf", dir.join("dangling.conf")).unwrap();
+        fs::create_dir_all(dir.join("dir.conf")).unwrap();
+    }
+
+    // blscfg reads only a file whose name does not start with '.', is longer
+    // than 5 bytes and ends in ".conf", and skips one it cannot open
+    // (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c,
+    // read_entry). None of them is a broken entry.
+    #[test]
+    fn files_blscfg_does_not_read_are_not_boot_entries() {
+        let top = scratch("bls-entry-names");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put_files_blscfg_skips(&top.join("root/boot/loader/entries"));
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+
+        let results = bls_entries(&grub);
+        assert!(passes(&results), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn a_directory_of_files_blscfg_does_not_read_has_no_boot_entries() {
+        let top = scratch("bls-entry-names-none");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        let entries = top.join("root/boot/loader/entries");
+        fs::remove_file(entries.join(format!("{KVER}.conf"))).unwrap();
+        put_files_blscfg_skips(&entries);
+        let grub = btrfs_context(&top, false, "/root/boot/grub2");
+
+        let results = bls_entries(&grub);
+        assert!(fails_with(&results, "No boot entries found"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // --- refusals: each check fails on a seeded defect ---
 
     // The live root keeps its grub.cfg; the snapshot, whose prefix GRUB
@@ -1129,22 +1195,22 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let initramfs = format!("/root/boot/initramfs-{KVER}.img");
 
         put(&conf, &bls_entry(&linux, &[&format!("{initramfs} $tuned_initrd"), "/root/boot/microcode.img"]));
-        assert!(validate_bls_entry(&grub, entry).is_ok());
+        assert!(validate(&grub, entry).is_ok());
 
         put(&conf, &bls_entry(&linux, &[&format!("$tuned_initrd {initramfs} /root/boot/microcode.img")]));
-        assert!(validate_bls_entry(&grub, entry).is_ok());
+        assert!(validate(&grub, entry).is_ok());
 
         put(&conf, &bls_entry(&linux, &[&initramfs, "/root/boot/absent.img"]));
-        let err = validate_bls_entry(&grub, entry).unwrap_err();
+        let err = validate(&grub, entry).unwrap_err();
         assert!(err.message().contains("`/root/boot/absent.img'"), "{err}");
 
         put(&conf, &bls_entry(&linux, &[&format!("{initramfs} /root/boot/absent.img $tuned_initrd")]));
-        let err = validate_bls_entry(&grub, entry).unwrap_err();
+        let err = validate(&grub, entry).unwrap_err();
         assert!(err.message().contains("`/root/boot/absent.img'"), "{err}");
 
         // The Fedora 44 failure reaches initrd too.
         put(&conf, &bls_entry(&linux, &[&format!("/initramfs-{KVER}.img")]));
-        let err = validate_bls_entry(&grub, entry).unwrap_err();
+        let err = validate(&grub, entry).unwrap_err();
         assert!(err.message().contains(&format!("`/initramfs-{KVER}.img'")), "{err}");
 
         fs::remove_dir_all(&top).unwrap();
