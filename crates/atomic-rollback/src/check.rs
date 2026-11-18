@@ -1260,6 +1260,41 @@ blscfg
         }
     }
 
+    // GRUB sets a variable only through a command that assigns it
+    // (kern/corecmd.c, set and unset; script/execute.c, NAME=VALUE), so a
+    // line that only expands a lookup variable leaves it as it is, and the
+    // body of a menu entry runs only when the entry is booted.
+    #[test]
+    fn grub_cfg_reading_a_lookup_variable_before_blscfg_is_followed() {
+        for script in [
+            "if [ -z \"${blsdir}\" ]; then echo none; fi",
+            "echo $btrfs_relative_path ${btrfs_subvol}",
+            "menuentry 'other' {\n  set blsdir=/elsewhere\n}",
+        ] {
+            let top = scratch("phase-script-read");
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{script}\ninsmod blscfg\nblscfg\n"));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+            assert!(grub.is_ok(), "{script}: {:?}", grub.as_ref().err());
+            assert!(passes(&bls_entries(&grub.unwrap())), "{script}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // A command whose variable name, or whose command name, is the value of
+    // a variable can set any variable (script/execute.c, grub_script_execute_cmdline).
+    #[test]
+    fn grub_cfg_assigning_through_an_expansion_before_blscfg_cannot_be_verified() {
+        for line in ["set ${x}=/elsewhere", "${x}=/elsewhere", "unset $x", "search --fs-uuid --set=$x 3f2a9c41", "$cmd"] {
+            let top = scratch("phase-script-expansion");
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{line}\ninsmod blscfg\nblscfg\n"));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+            assert!(cannot_verify_naming(grub, line), "{line}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
     // load_env or source other than the generated header's and 01_users's
     // can set any variable.
     #[test]

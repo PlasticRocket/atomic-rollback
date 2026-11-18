@@ -19,6 +19,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use crate::platform::FEDORA as P;
+use crate::script;
 use crate::swap::{join_below, RenameExchange};
 use crate::tools;
 
@@ -551,53 +552,45 @@ const HEADER_LOAD_ENV: [&str; 3] = ["load_env -f ${config_directory}/grubenv", "
 /// 01_users's source of user.cfg, before blscfg (util/grub.d/01_users.in:4).
 const USERS_SOURCE: &str = "source ${prefix}/user.cfg";
 
-/// Commands that set variables check cannot see from their line: from a
-/// file (load_env, source) or from a string (eval).
-const LOADING_COMMANDS: [&str; 3] = ["load_env", "source", "eval"];
-
 /// Reads script, the text of the GRUB script file, up to its blscfg
 /// command, and says whether it sources user.cfg as 01_users generates it.
-/// check does not interpret GRUB script, so a line that names a lookup
-/// variable, or loads variables other than as the generated lines do, makes
-/// where GRUB looks the boot entries up unknown. generated says whether the
-/// generated lines may appear in file.
+/// A command that sets a lookup variable, or that can set any variable,
+/// such as a load of variables other than as the generated lines load them,
+/// makes where GRUB looks the boot entries up unknown, since check does not
+/// interpret GRUB script; a command that only reads one does not.
+/// generated says whether the generated lines may appear in file.
 fn script_before_blscfg(script: &str, file: &str, generated: bool) -> Result<bool, GrubContextError> {
     let mut sources_user_cfg = false;
-    for line in script.lines().map(str::trim) {
-        let command = line.split_whitespace().next().unwrap_or_default();
-        if command == "blscfg" {
-            break;
-        }
-        if command.is_empty() || command.starts_with('#') {
+    let mut reader = script::Reader::default();
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if generated && HEADER_LOAD_ENV.contains(&trimmed) {
             continue;
         }
-        if generated && HEADER_LOAD_ENV.contains(&line) {
-            continue;
-        }
-        if generated && line == USERS_SOURCE {
+        if generated && trimmed == USERS_SOURCE {
             sources_user_cfg = true;
             continue;
         }
-        if LOADING_COMMANDS.contains(&command) {
-            return Err(GrubContextError::CannotVerify(format!(
-                "{file} runs '{line}' before blscfg, which can set where GRUB looks the boot entries up, \
-                 and check does not interpret GRUB script")));
-        }
-        if let Some(variable) = LOOKUP_VARIABLES.into_iter().find(|variable| names_word(line, variable)) {
-            return Err(GrubContextError::CannotVerify(format!(
-                "{file} names {variable} before blscfg, and check does not interpret GRUB script")));
+        let commands = reader.line(line).map_err(|why| GrubContextError::CannotVerify(format!(
+            "{file} has the line '{trimmed}' before blscfg, which check cannot read: {why}")))?;
+        for command in commands {
+            if command.words.first().is_some_and(|w| w.is("blscfg")) {
+                return Ok(sources_user_cfg);
+            }
+            let names = match script::sets(&command.words) {
+                script::Sets::Names(names) => names,
+                script::Sets::Any => return Err(GrubContextError::CannotVerify(format!(
+                    "{file} runs '{}' before blscfg, which can set where GRUB looks the boot entries up, \
+                     and check does not interpret GRUB script", command.line.trim()))),
+            };
+            if let Some(variable) = LOOKUP_VARIABLES.into_iter().find(|v| names.iter().any(|n| n == v)) {
+                return Err(GrubContextError::CannotVerify(format!(
+                    "{file} sets {variable} before blscfg in '{}', and check does not interpret GRUB script",
+                    command.line.trim())));
+            }
         }
     }
     Ok(sources_user_cfg)
-}
-
-/// Whether line holds word with no letter, digit or '_' on either side.
-fn names_word(line: &str, word: &str) -> bool {
-    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    line.match_indices(word).any(|(at, _)| {
-        !line[..at].chars().next_back().is_some_and(is_name)
-            && !line[at + word.len()..].chars().next().is_some_and(is_name)
-    })
 }
 
 /// GRUB's starting lookup directory for each btrfs_relative_path setting,
