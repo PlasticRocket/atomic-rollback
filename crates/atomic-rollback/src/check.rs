@@ -803,7 +803,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let grub = btrfs_context(&top, false, "/root/boot/grub2");
 
         let results = bls_entries(&grub);
-        assert!(fails_with(&results, "`/boot/loader/entries'"), "{:?}", results);
+        assert!(fails_with(&results, "`/boot/loader/entries/'"), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
 
