@@ -28,27 +28,44 @@ pub enum BootStatus {
     Inaccessible { reason: String, hint: String },
 }
 
+/// What a group of checks found: the results its verdict rests on, what
+/// that verdict counted, and warnings, which do not decide it.
+#[derive(Default)]
+struct Group {
+    results: Vec<CheckResult>,
+    counted: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl From<Vec<CheckResult>> for Group {
+    fn from(results: Vec<CheckResult>) -> Self {
+        Group { results, ..Group::default() }
+    }
+}
+
 /// A failure in any group fails the boot chain. Otherwise a group check
 /// cannot verify leaves the boot chain unverified, since it may be valid.
-fn evaluate_checks(checks: Vec<(&str, Vec<CheckResult>)>) -> BootStatus {
+/// A warning makes a valid boot chain one with warnings.
+fn evaluate_checks(checks: Vec<(&str, Group)>) -> BootStatus {
     let mut all_failures = Vec::new();
     let mut all_unverified = Vec::new();
     let mut warned = false;
-    for (name, results) in &checks {
-        if results.is_empty() {
-            warned = true; // Check group handled its own WARN display
-            continue;
-        }
-        let failures: Vec<&String> = results.iter()
+    for (name, group) in &checks {
+        let failures: Vec<&String> = group.results.iter()
             .filter_map(|r| match r { Err(Finding::Fails(f)) => Some(f), _ => None }).collect();
-        let unverified: Vec<&String> = results.iter()
+        let unverified: Vec<&String> = group.results.iter()
             .filter_map(|r| match r { Err(Finding::CannotVerify(f)) => Some(f), _ => None }).collect();
         if !failures.is_empty() {
             println!("  FAIL  {name}");
         } else if !unverified.is_empty() {
             println!("  CANNOT VERIFY  {name}");
+        } else if !group.warnings.is_empty() {
+            println!("  WARN  {name}");
         } else {
             println!("  PASS  {name}");
+        }
+        for line in &group.counted {
+            println!("        {line}");
         }
         for f in &failures {
             println!("        {f}");
@@ -58,6 +75,10 @@ fn evaluate_checks(checks: Vec<(&str, Vec<CheckResult>)>) -> BootStatus {
             println!("        {f}");
             all_unverified.push(format!("{name}: {f}"));
         }
+        for warning in &group.warnings {
+            println!("        {warning}");
+        }
+        warned |= !group.warnings.is_empty();
     }
     if !all_failures.is_empty() {
         BootStatus::Fail(all_failures)
@@ -109,11 +130,11 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
 
     let blsdir = grub.blsdir();
     evaluate_checks(vec![
-        ("EFI boot files", check_esp(root)),
-        ("GRUB configuration", check_grub_config(root, &grub)),
+        ("EFI boot files", check_esp(root).into()),
+        ("GRUB configuration", check_grub_config(root, &grub).into()),
         ("Kernel boot entry", check_bls_entries(&grub, &blsdir)),
-        ("Root filesystem", check_root_mountable(root, &grub, &blsdir)),
-        ("System mounts", check_fstab_mounts(root)),
+        ("Root filesystem", check_root_mountable(root, &grub, &blsdir).into()),
+        ("System mounts", check_fstab_mounts(root).into()),
     ])
 }
 
@@ -133,10 +154,10 @@ pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> B
     let snapshot = toplevel.join(exchange.snapshot.as_str());
     let blsdir = grub.blsdir();
     evaluate_checks(vec![
-        ("GRUB configuration", check_grub_cfg(&grub, None)),
+        ("GRUB configuration", check_grub_cfg(&grub, None).into()),
         ("Kernel boot entry", check_bls_entries(&grub, &blsdir)),
-        ("Root filesystem", check_root_mountable(&snapshot, &grub, &blsdir)),
-        ("System mounts", check_fstab_mounts(&snapshot)),
+        ("Root filesystem", check_root_mountable(&snapshot, &grub, &blsdir).into()),
+        ("System mounts", check_fstab_mounts(&snapshot).into()),
     ])
 }
 
@@ -306,53 +327,86 @@ fn default_subvol_is_root(default_id: u64, root_subvol_name: &tools::SubvolName,
 
 // --- Kernel boot entry ---
 
+/// A menu entry blscfg adds, and whether GRUB finds its kernel and
+/// initramfs.
+struct MenuEntry {
+    conf: String,
+    item: menu::MenuItem,
+    verdict: CheckResult,
+}
+
+impl MenuEntry {
+    /// The entry as check's output names it: its title, its GRUB path and
+    /// its place in the menu.
+    fn describe(&self, index: usize) -> String {
+        format!("'{}' ('{}', entry {} of the menu)", self.item.title, self.conf, index + 1)
+    }
+}
+
 /// blsdir is the directory blscfg reads boot entries from, as
-/// GrubContext::blsdir finds it.
-fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Vec<CheckResult> {
+/// GrubContext::blsdir finds it. The verdict rests on the entry GRUB boots
+/// when no key is pressed: the one normal mode picks from default when the
+/// menu runs (grub-core/normal/menu.c, run_menu). Another menu entry that
+/// does not resolve is a warning.
+fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Group {
     let blsdir = match blsdir {
         Ok(dir) => dir,
-        Err(finding) => return vec![Err(finding.clone().map_fails(|e| format!("{e}. GRUB will show an empty menu.")))],
+        Err(finding) => return vec![Err(finding.clone().map_fails(|e| format!("{e}. GRUB will show an empty menu.")))].into(),
     };
 
     let entries = match blscfg_entries(grub, blsdir) {
         Ok(entries) => entries,
-        Err(finding) => return vec![Err(finding)],
+        Err(finding) => return vec![Err(finding)].into(),
     };
 
-    // Validate ALL entries, not just until the first valid one
-    let mut valid = 0;
-    let mut failures: Vec<String> = Vec::new();
-    let mut unverified: Vec<String> = Vec::new();
+    let mut menu = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
     let mut left_out: Vec<String> = Vec::new();
     for entry in &entries {
         let content = match &entry.content {
             Ok(content) => content,
             Err(e) => {
-                unverified.push(e.clone());
+                unread.push(e.clone());
                 continue;
             }
         };
-        // create_entry leaves an entry without linux out of the menu
-        // (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c).
+        // create_entry leaves an entry without linux out of the menu, and
+        // titles one without a title by its linux value (Fedora's grub2
+        // 2.12 patches, grub-core/commands/blscfg.c).
         let Some(linux) = parse::bls_field(content, "linux") else {
             left_out.push(format!("'{}', which has no linux line", entry.conf));
             continue;
         };
-        if menu::bls_menu_id(&entry.name).is_none() {
+        let Some(id) = menu::bls_menu_id(&entry.name) else {
             return vec![Err(format!(
                 "GRUB never shows its menu: blscfg's create_entry loops forever stripping \".conf\" from \
-                 the name of '{}', whose first \".conf\" is not its last. Rename the entry.", entry.conf).into())];
-        }
-        match validate_bls_entry(grub, &entry.conf, content, linux) {
-            Ok(()) => valid += 1,
-            Err(Finding::Fails(e)) => failures.push(e),
-            Err(Finding::CannotVerify(e)) => unverified.push(e),
-        }
+                 the name of '{}', whose first \".conf\" is not its last. Rename the entry.", entry.conf).into())].into();
+        };
+        menu.push(MenuEntry {
+            conf: entry.conf.clone(),
+            item: menu::MenuItem { id: id.to_string(), title: parse::bls_field(content, "title").unwrap_or(linux).to_string() },
+            verdict: validate_bls_entry(grub, &entry.conf, content, linux),
+        });
     }
 
-    let total = valid + failures.len() + unverified.len();
+    let not_booted_by_default = |picked: &[usize]| -> Vec<String> {
+        menu.iter().enumerate()
+            .filter(|(i, _)| !picked.contains(i))
+            .filter_map(|(i, entry)| entry.verdict.as_ref().err()
+                .map(|finding| format!("{}, which GRUB does not boot by default: {finding}", entry.describe(i))))
+            .collect()
+    };
 
-    if total == 0 {
+    if !unread.is_empty() {
+        // An entry check cannot read may stand anywhere in the menu.
+        return Group {
+            results: unread.into_iter().map(|e| Err(Finding::CannotVerify(e))).collect(),
+            warnings: not_booted_by_default(&[]),
+            ..Group::default()
+        };
+    }
+
+    if menu.is_empty() {
         let left_out = if left_out.is_empty() { String::new() } else {
             format!(" blscfg leaves out {}.", left_out.join("; "))
         };
@@ -360,36 +414,62 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Ve
             "No boot entries found in '{}'.{left_out} \
              GRUB will show an empty menu with no kernels to boot. \
              Reinstall the kernel: sudo dnf reinstall kernel-core",
-            blsdir.grub_path).into())];
+            blsdir.grub_path).into())].into();
     }
 
-    if valid == total {
-        return vec![Ok(())];
-    }
-
-    if valid > 0 {
-        // System boots but some entries are broken or unverified. WARN,
-        // not PASS. Print here; return empty so evaluate_checks skips this
-        // group.
-        println!("  WARN  Kernel boot entry ({valid} of {total} valid)");
-        for f in failures.iter().chain(&unverified) {
-            println!("        {f}");
+    let config = &grub.menu;
+    let items: Vec<menu::MenuItem> = menu.iter().map(|entry| entry.item.clone()).collect();
+    let (picks, chosen) = match &config.default {
+        Ok(default) => (
+            menu::default_picks(default.as_ref().map(|d| d.value.as_str()), &items, &config.added),
+            match default {
+                Some(d) => format!("default is '{}' (from {})", d.value, d.origin),
+                None => "default is unset".to_string(),
+            },
+        ),
+        Err(why) => {
+            let mut picks: Vec<menu::Pick> = (0..menu.len()).map(menu::Pick::Bls).collect();
+            if !config.added.entries.is_empty() {
+                picks.push(menu::Pick::Added);
+            }
+            (picks, format!("check cannot tell default: {why}"))
         }
-        return vec![];
-    }
+    };
+    let picked: Vec<usize> = picks.iter().filter_map(|pick| match pick {
+        menu::Pick::Bls(i) => Some(*i),
+        menu::Pick::Added => None,
+    }).collect();
+    let warnings = not_booted_by_default(&picked);
+    let verdict = |results: Vec<CheckResult>, counted: Vec<String>| Group { results, counted, warnings: warnings.clone() };
 
-    // No entry is valid, but one check cannot verify may be: whether GRUB
-    // boots is unknown, and the broken entries are listed with it.
-    if !unverified.is_empty() {
-        return unverified.into_iter().chain(failures).map(|e| Err(Finding::CannotVerify(e))).collect();
+    if picks.contains(&menu::Pick::Added) {
+        return verdict(vec![Err(Finding::CannotVerify(format!(
+            "GRUB may boot by default an entry grub.cfg adds after the boot entries, which check does not verify: \
+             {chosen}.")))], vec![]);
     }
+    let booted = match picked.as_slice() {
+        [one] => format!("GRUB boots {} when no key is pressed", menu[*one].describe(*one)),
+        several => format!("GRUB boots one of {} when no key is pressed",
+            several.iter().map(|&i| menu[i].describe(i)).collect::<Vec<_>>().join(", ")),
+    };
+    let findings: Vec<&Finding> = picked.iter().filter_map(|&i| menu[i].verdict.as_ref().err()).collect();
 
-    let mut results: Vec<CheckResult> = failures.into_iter().map(|e| Err(Finding::Fails(e))).collect();
-    results.push(Err(
-        "No boot entry has a valid kernel, initramfs, and root parameter. \
-         The system cannot boot. \
-         Rebuild the boot entry: sudo kernel-install add $(uname -r) /lib/modules/$(uname -r)/vmlinuz".to_string().into()));
-    results
+    if findings.is_empty() {
+        return verdict(vec![Ok(())], vec![format!(
+            "{booted}: {chosen}. GRUB finds its kernel and initramfs. \
+             check does not count the menu's timeout or a password the entry needs.")]);
+    }
+    let detail = findings.iter().map(|finding| finding.message()).collect::<Vec<_>>().join(" ");
+    if findings.len() == picked.len() && findings.iter().all(|finding| matches!(finding, Finding::Fails(_))) {
+        if let Some(fallback) = &config.fallback {
+            return verdict(vec![Err(Finding::CannotVerify(format!(
+                "{booted}: {chosen}. {detail} GRUB then tries the entries fallback names ({fallback}), \
+                 which check does not follow.")))], vec![]);
+        }
+        return verdict(vec![Err(Finding::Fails(format!(
+            "{booted}: {chosen}. {detail}")))], vec![]);
+    }
+    verdict(vec![Err(Finding::CannotVerify(format!("{booted}: {chosen}. {detail}")))], vec![])
 }
 
 /// The files in blsdir whose names blscfg reads as boot entries, each as
@@ -909,7 +989,7 @@ fi
     }
 
     fn bls_entries(grub: &GrubContext) -> Vec<CheckResult> {
-        check_bls_entries(grub, &grub.blsdir())
+        check_bls_entries(grub, &grub.blsdir()).results
     }
 
     fn validate(grub: &GrubContext, conf: &str) -> CheckResult {
@@ -1538,6 +1618,229 @@ fi
         fs::remove_dir_all(&top).unwrap();
     }
 
+    // --- the entry GRUB boots without a key press ---
+
+    /// An older kernel than KVER, whose entry blscfg lists second and whose
+    /// kernel and initramfs the layouts here do not hold.
+    const OLDER: &str = "6.18.1-100.fc45.x86_64";
+
+    fn older_entry() -> String {
+        bls_entry(&format!("/root/boot/vmlinuz-{OLDER}"), &[&format!("/root/boot/initramfs-{OLDER}.img")])
+            .replace(&format!("({KVER})"), &format!("({OLDER})"))
+    }
+
+    /// Fedora's generated grub.cfg with GRUB_DEFAULT written as grub_default
+    /// over the root subvolume holding KVER's entry and the broken entry of
+    /// OLDER, with the grubenv variables vars.
+    fn two_kernels(name: &str, grub_default: &str, vars: &str) -> (PathBuf, GrubContext) {
+        let top = scratch(name);
+        install_subvol(&top, "root", &format!("{BLSDIR_TOP_LEVEL}{vars}"), &entry_from_top_level());
+        put(&top.join(format!("root/boot/loader/entries/{OLDER}.conf")), &older_entry());
+        put(&top.join("root/boot/grub2/grub.cfg"),
+            &GENERATED_GRUB_CFG.replace("set default=\"${saved_entry}\"", &format!("set default=\"{grub_default}\"")));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        (top, grub)
+    }
+
+    fn kernel_entry_status(grub: &GrubContext) -> BootStatus {
+        evaluate_checks(vec![("Kernel boot entry", check_bls_entries(grub, &grub.blsdir()))])
+    }
+
+    fn fails_naming(status: BootStatus, needle: &str) -> bool {
+        matches!(status, BootStatus::Fail(failures) if failures.iter().any(|f| f.contains(needle)))
+    }
+
+    fn cannot_verify(status: BootStatus, needle: &str) -> bool {
+        matches!(status, BootStatus::Inaccessible { reason, .. } if reason.contains(needle))
+    }
+
+    // run_menu boots entry get_entry_number(default), the first when that
+    // is no entry (grub-core/normal/menu.c), and 00_header sets default to
+    // saved_entry (util/grub.d/00_header.in:92-103): a broken default entry
+    // beside a working one leaves the machine unable to boot unattended.
+    #[test]
+    fn a_broken_default_entry_fails_beside_a_working_one() {
+        let (top, grub) = two_kernels("default-broken", "${saved_entry}", &format!("saved_entry={OLDER}\n"));
+        assert!(fails_naming(kernel_entry_status(&grub), &format!("`/root/boot/vmlinuz-{OLDER}'")));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // blscfg lists KVER first, so a default that names no entry, or is
+    // unset, boots it.
+    #[test]
+    fn a_working_default_entry_passes_with_a_warning_for_a_broken_one() {
+        for vars in [format!("saved_entry={KVER}\n"), String::new(), "saved_entry=gone-6.1.0\n".to_string()] {
+            let (top, grub) = two_kernels("default-works", "${saved_entry}", &vars);
+            assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn), "{vars}");
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // GRUB_DEFAULT=1 names the second entry by its place in the menu.
+    #[test]
+    fn a_default_by_number_fails_on_the_broken_entry_it_names() {
+        let (top, grub) = two_kernels("default-number", "1", "");
+        assert!(fails_naming(kernel_entry_status(&grub), OLDER));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // next_entry, set by grub2-reboot, wins over saved_entry for one boot
+    // (00_header.in:92-93).
+    #[test]
+    fn next_entry_decides_the_default_entry() {
+        let (top, grub) = two_kernels("default-next", "${saved_entry}", &format!("saved_entry={KVER}\nnext_entry={OLDER}\n"));
+        assert!(fails_naming(kernel_entry_status(&grub), OLDER));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // 08_fallback_counting sets default to 1 when boot_counter has run out
+    // and the last boot did not succeed (08_fallback_counting.in:12-16).
+    #[test]
+    fn the_boot_counter_decides_the_default_entry_when_it_runs_out() {
+        let (top, grub) = two_kernels("default-counter", "${saved_entry}",
+            &format!("saved_entry={KVER}\nboot_counter=0\nboot_success=0\n"));
+        assert!(fails_naming(kernel_entry_status(&grub), OLDER));
+        fs::remove_dir_all(&top).unwrap();
+
+        let (top, grub) = two_kernels("default-counter-success", "${saved_entry}",
+            &format!("saved_entry={KVER}\nboot_counter=0\nboot_success=1\n"));
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // When the default entry fails, GRUB tries the entries fallback names
+    // (grub-core/normal/menu.c, grub_menu_execute_with_fallback), which
+    // check does not follow.
+    #[test]
+    fn a_broken_default_entry_with_fallback_set_cannot_be_verified() {
+        let (top, grub) = two_kernels("default-fallback", "${saved_entry}", &format!("saved_entry={OLDER}\nfallback=0\n"));
+        assert!(cannot_verify(kernel_entry_status(&grub), "fallback"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // 30_uefi-firmware adds its entry only where fwsetup is supported
+    // (util/grub.d/30_uefi-firmware.in:34-40), so a default naming it boots
+    // that entry or, without it, the first.
+    #[test]
+    fn a_default_naming_an_entry_grub_cfg_adds_cannot_be_verified() {
+        let (top, grub) = two_kernels("default-firmware", "uefi-firmware", "");
+        assert!(cannot_verify(kernel_entry_status(&grub), "uefi-firmware"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The verdict says which entry it counted, why GRUB boots it, and what
+    // it does not count.
+    #[test]
+    fn the_verdict_states_the_entry_it_counted() {
+        let (top, grub) = two_kernels("default-counted", "${saved_entry}", &format!("saved_entry={KVER}\n"));
+        let group = check_bls_entries(&grub, &grub.blsdir());
+        let counted = group.counted.join(" ");
+        assert!(counted.contains(&format!("GRUB boots 'Fedora Linux ({KVER})'")), "{counted}");
+        assert!(counted.contains("when no key is pressed"), "{counted}");
+        assert!(counted.contains(&format!("default is '{KVER}' (from saved_entry in grubenv)")), "{counted}");
+        assert!(counted.contains("does not count the menu's timeout"), "{counted}");
+        assert!(group.warnings.iter().any(|w| w.contains(OLDER) && w.contains("does not boot by default")), "{:?}", group.warnings);
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // grub_normal_add_menu_entry adds each entry at the end of the menu
+    // (grub-core/commands/menuentry.c), so an entry grub.cfg defines before
+    // blscfg stands ahead of the boot entries.
+    #[test]
+    fn a_menu_entry_before_blscfg_cannot_be_verified() {
+        let (top, grub) = two_kernels("default-entry-before", "${saved_entry}", &format!("saved_entry={KVER}\n"));
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
+        put(&top.join("root/boot/grub2/grub.cfg"), &GENERATED_GRUB_CFG.replace("insmod blscfg\nblscfg\n",
+            "menuentry 'Other' {\n  chainloader /EFI/other.efi\n}\ninsmod blscfg\nblscfg\n"));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(cannot_verify(kernel_entry_status(&grub), "grub.cfg adds a menu entry before blscfg"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    /// The entry os-prober writes for Windows after the boot entries
+    /// (util/grub.d/30_os-prober.in), with a synthetic id.
+    const OS_PROBER_ENTRY: &str = "\
+menuentry 'Windows Boot Manager (on /dev/nvme0n1p1)' --class windows --class os $menuentry_id_option 'osprober-efi-0A1B-2C3D' {
+\tinsmod part_gpt
+\tchainloader /EFI/Microsoft/Boot/bootmgfw.efi
+}
+";
+
+    // An entry grub.cfg adds after blscfg on every run is in the menu, with
+    // the id after --id (00_header.in:108-112 sets menuentry_id_option).
+    #[test]
+    fn a_default_naming_an_entry_grub_cfg_always_adds_cannot_be_verified() {
+        for (grub_default, by_default) in [("osprober-efi-0A1B-2C3D", false), ("Windows Boot Manager (on /dev/nvme0n1p1)", false), ("2", false), ("0", true)] {
+            let top = scratch("default-os-prober");
+            install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+            put(&top.join(format!("root/boot/loader/entries/{OLDER}.conf")), &older_entry());
+            put(&top.join("root/boot/grub2/grub.cfg"), &format!("{}{OS_PROBER_ENTRY}",
+                GENERATED_GRUB_CFG.replace("set default=\"${saved_entry}\"", &format!("set default=\"{grub_default}\""))));
+            let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+            let status = kernel_entry_status(&grub);
+            if by_default {
+                assert!(matches!(status, BootStatus::Warn), "{grub_default}");
+            } else {
+                assert!(cannot_verify(status, "an entry grub.cfg adds"), "{grub_default}");
+            }
+            fs::remove_dir_all(&top).unwrap();
+        }
+    }
+
+    // user.cfg runs after 00_header sets default (01_users.in:3-4), so it
+    // can set default to anything: GRUB boots any entry of the menu, which
+    // in Fedora's grub.cfg may hold the UEFI firmware entry.
+    #[test]
+    fn user_cfg_setting_default_leaves_any_menu_entry_the_default() {
+        let (top, grub) = two_kernels("default-user-cfg", "${saved_entry}", &format!("saved_entry={KVER}\n"));
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Warn));
+        put(&top.join("root/boot/grub2/user.cfg"), "set default=1\n");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(cannot_verify(kernel_entry_status(&grub), "user.cfg sets default"));
+
+        // A menu of boot entries that all resolve boots one that resolves.
+        fs::remove_file(top.join(format!("root/boot/loader/entries/{OLDER}.conf"))).unwrap();
+        put(&top.join("root/boot/grub2/grub.cfg"),
+            &format!("{LOAD_GRUBENV}source ${{prefix}}/user.cfg\n{SEARCH_ROOT}insmod blscfg\nblscfg\n"));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        assert!(matches!(kernel_entry_status(&grub), BootStatus::Pass));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // A group with nothing to check passes; it is no warning.
+    #[test]
+    fn a_group_with_no_results_passes() {
+        assert!(matches!(evaluate_checks(vec![("System mounts", Vec::new().into())]), BootStatus::Pass));
+    }
+
+    // When check cannot verify the default entry, a broken entry beside it
+    // is reported as broken, not as one check cannot verify.
+    #[test]
+    fn a_broken_entry_beside_a_default_check_cannot_verify_is_not_reported_as_unverified() {
+        let (top, _) = generated_layout("default-unverified", &format!("{BLSDIR_TOP_LEVEL}saved_entry={KVER}\n"),
+            &bls_entry(&format!("/root/locked/vmlinuz-{KVER}"), &[&format!("/root/boot/initramfs-{KVER}.img")]));
+        put(&top.join(format!("root/boot/loader/entries/{OLDER}.conf")), &older_entry());
+        put(&top.join(format!("root/locked/vmlinuz-{KVER}")), "kernel");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let locked = top.join("root/locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::symlink_metadata(locked.join(format!("vmlinuz-{KVER}"))).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: this process reads directories without permission");
+            return;
+        }
+        let status = kernel_entry_status(&grub);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        match status {
+            BootStatus::Inaccessible { reason, .. } => {
+                assert!(reason.contains("ermission denied") && !reason.contains(OLDER), "{reason}");
+            }
+            _ => panic!("not reported as unverified"),
+        }
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // grub.cfg loads grubenv before blscfg, and GRUB's Btrfs driver reads
     // btrfs_relative_path at each mount (btrfs.c, grub_btrfs_mount and
     // find_path): grub.cfg is looked up from the top level, as the stub
@@ -1749,13 +2052,13 @@ fi
     // GRUB sets a variable only through a command that assigns it
     // (kern/corecmd.c, set and unset; script/execute.c, NAME=VALUE), so a
     // line that only expands a lookup variable leaves it as it is, and the
-    // body of a menu entry runs only when the entry is booted.
+    // body of a function runs only when it is called.
     #[test]
     fn grub_cfg_reading_a_lookup_variable_before_blscfg_is_followed() {
         for script in [
             "if [ -z \"${blsdir}\" ]; then echo none; fi",
             "echo $btrfs_relative_path ${btrfs_subvol}",
-            "menuentry 'other' {\n  set blsdir=/elsewhere\n}",
+            "function elsewhere {\n  set blsdir=/elsewhere\n}",
         ] {
             let top = scratch("phase-script-read");
             install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
@@ -2006,7 +2309,7 @@ fi
             return;
         }
 
-        let status = evaluate_checks(vec![("Kernel boot entry", bls_entries(&grub))]);
+        let status = evaluate_checks(vec![("Kernel boot entry", check_bls_entries(&grub, &grub.blsdir()))]);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         match status {
             BootStatus::Inaccessible { reason, .. } => {

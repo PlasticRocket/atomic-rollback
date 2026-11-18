@@ -1,6 +1,9 @@
 //! GRUB's boot menu: the entries Fedora's blscfg adds from the BLS
 //! directory and the order it adds them in (Fedora's grub2 2.12 patches,
-//! grub-core/commands/blscfg.c).
+//! grub-core/commands/blscfg.c), and the entry normal mode boots when no
+//! key is pressed (grub-core/normal/menu.c, run_menu).
+
+use crate::grub::{grub_strtoull, is_grub_space, BASE_FROM_PREFIX};
 
 /// rpm's version comparison as blscfg.c carries it (vercmp): 1 when a is
 /// newer, -1 when b is, 0 when they compare the same. Separators other
@@ -171,6 +174,148 @@ pub fn bls_menu_id(name: &str) -> Option<&str> {
     }
 }
 
+/// menuentry_eq (normal/menu.c): whether spec names the menu entry whose
+/// id or title is id. A '>' in spec ends the part naming an entry, and '>>'
+/// stands for '>'; with limit, spec may go on after limit bytes with a
+/// space.
+fn menuentry_eq(id: &[u8], spec: &[u8], limit: Option<usize>) -> bool {
+    let at = |s: &[u8], i: usize| s.get(i).copied().unwrap_or(0);
+    let (mut p1, mut p2) = (0, 0);
+    while limit.is_none_or(|l| p1 <= l) {
+        if at(spec, p2) == b'>' && at(spec, p2 + 1) != b'>' {
+            return at(id, p1) == 0 && p2 != 0;
+        }
+        if at(spec, p2) == b'>' {
+            p2 += 1;
+        }
+        if at(id, p1) != at(spec, p2) {
+            // menu.c returns p1 - 1 here, which is true unless p1 is 1.
+            return limit == Some(p1) && at(id, p1) == 0 && is_grub_space(at(spec, p2)) && p1 != 1;
+        }
+        if at(id, p1) == 0 {
+            return p1 != 0;
+        }
+        p1 += 1;
+        p2 += 1;
+    }
+    false
+}
+
+/// An entry of the menu, as menu.c matches default against it.
+#[derive(Debug, Clone)]
+pub struct MenuItem {
+    pub id: String,
+    pub title: String,
+}
+
+/// An entry a script adds after blscfg: its id and title where check can
+/// read them from the menuentry line, and whether it is added on every
+/// run, not inside a condition or loop.
+#[derive(Debug, Clone)]
+pub struct AddedEntry {
+    pub id: Option<String>,
+    pub title: Option<String>,
+    pub certain: bool,
+}
+
+/// The entries scripts add after blscfg, in order. countable is false
+/// when one is added inside a loop, any number of times.
+#[derive(Debug, Clone)]
+pub struct AddedEntries {
+    pub entries: Vec<AddedEntry>,
+    pub countable: bool,
+}
+
+/// An entry normal mode may boot by default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Pick {
+    /// The entry at this index among the entries blscfg adds, which come
+    /// first in the menu.
+    Bls(usize),
+    /// An entry a script adds after blscfg.
+    Added,
+}
+
+/// Whether an entry check reads only in part matches: Some(answer), or
+/// None when it cannot tell.
+fn matches(text: Option<&str>, spec: &[u8], limit: Option<usize>) -> Option<bool> {
+    text.map(|text| menuentry_eq(text.as_bytes(), spec, limit))
+}
+
+/// The entries normal mode may boot without a key press, given default,
+/// the default variable when the menu runs, over a menu of bls followed by
+/// added (normal/menu.c). run_menu boots entry get_entry_number(default),
+/// or the first entry when that is negative or past the menu's end.
+/// get_entry_number_helper matches default's first word against each
+/// entry's id, then all of default against each title, then reads it as a
+/// number (grub_strtoul with base 0, taken as an int); get_entry_number
+/// refuses anything after an id or a number. More than one pick means the
+/// added entries' presence or names decide; bls holds at least one entry.
+pub fn default_picks(default: Option<&str>, bls: &[MenuItem], added: &AddedEntries) -> Vec<Pick> {
+    let first = Pick::Bls(0);
+    let Some(spec) = default.map(str::as_bytes) else {
+        return vec![first];
+    };
+    let mut picks: Vec<Pick> = Vec::new();
+    fn pick(picks: &mut Vec<Pick>, p: Pick) {
+        if !picks.contains(&p) {
+            picks.push(p);
+        }
+    }
+
+    let word = spec.iter().position(|&c| is_grub_space(c)).unwrap_or(spec.len());
+    let by_id = |entry: Pick| if word == spec.len() { entry } else { first };
+    if let Some(i) = bls.iter().position(|e| menuentry_eq(e.id.as_bytes(), spec, Some(word))) {
+        return vec![by_id(Pick::Bls(i))];
+    }
+    for entry in &added.entries {
+        match matches(entry.id.as_deref(), spec, Some(word)) {
+            Some(false) => {}
+            found => {
+                pick(&mut picks, by_id(Pick::Added));
+                if found == Some(true) && entry.certain {
+                    return picks;
+                }
+            }
+        }
+    }
+
+    if let Some(i) = bls.iter().position(|e| menuentry_eq(e.title.as_bytes(), spec, None)) {
+        pick(&mut picks, Pick::Bls(i));
+        return picks;
+    }
+    for entry in &added.entries {
+        match matches(entry.title.as_deref(), spec, None) {
+            Some(false) => {}
+            found => {
+                pick(&mut picks, Pick::Added);
+                if found == Some(true) && entry.certain {
+                    return picks;
+                }
+            }
+        }
+    }
+
+    let mut end = 0;
+    let index = match grub_strtoull(spec, &mut end, BASE_FROM_PREFIX) {
+        // (int) of the unsigned long: its low 32 bits.
+        Some(number) if end == spec.len() => i64::from(number as u32 as i32),
+        _ => -1,
+    };
+    let certain_size = bls.len() + added.entries.iter().filter(|e| e.certain).count();
+    let largest_size = bls.len() + added.entries.len();
+    match usize::try_from(index) {
+        Ok(i) if i < bls.len() => pick(&mut picks, Pick::Bls(i)),
+        Ok(i) if i < certain_size => pick(&mut picks, Pick::Added),
+        Ok(i) if i < largest_size || !added.countable => {
+            pick(&mut picks, Pick::Added);
+            pick(&mut picks, first);
+        }
+        _ => pick(&mut picks, first),
+    }
+    picks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +366,57 @@ mod tests {
         assert_eq!(bls_menu_id("abc.conf"), Some("abc"));
         assert_eq!(bls_menu_id("abc.confx"), None);
         assert_eq!(bls_menu_id("a.conf.conf"), None);
+    }
+
+    fn items(ids_titles: &[(&str, &str)]) -> Vec<MenuItem> {
+        ids_titles.iter().map(|(id, title)| MenuItem { id: id.to_string(), title: title.to_string() }).collect()
+    }
+
+    fn none_added() -> AddedEntries {
+        AddedEntries { entries: Vec::new(), countable: true }
+    }
+
+    fn firmware(certain: bool) -> AddedEntries {
+        AddedEntries {
+            entries: vec![AddedEntry {
+                id: Some("uefi-firmware".into()),
+                title: Some("UEFI Firmware Settings".into()),
+                certain,
+            }],
+            countable: true,
+        }
+    }
+
+    // normal/menu.c, get_entry_number_helper and run_menu.
+    #[test]
+    fn default_is_matched_by_id_then_title_then_number() {
+        let bls = items(&[("k7", "Fedora 7"), ("k6", "Fedora 6"), ("rescue", "Rescue")]);
+        let picks = |default: Option<&str>| default_picks(default, &bls, &firmware(false));
+        assert_eq!(picks(None), vec![Pick::Bls(0)]);
+        assert_eq!(picks(Some("k6")), vec![Pick::Bls(1)]);
+        assert_eq!(picks(Some("Rescue")), vec![Pick::Bls(2)]);
+        assert_eq!(picks(Some("2")), vec![Pick::Bls(2)]);
+        assert_eq!(picks(Some("0x1")), vec![Pick::Bls(1)]);
+        // A saved entry whose file is gone matches nothing.
+        assert_eq!(picks(Some("k5")), vec![Pick::Bls(0)]);
+        assert_eq!(picks(Some("")), vec![Pick::Bls(0)]);
+        // Anything after the id or the number refuses it.
+        assert_eq!(picks(Some("k6 extra")), vec![Pick::Bls(0)]);
+        assert_eq!(picks(Some("1 ")), vec![Pick::Bls(0)]);
+        // A submenu path names its first entry.
+        assert_eq!(picks(Some("k6>anything")), vec![Pick::Bls(1)]);
+        // An int: 2^32 + 1 is 1.
+        assert_eq!(picks(Some("4294967297")), vec![Pick::Bls(1)]);
+    }
+
+    #[test]
+    fn default_past_the_boot_entries_depends_on_the_added_entries() {
+        let bls = items(&[("k7", "Fedora 7")]);
+        assert_eq!(default_picks(Some("uefi-firmware"), &bls, &firmware(true)), vec![Pick::Added]);
+        assert_eq!(default_picks(Some("uefi-firmware"), &bls, &firmware(false)), vec![Pick::Added, Pick::Bls(0)]);
+        assert_eq!(default_picks(Some("1"), &bls, &firmware(true)), vec![Pick::Added]);
+        assert_eq!(default_picks(Some("1"), &bls, &firmware(false)), vec![Pick::Added, Pick::Bls(0)]);
+        assert_eq!(default_picks(Some("2"), &bls, &firmware(false)), vec![Pick::Bls(0)]);
+        assert_eq!(default_picks(Some("1"), &bls, &none_added()), vec![Pick::Bls(0)]);
     }
 }

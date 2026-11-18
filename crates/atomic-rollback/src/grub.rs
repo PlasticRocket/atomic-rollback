@@ -18,6 +18,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use crate::menu;
 use crate::platform::FEDORA as P;
 use crate::script;
 use crate::swap::{join_below, RenameExchange};
@@ -437,6 +438,8 @@ pub struct GrubContext {
     /// The GRUB directory the ESP stub sets $prefix to (gen_grub_cfgstub's
     /// GRUB_DIR). GRUB loads grub.cfg and grubenv from it.
     grub_dir: String,
+    /// What grub.cfg leaves for the menu.
+    pub menu: MenuConfig,
     // Never read directly. Present so that a mount made for the check is
     // unmounted when GrubContext is dropped (Rust Drop convention).
     _mount: Option<tools::MountPoint>,
@@ -466,7 +469,7 @@ fn reject_btrfs_subvol_variables(variables: &GrubVariables, fstype: &tools::FsTy
     if *fstype != tools::FsType::Btrfs || !variables.btrfs_relative() {
         return Ok(());
     }
-    match variables.btrfs_subvol {
+    match &variables.btrfs_subvol {
         Some((name, source)) => Err(format!(
             "{source} sets {name}, which neither Fedora nor atomic-rollback writes, \
              while btrfs_relative_path is set. check cannot tell which subvolume GRUB resolves paths from")),
@@ -482,6 +485,19 @@ const LOOKUP_VARIABLES: [&str; 4] = ["btrfs_relative_path", "btrfs_subvol", "btr
 /// block, read from the device in dev, and prefix the directory of user.cfg
 /// (util/grub.d/00_header.in:62-70, util/grub.d/01_users.in:3-4).
 const LOADING_VARIABLES: [&str; 3] = ["env_block", "dev", "prefix"];
+
+/// The variables that decide the entry GRUB boots without a key press:
+/// default, which 00_header sets from next_entry or saved_entry
+/// (util/grub.d/00_header.in:92-103) and 08_fallback_counting from
+/// boot_counter and boot_success (08_fallback_counting.in:12-16), fallback,
+/// which names the entries GRUB tries when that one fails
+/// (grub-core/normal/menu.c, grub_menu_execute_with_fallback), and
+/// feature_menuentry_id and menuentry_id_option, which decide how a menu
+/// entry grub.cfg defines names its id (00_header.in:108-112).
+const MENU_VARIABLES: [&str; 8] = [
+    "default", "next_entry", "saved_entry", "boot_counter", "boot_success", "fallback",
+    "feature_menuentry_id", "menuentry_id_option",
+];
 
 /// Where an assignment check follows was made.
 const GRUB_ENV: &str = "the GRUB_ENV EFI variable";
@@ -522,13 +538,13 @@ fn read_grub_env_variable(dir: &Path) -> Result<Option<Vec<u8>>, GrubContextErro
 /// unless grub.cfg makes another.
 #[derive(Default)]
 struct GrubVariables {
-    values: HashMap<&'static str, (String, &'static str)>,
+    values: HashMap<&'static str, (String, String)>,
     /// The variable that points GRUB's Btrfs driver at a subvolume, and
     /// where it was set: btrfs_subvol naming one, or btrfs_subvolid other
     /// than 0. Setting either replaces the other (Fedora's grub2 2.12
     /// patches, grub-core/fs/btrfs.c, subvol_set_env and subvolid_set_env).
     /// Neither Fedora's gen_grub_cfgstub nor migrate sets either.
-    btrfs_subvol: Option<(&'static str, &'static str)>,
+    btrfs_subvol: Option<(&'static str, String)>,
     root: Root,
 }
 
@@ -587,7 +603,7 @@ impl GrubVariables {
     /// contract values, so an earlier value of either does not hold.
     fn apply_stub(&mut self, stub_text: &str) {
         for line in tools::before_configfile(stub_text) {
-            for name in LOOKUP_VARIABLES.into_iter().chain(["env_block"]) {
+            for name in LOOKUP_VARIABLES.into_iter().chain(["env_block"]).chain(MENU_VARIABLES) {
                 if let Some(value) = tools::grub_assignment(line, name) {
                     self.assign(name, value.to_string(), ESP_STUB);
                 }
@@ -608,18 +624,22 @@ impl GrubVariables {
     /// (grub-core/kern/env.c, grub_register_variable_hook), so GRUB_ENV's
     /// values of those point the driver at no subvolume. GRUB then sets root
     /// to the device it started from (grub-core/kern/main.c,
-    /// grub_set_prefix_and_root), so GRUB_ENV's root does not hold either.
+    /// grub_set_prefix_and_root), so GRUB_ENV's root does not hold either,
+    /// and normal mode sets feature_menuentry_id to "y" when it starts
+    /// (grub-core/normal/main.c, GRUB_MOD_INIT).
     fn load_grub_env(&mut self, data: &[u8]) -> Result<(), GrubContextError> {
         for (name, value) in envblk_iterate(data) {
-            let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).find(|n| n.as_bytes() == name) else {
+            let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES)
+                .chain(MENU_VARIABLES.into_iter().filter(|&n| n != "feature_menuentry_id"))
+                .find(|n| n.as_bytes() == name) else {
                 continue;
             };
             if name == "btrfs_subvol" || name == "btrfs_subvolid" {
                 continue;
             }
             let value = String::from_utf8(value).map_err(|_| GrubContextError::CannotVerify(format!(
-                "{GRUB_ENV} sets {name} to bytes that are not UTF-8, which check does not look up")))?;
-            self.values.insert(name, (value, GRUB_ENV));
+                "{GRUB_ENV} sets {name} to bytes that are not UTF-8, which check does not read")))?;
+            self.values.insert(name, (value, GRUB_ENV.to_string()));
         }
         Ok(())
     }
@@ -632,37 +652,40 @@ impl GrubVariables {
     /// as grub_strtoull reads decimal digits, empty is 0, 0 names none, and
     /// a value that is no number is refused, which leaves the variable as it
     /// was.
-    fn assign(&mut self, name: &'static str, value: String, source: &'static str) {
+    fn assign(&mut self, name: &'static str, value: String, source: &str) {
         match name {
             "root" => self.root = Root::Other(format!("{source} sets root")),
-            "btrfs_subvol" => self.btrfs_subvol = (!value.is_empty()).then_some((name, source)),
+            "btrfs_subvol" => self.btrfs_subvol = (!value.is_empty()).then(|| (name, source.to_string())),
             "btrfs_subvolid" => {
                 let id = if value.is_empty() { Some(0) } else { grub_strtoull(value.as_bytes(), &mut 0, DECIMAL) };
                 match id {
                     None => return,
                     Some(0) => self.btrfs_subvol = None,
-                    Some(_) => self.btrfs_subvol = Some((name, source)),
+                    Some(_) => self.btrfs_subvol = Some((name, source.to_string())),
                 }
             }
             _ => {}
         }
-        self.values.insert(name, (value, source));
+        self.values.insert(name, (value, source.to_string()));
     }
 
     /// Makes the assignments load_env makes from the environment block
     /// block, read from source (grub-core/commands/loadenv.c,
-    /// grub_cmd_load_env). A block GRUB refuses sets nothing.
-    fn load(&mut self, block: &[u8], source: &'static str) -> Result<(), GrubContextError> {
+    /// grub_cmd_load_env), and returns the names it set. A block GRUB
+    /// refuses sets nothing.
+    fn load(&mut self, block: &[u8], source: &str) -> Result<Vec<&'static str>, GrubContextError> {
+        let mut set = Vec::new();
         for (name, value) in envblk_assignments(block).unwrap_or_default() {
-            let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).chain(["root"])
+            let Some(name) = LOOKUP_VARIABLES.into_iter().chain(LOADING_VARIABLES).chain(["root"]).chain(MENU_VARIABLES)
                 .find(|n| n.as_bytes() == name) else {
                 continue;
             };
             let value = String::from_utf8(value).map_err(|_| GrubContextError::CannotVerify(format!(
-                "{source} sets {name} to bytes that are not UTF-8, which check does not look up")))?;
+                "{source} sets {name} to bytes that are not UTF-8, which check does not read")))?;
             self.assign(name, value, source);
+            set.push(name);
         }
-        Ok(())
+        Ok(set)
     }
 
     fn get(&self, name: &str) -> Option<&str> {
@@ -670,8 +693,8 @@ impl GrubVariables {
     }
 
     /// Where the assignment name holds was made.
-    fn source(&self, name: &str) -> Option<&'static str> {
-        self.values.get(name).map(|&(_, source)| source)
+    fn source(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(|(_, source)| source.as_str())
     }
 
     fn btrfs_relative(&self) -> bool {
@@ -694,6 +717,15 @@ enum Step {
     /// 41_custom's source of custom.cfg from config_directory, which is the
     /// GRUB directory, when it is a file there (util/grub.d/41_custom.in:3-4).
     SourceCustomCfg,
+    /// 00_header's choice of default: next_entry when it is not empty, else
+    /// GRUB_DEFAULT as grub2-mkconfig wrote it (util/grub.d/00_header.in:92-103).
+    SetDefault(GrubDefault),
+    /// 00_header's choice of menuentry_id_option: "--id" when
+    /// feature_menuentry_id is "y", else empty (00_header.in:108-112).
+    SetMenuentryIdOption,
+    /// 08_fallback_counting: default 1 when boot_counter is "0" or "-1" and
+    /// boot_success is "0" (util/grub.d/08_fallback_counting.in:12-27).
+    FallbackCounting,
     /// Any other command, where it stands.
     Run(script::Command),
 }
@@ -716,23 +748,190 @@ fn generated_step(line: &str) -> Option<Option<Step>> {
     })
 }
 
+/// GRUB_DEFAULT as grub2-mkconfig writes it into 00_header's
+/// set default="..." (util/grub.d/00_header.in:44-45 and 102).
+enum GrubDefault {
+    /// GRUB_DEFAULT=saved: the value of saved_entry.
+    SavedEntry,
+    /// A value with no variable or escape in it.
+    Literal(String),
+    /// A value check does not interpret, on this line.
+    Script(String),
+}
+
+impl GrubDefault {
+    fn read(line: &str) -> Option<Self> {
+        let value = line.strip_prefix("set default=\"")?.strip_suffix('"')?;
+        Some(if value == "${saved_entry}" {
+            GrubDefault::SavedEntry
+        } else if value.contains(['$', '"', '\\']) {
+            GrubDefault::Script(line.to_string())
+        } else {
+            GrubDefault::Literal(value.to_string())
+        })
+    }
+}
+
+/// A line of a block of Fedora's generated grub.cfg, as check matches it.
+#[derive(Clone, Copy)]
+enum Template {
+    Line(&'static str),
+    /// 00_header's set default="..." with GRUB_DEFAULT in it.
+    SetGrubDefault,
+}
+
+use Template::{Line, SetGrubDefault};
+
+/// 00_header's choice of default (util/grub.d/00_header.in:92-103).
+const SET_DEFAULT_BLOCK: [Template; 12] = [
+    Line("if [ \"${next_entry}\" ] ; then"),
+    Line("set default=\"${next_entry}\""),
+    Line("set next_entry="),
+    Line("if [ \"${env_block}\" ] ; then"),
+    Line("save_env -f \"${env_block}\" next_entry"),
+    Line("else"),
+    Line("save_env next_entry"),
+    Line("fi"),
+    Line("set boot_once=true"),
+    Line("else"),
+    SetGrubDefault,
+    Line("fi"),
+];
+
+/// 00_header's choice of menuentry_id_option (00_header.in:108-112).
+const MENUENTRY_ID_OPTION_BLOCK: [Template; 5] = [
+    Line("if [ x\"${feature_menuentry_id}\" = xy ]; then"),
+    Line("menuentry_id_option=\"--id\""),
+    Line("else"),
+    Line("menuentry_id_option=\"\""),
+    Line("fi"),
+];
+
+/// 08_fallback_counting (util/grub.d/08_fallback_counting.in:12-27).
+const FALLBACK_COUNTING_BLOCK: [Template; 13] = [
+    Line("if [ -n \"${boot_counter}\" -a \"${boot_success}\" = \"0\" ]; then"),
+    Line("if  [ \"${boot_counter}\" = \"0\" -o \"${boot_counter}\" = \"-1\" ]; then"),
+    Line("set default=1"),
+    Line("set boot_counter=-1"),
+    Line("else"),
+    Line("decrement boot_counter"),
+    Line("fi"),
+    Line("if [ \"${env_block}\" ]; then"),
+    Line("save_env -f \"${env_block}\" boot_counter"),
+    Line("else"),
+    Line("save_env boot_counter"),
+    Line("fi"),
+    Line("fi"),
+];
+
+/// Whether line is blank or a comment, which GRUB's lexer skips (yylex.l).
+fn skipped_by_lexer(line: &str) -> bool {
+    let line = line.trim();
+    line.is_empty() || line.starts_with('#')
+}
+
+/// The lines from start matched against template, skipping blank and
+/// comment lines after the first: the index after the match, and the
+/// GRUB_DEFAULT it holds, when they match.
+fn match_block(lines: &[&str], start: usize, template: &[Template]) -> Option<(usize, Option<GrubDefault>)> {
+    let mut at = start;
+    let mut grub_default = None;
+    for (k, expected) in template.iter().enumerate() {
+        while k > 0 && lines.get(at).is_some_and(|line| skipped_by_lexer(line)) {
+            at += 1;
+        }
+        let line = lines.get(at)?.trim();
+        match expected {
+            Line(text) if line == *text => {}
+            Line(_) => return None,
+            SetGrubDefault => grub_default = Some(GrubDefault::read(line)?),
+        }
+        at += 1;
+    }
+    Some((at, grub_default))
+}
+
+/// The step that a block of Fedora's generated grub.cfg starting at
+/// lines[start] is, with the index after it.
+fn generated_block(lines: &[&str], start: usize) -> Option<(usize, Step)> {
+    if let Some((end, Some(grub_default))) = match_block(lines, start, &SET_DEFAULT_BLOCK) {
+        return Some((end, Step::SetDefault(grub_default)));
+    }
+    if let Some((end, _)) = match_block(lines, start, &MENUENTRY_ID_OPTION_BLOCK) {
+        return Some((end, Step::SetMenuentryIdOption));
+    }
+    match_block(lines, start, &FALLBACK_COUNTING_BLOCK).map(|(end, _)| (end, Step::FallbackCounting))
+}
+
 /// The steps of the GRUB script file script, named file. generated says
 /// whether Fedora's generated lines may appear in it. A line check cannot
 /// read leaves what GRUB does unknown.
 fn steps(script: &str, file: &str, generated: bool) -> Result<Vec<Step>, GrubContextError> {
+    let lines: Vec<&str> = script.lines().collect();
     let mut steps = Vec::new();
     let mut reader = script::Reader::default();
-    for line in script.lines() {
+    let mut at = 0;
+    while at < lines.len() {
+        let line = lines[at];
         let trimmed = line.trim();
-        if generated && !reader.in_body() && let Some(step) = generated_step(trimmed) {
-            steps.extend(step);
-            continue;
+        if generated && !reader.in_body() {
+            if let Some((end, step)) = generated_block(&lines, at) {
+                steps.push(step);
+                at = end;
+                continue;
+            }
+            if let Some(step) = generated_step(trimmed) {
+                steps.extend(step);
+                at += 1;
+                continue;
+            }
         }
         let commands = reader.line(line).map_err(|why| GrubContextError::CannotVerify(format!(
             "{file} has the line '{trimmed}', which check cannot read: {why}")))?;
         steps.extend(commands.into_iter().map(Step::Run));
+        at += 1;
     }
     Ok(steps)
+}
+
+/// The operators GRUB's test reads in the place of a three-argument test's
+/// operator (grub-core/commands/test.c, test_parse): a value equal to one
+/// there changes what the test compares. -nt and -ot take a suffix.
+const TEST_OPERATORS: [&str; 15] = [
+    "=", "==", "!=", "<", "<=", ">", ">=", "-eq", "-ge", "-gt", "-le", "-lt", "-ne", "-pgt", "-plt",
+];
+
+fn is_test_operator(value: &str) -> bool {
+    TEST_OPERATORS.contains(&value) || value.starts_with("-nt") || value.starts_with("-ot")
+}
+
+/// What $menuentry_id_option expands to where a script defines a menu entry.
+enum IdOption {
+    /// Nothing: the variable is unset or empty, so an entry's id is its title.
+    Empty,
+    /// "--id", so the word after it is the entry's id.
+    Id,
+    /// A value set where check does not follow.
+    Unknown,
+}
+
+/// The value of default when the menu runs, and where it comes from.
+pub struct DefaultValue {
+    pub value: String,
+    pub origin: String,
+}
+
+/// What grub.cfg leaves for the menu GRUB shows when it ends: the default
+/// variable, the fallback variable, and the entries it adds after blscfg,
+/// which follow the ones blscfg adds (grub-core/commands/menuentry.c,
+/// grub_normal_add_menu_entry, adds each entry at the end of the menu).
+pub struct MenuConfig {
+    /// default, None when unset; Err when check cannot tell it, saying why.
+    pub default: Result<Option<DefaultValue>, String>,
+    /// Where fallback is set, when it names entries GRUB tries after the
+    /// default one fails.
+    pub fallback: Option<String>,
+    pub added: menu::AddedEntries,
 }
 
 /// The variables, besides the lookup variables, that a script line before
@@ -763,6 +962,14 @@ struct ConfigRun<'a, F> {
     /// Where blscfg starts its lookups, and the blsdir variable, once
     /// grub.cfg runs it.
     at_blscfg: Option<(StartingLookupDir, Option<String>)>,
+    /// The variables deciding default that a command check does not
+    /// interpret has set, each with where.
+    unread: HashMap<&'static str, String>,
+    id_option: IdOption,
+    /// The entries scripts add after blscfg.
+    added: menu::AddedEntries,
+    /// Where a script adds a menu entry before blscfg, ahead of its entries.
+    entry_before_blscfg: Option<String>,
 }
 
 impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
@@ -776,7 +983,8 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
             Step::LoadGrubenv => {
                 let at = self.starting_lookup_dir()?;
                 if let Some(block) = read_if_found(&at, &grub_dir_file(self.grub_dir, "grubenv"))? {
-                    self.variables.load(&block, GRUBENV)?;
+                    let set = self.variables.load(&block, GRUBENV)?;
+                    self.loaded(&set);
                 }
                 reject_btrfs_subvol_variables(&self.variables, self.fstype)?;
             }
@@ -798,7 +1006,8 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                     read_blocklist(self.partition, &env_block)?
                 };
                 if let Some(block) = block {
-                    self.variables.load(&block, ENV_BLOCK)?;
+                    let set = self.variables.load(&block, ENV_BLOCK)?;
+                    self.loaded(&set);
                 }
                 reject_btrfs_subvol_variables(&self.variables, self.fstype)?;
             }
@@ -822,9 +1031,191 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                     }
                 }
             }
+            Step::SetDefault(grub_default) => {
+                // [ "${next_entry}" ] is true exactly when next_entry is not
+                // empty, whatever it holds (commands/test.c, test_parse).
+                let default = match self.menu_variable("next_entry") {
+                    Err(why) => Err(why),
+                    Ok(Some((value, source))) if !value.is_empty() =>
+                        Ok((value, format!("next_entry in {source}, for this boot only"))),
+                    Ok(_) => match grub_default {
+                        GrubDefault::SavedEntry => match self.menu_variable("saved_entry") {
+                            Err(why) => Err(why),
+                            Ok(Some((value, source))) => Ok((value, format!("saved_entry in {source}"))),
+                            Ok(None) => Ok((String::new(), "saved_entry, which is unset".to_string())),
+                        },
+                        GrubDefault::Literal(value) => Ok((value, format!("GRUB_DEFAULT in {file}"))),
+                        GrubDefault::Script(line) => Err(format!(
+                            "{file} sets default in '{line}', which check does not interpret")),
+                    },
+                };
+                self.set_default(default);
+            }
+            Step::SetMenuentryIdOption => {
+                // Normal mode sets feature_menuentry_id to "y" when it
+                // starts (normal/main.c, GRUB_MOD_INIT).
+                self.id_option = match self.menu_variable("feature_menuentry_id") {
+                    Err(_) => IdOption::Unknown,
+                    Ok(Some((value, _))) if value != "y" => IdOption::Empty,
+                    Ok(_) => IdOption::Id,
+                };
+            }
+            Step::FallbackCounting => {
+                let counting = match (self.menu_variable("boot_counter"), self.menu_variable("boot_success")) {
+                    (Err(why), _) | (_, Err(why)) => Err(why),
+                    (Ok(counter), Ok(success)) => Ok((counter.map(|(v, _)| v).unwrap_or_default(),
+                        success.map(|(v, _)| v).unwrap_or_default())),
+                };
+                match counting {
+                    Err(why) => self.set_default(Err(why)),
+                    Ok((counter, success)) => {
+                        if let Some(operator) = [&counter, &success].into_iter().find(|v| is_test_operator(v)) {
+                            self.set_default(Err(format!(
+                                "08_fallback_counting tests boot_counter and boot_success, and '{operator}' \
+                                 is an operator to GRUB's test, which check does not model")));
+                        } else if !counter.is_empty() && success == "0" && (counter == "0" || counter == "-1") {
+                            self.set_default(Ok(("1".to_string(),
+                                format!("08_fallback_counting in {file}, as boot_counter has run out"))));
+                        }
+                    }
+                }
+            }
             Step::Run(command) => self.run(&command, file)?,
         }
         Ok(())
+    }
+
+    /// What grub.cfg leaves for the menu when it ends. An entry added before
+    /// blscfg stands ahead of blscfg's, so default cannot be told and an
+    /// entry check does not read may be the one GRUB boots.
+    fn menu_config(&mut self) -> MenuConfig {
+        let mut added = std::mem::replace(&mut self.added, menu::AddedEntries { entries: Vec::new(), countable: true });
+        let default = if let Some(why) = self.entry_before_blscfg.take() {
+            added.entries.push(menu::AddedEntry { id: None, title: None, certain: false });
+            Err(why)
+        } else {
+            self.menu_variable("default").map(|default| default.map(|(value, origin)| DefaultValue { value, origin }))
+        };
+        // get_and_remove_first_entry_number reads no entry from an empty
+        // fallback (normal/menu.c).
+        let fallback = match self.menu_variable("fallback") {
+            Err(why) => Some(why),
+            Ok(Some((value, source))) if !value.is_empty() => Some(format!("{source} sets fallback")),
+            Ok(_) => None,
+        };
+        MenuConfig { default, fallback, added }
+    }
+
+    /// The value of a variable deciding default, with where it was set;
+    /// Err when a command check does not interpret has set it.
+    fn menu_variable(&self, name: &str) -> Result<Option<(String, String)>, String> {
+        match self.unread.get(name) {
+            Some(why) => Err(why.clone()),
+            None => Ok(self.variables.values.get(name).cloned()),
+        }
+    }
+
+    fn set_default(&mut self, default: Result<(String, String), String>) {
+        match default {
+            Ok(value) => {
+                self.unread.remove("default");
+                self.variables.values.insert("default", value);
+            }
+            Err(why) => {
+                self.unread.insert("default", why);
+            }
+        }
+    }
+
+    /// Notes the variables an environment block set when it loaded.
+    fn loaded(&mut self, set: &[&'static str]) {
+        for &name in set {
+            self.unread.remove(name);
+            if name == "menuentry_id_option" {
+                self.id_option = IdOption::Unknown;
+            }
+        }
+    }
+
+    /// Follows what command, a command of file, does to the menu GRUB
+    /// shows when grub.cfg ends and the variables its default entry is
+    /// chosen with: a menu entry it defines, and a variable deciding default
+    /// it sets, which check does not interpret.
+    fn follow_menu(&mut self, command: &script::Command, names: &[String], file: &str) {
+        let line = command.line.trim();
+        if command.words.first().is_some_and(|w| w.is("menuentry") || w.is("submenu")) {
+            if self.at_blscfg.is_some() {
+                let entry = self.added_entry(command);
+                self.added.entries.push(entry);
+                self.added.countable &= !command.in_loop;
+            } else {
+                self.entry_before_blscfg.get_or_insert_with(|| format!("{file} adds a menu entry before blscfg in '{line}'"));
+            }
+        }
+        for name in MENU_VARIABLES {
+            if names.iter().any(|n| n == name) {
+                let why = format!("{file} sets {name} in '{line}'");
+                if name == "menuentry_id_option" {
+                    self.id_option = IdOption::Unknown;
+                }
+                self.unread.insert(name, why);
+            }
+        }
+    }
+
+    /// The menu entry a menuentry or submenu command adds, its id and title
+    /// read as GRUB's argument parser reads the command's options
+    /// (commands/menuentry.c, options; lib/arg.c, grub_arg_parse): --class,
+    /// --hotkey, --source and --id take the next word or an "=" value,
+    /// --users takes the next word unless it starts with '-', the first
+    /// other word is the title, and the id is the title when --id is not
+    /// given (grub_normal_add_menu_entry). A word check cannot read leaves
+    /// both unknown.
+    fn added_entry(&self, command: &script::Command) -> menu::AddedEntry {
+        let unknown = menu::AddedEntry { id: None, title: None, certain: !command.conditional };
+        let mut words = command.words[1..].iter().peekable();
+        let (mut title, mut id) = (None, None);
+        while let Some(word) = words.next() {
+            let text = if word.expansion.is_none() {
+                word.text.as_str()
+            } else if matches!(word.text.as_str(), "$menuentry_id_option" | "${menuentry_id_option}") {
+                match &self.id_option {
+                    IdOption::Id => "--id",
+                    IdOption::Empty => continue,
+                    IdOption::Unknown => return unknown,
+                }
+            } else {
+                return unknown;
+            };
+            let (option, inline) = match text.split_once('=') {
+                Some((option, value)) if option.starts_with("--") => (option, Some(value)),
+                _ => (text, None),
+            };
+            match option {
+                "--unrestricted" => {}
+                "--class" | "--hotkey" | "--source" | "--id" | "--users" => {
+                    let value = match inline {
+                        Some(value) => Some(value.to_string()),
+                        None if option == "--users" && words.peek().is_some_and(|w| w.text.starts_with('-') && w.text.len() > 1) => None,
+                        None => match words.next() {
+                            Some(next) if next.expansion.is_none() => Some(next.text.clone()),
+                            _ => return unknown,
+                        },
+                    };
+                    if option == "--id" {
+                        id = value;
+                    }
+                }
+                other if other.starts_with('-') && other.len() > 1 => return unknown,
+                other => {
+                    title.get_or_insert_with(|| other.to_string());
+                }
+            }
+        }
+        let Some(title) = title else {
+            return unknown;
+        };
+        menu::AddedEntry { id: Some(id.unwrap_or_else(|| title.clone())), title: Some(title), certain: !command.conditional }
     }
 
     /// Follows command, a command of file that check follows as no step of
@@ -874,6 +1265,7 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                 "{file} runs '{line}' before blscfg, which can set where GRUB looks the boot entries up, \
                  and check does not interpret GRUB script"))),
         };
+        self.follow_menu(command, &names, file);
         if names.iter().any(|n| n == "root") {
             self.variables.root = Root::Other(format!("{file} sets root in '{line}'"));
         }
@@ -903,6 +1295,7 @@ impl<F: FnMut(bool) -> Result<StartingLookupDir, String>> ConfigRun<'_, F> {
                 "{file} runs '{line}' after blscfg, which can set where GRUB looks the kernels up when it boots \
                  an entry, and check does not interpret GRUB script"))),
         };
+        self.follow_menu(command, &names, file);
         if let Some(variable) = AFTER_BLSCFG_VARIABLES.into_iter().find(|v| names.iter().any(|n| n == v)) {
             return Err(GrubContextError::CannotVerify(format!(
                 "{file} sets {variable} after blscfg in '{line}', which moves where GRUB looks the kernels up \
@@ -1203,7 +1596,14 @@ impl GrubContext {
             grub_dir: &stub.grub_dir,
             boot_uuid: stub.boot_uuid.as_str(),
             at_blscfg: None,
+            unread: HashMap::new(),
+            id_option: IdOption::Empty,
+            added: menu::AddedEntries { entries: Vec::new(), countable: true },
+            entry_before_blscfg: None,
         };
+        if run.variables.source("menuentry_id_option").is_some() {
+            run.id_option = IdOption::Unknown;
+        }
         let at_configfile = run.starting_lookup_dir()?;
 
         if let Some(script) = read_if_found(&at_configfile, &grub_dir_file(&stub.grub_dir, "grub.cfg"))? {
@@ -1215,7 +1615,8 @@ impl GrubContext {
             Some(at_blscfg) => at_blscfg,
             None => (run.starting_lookup_dir()?, run.variables.get("blsdir").map(str::to_string)),
         };
-        Ok(Self { at_configfile, at_blscfg, blsdir, grub_dir: stub.grub_dir, _mount: mount })
+        let menu = run.menu_config();
+        Ok(Self { at_configfile, at_blscfg, blsdir, grub_dir: stub.grub_dir, menu, _mount: mount })
     }
 
     /// GRUB path of a file in the stub's GRUB directory.

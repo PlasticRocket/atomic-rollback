@@ -245,6 +245,11 @@ pub struct Command {
     pub line: String,
     /// The command's words, without the keywords that lead into it.
     pub words: Vec<Word>,
+    /// Whether it runs inside an if, while, until or for, so it may not run.
+    pub conditional: bool,
+    /// Whether it runs inside a while, until or for, so it may run more
+    /// than once.
+    pub in_loop: bool,
 }
 
 /// A body that has opened and not closed: a function's, recorded for its
@@ -260,6 +265,13 @@ struct Body {
 /// which check does not follow into a call.
 type FunctionBody = Option<Vec<(String, Vec<Word>)>>;
 
+/// A compound command a script is inside where it stands.
+#[derive(PartialEq)]
+enum Compound {
+    If,
+    Loop,
+}
+
 /// Reads a script line by line as GRUB runs it from top to bottom.
 #[derive(Default)]
 pub struct Reader {
@@ -267,6 +279,8 @@ pub struct Reader {
     functions: HashMap<String, FunctionBody>,
     /// The functions being called, innermost last.
     calling: Vec<String>,
+    /// The compound commands open where the script stands, innermost last.
+    compounds: Vec<Compound>,
 }
 
 impl Reader {
@@ -312,14 +326,26 @@ impl Reader {
             return Ok(());
         }
 
-        while words.first().is_some_and(|w| LEADING_KEYWORDS.iter().any(|k| w.is(k))) {
+        while let Some(keyword) = words.first().filter(|w| LEADING_KEYWORDS.iter().any(|k| w.is(k))) {
+            if keyword.is("if") {
+                self.compounds.push(Compound::If);
+            } else if keyword.is("while") || keyword.is("until") {
+                self.compounds.push(Compound::Loop);
+            }
             words.remove(0);
         }
         let Some(first) = words.first() else {
             return Ok(());
         };
         if first.is("fi") || first.is("done") {
-            return if words.len() == 1 { Ok(()) } else { Err("words follow fi or done".into()) };
+            let closes = if first.is("fi") { Compound::If } else { Compound::Loop };
+            if words.len() > 1 || self.compounds.pop() != Some(closes) {
+                return Err(format!("its {} closes no compound command it opened", first.text));
+            }
+            return Ok(());
+        }
+        if first.is("for") {
+            self.compounds.push(Compound::Loop);
         }
         if first.is("{") || first.is("}") {
             return Err("a brace stands outside the body of a menu entry or function".into());
@@ -339,7 +365,7 @@ impl Reader {
             if let Some(function) = &function {
                 self.functions.insert(function.clone(), Some(Vec::new()));
             }
-            run.push(Command { line: line.to_string(), words });
+            run.push(self.at(line, words));
             self.bodies.push(Body { function, nested: 0 });
             if !body.is_empty() {
                 self.command(line, body, run)?;
@@ -366,8 +392,18 @@ impl Reader {
             return Ok(());
         }
 
-        run.push(Command { line: line.to_string(), words });
+        run.push(self.at(line, words));
         Ok(())
+    }
+
+    /// The command of words on line, where the script stands.
+    fn at(&self, line: &str, words: Vec<Word>) -> Command {
+        Command {
+            line: line.to_string(),
+            words,
+            conditional: !self.compounds.is_empty(),
+            in_loop: self.compounds.contains(&Compound::Loop),
+        }
     }
 }
 
