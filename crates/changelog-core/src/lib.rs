@@ -490,11 +490,11 @@ impl Fragment {
             // Unreleased
             Self::CheckDistinguishesPermissionDeniedFromBootFailure => Status::Unreleased {
                 section: Section::Fixed,
-                text: "`check` now distinguishes \"cannot verify\" from \"boot chain has problems.\" Running as non-root on Fedora (where the ESP grub.cfg is root-readable only) previously reported a boot-chain failure with exit 1, misleading users about the actual system state. The tool now reports \"cannot verify boot chain\" with a prompt to run as root, and exits with code 3 to let scripts distinguish the case. Closes #14.",
+                text: "`check` now distinguishes \"cannot verify\" from \"boot chain has problems.\" Running as non-root on Fedora (where the ESP grub.cfg is root-readable only) previously reported a boot-chain failure with exit 1, misleading users about the actual system state. The tool now reports \"cannot verify boot chain\" with a prompt to run as root, and exits with code 3 to let scripts distinguish the case. It reports \"cannot verify\" too when Linux refuses to read a file or directory GRUB reads, with the Linux error, instead of reporting the file missing. Closes #14.",
             },
             Self::CheckResolvesPathsLikeGrub => Status::Unreleased {
                 section: Section::Fixed,
-                text: "The boot chain check run by `check`, `rollback`, each step of `setup` and `migrate`, and the kernel hook looks up the files GRUB reads (the ESP stub's prefix, `grub.cfg`, the BLS directory named in `grubenv`, and each boot entry's kernel and initramfs) as GRUB's filesystem code does: on Btrfs from the top-level subvolume, or from the default subvolume when the ESP stub sets `btrfs_relative_path`, following symbolic links as GRUB follows them, and it names each missing file by its GRUB path. It previously looked them up inside the subvolume mounted at `/`, so on a migrated system whose ESP stub Fedora 44 or later had replaced, it reported a valid boot chain while every menu entry failed with `` file `/vmlinuz-...' not found ``; on such a system `check` now reports those entries and `rollback` refuses.",
+                text: "The boot chain check run by `check`, `rollback`, each step of `setup` and `migrate`, and the kernel hook looks up the files GRUB reads (the ESP stub's prefix, `grub.cfg`, the BLS directory named in `grubenv`, and each boot entry's kernel and initramfs) as GRUB does: on Btrfs from the top-level subvolume, or from the default subvolume when `btrfs_relative_path` is set, which the ESP stub decides for `grub.cfg` and `grubenv` and the variables `grub.cfg` then loads from `grubenv` decide for the boot entries; following symbolic links as GRUB follows them; and counting as boot entries only the files `blscfg` reads. It names each missing file by its GRUB path, and reports that it cannot verify the boot chain when `grub.cfg` sets those variables before `blscfg` other than as its generated header does. It previously looked them up inside the subvolume mounted at `/`, so on a migrated system whose ESP stub Fedora 44 or later had replaced, it reported a valid boot chain while every menu entry failed with `` file `/vmlinuz-...' not found ``; on such a system `check` now reports those entries and `rollback` refuses.",
             },
             Self::SnapshotCheckReadsSeparateBootPartition => Status::Unreleased {
                 section: Section::Fixed,
@@ -502,7 +502,7 @@ impl Fragment {
             },
             Self::CheckRefusesBtrfsSubvolVariables => Status::Unreleased {
                 section: Section::Changed,
-                text: "`check` fails when the ESP `grub.cfg` sets `btrfs_subvol` or `btrfs_subvolid` together with `btrfs_relative_path` on a Btrfs boot filesystem, naming the variable. GRUB reads them only then, neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.",
+                text: "`check` fails when `btrfs_subvol` or `btrfs_subvolid` is set while `btrfs_relative_path` is, on a Btrfs boot filesystem, by the ESP `grub.cfg` or by the `grubenv` that `grub.cfg` loads, naming the variable and where it is set. GRUB reads them only then, neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.",
             },
             Self::TemporaryMountsInUniqueRunDirectory => Status::Unreleased {
                 section: Section::Security,
