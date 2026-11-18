@@ -4,7 +4,7 @@
 //!   UEFI -> shim -> GRUB -> grub.cfg -> BLS entries -> kernel -> root mount -> fstab
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::grub::{StartingLookupDir, GrubContext, GrubContextError};
 use crate::parse;
@@ -83,11 +83,12 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
     };
     println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
 
+    let blsdir = grub.blsdir();
     evaluate_checks(vec![
         ("EFI boot files", check_esp(root)),
         ("GRUB configuration", check_grub_config(root, &grub)),
-        ("Kernel boot entry", check_bls_entries(&grub)),
-        ("Root filesystem", check_root_mountable(root, &grub)),
+        ("Kernel boot entry", check_bls_entries(&grub, &blsdir)),
+        ("Root filesystem", check_root_mountable(root, &blsdir)),
         ("System mounts", check_fstab_mounts(root)),
     ])
 }
@@ -106,10 +107,11 @@ pub fn verify_snapshot_bootable(toplevel: &Path, exchange: &RenameExchange) -> B
     println!("  GRUB resolves paths from {}", grub.starting_lookup_dir.describe());
 
     let snapshot = toplevel.join(exchange.snapshot.as_str());
+    let blsdir = grub.blsdir();
     evaluate_checks(vec![
         ("GRUB configuration", check_grub_cfg(&grub, None)),
-        ("Kernel boot entry", check_bls_entries(&grub)),
-        ("Root filesystem", check_root_mountable(&snapshot, &grub)),
+        ("Kernel boot entry", check_bls_entries(&grub, &blsdir)),
+        ("Root filesystem", check_root_mountable(&snapshot, &blsdir)),
         ("System mounts", check_fstab_mounts(&snapshot)),
     ])
 }
@@ -249,8 +251,10 @@ fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckRes
 
 // --- Kernel boot entry ---
 
-fn check_bls_entries(grub: &GrubContext) -> Vec<CheckResult> {
-    let entries_dir = match grub.blsdir() {
+/// blsdir is the directory blscfg reads boot entries from, as
+/// GrubContext::blsdir finds it.
+fn check_bls_entries(grub: &GrubContext, blsdir: &Result<PathBuf, String>) -> Vec<CheckResult> {
+    let entries_dir = match blsdir {
         Ok(dir) => dir,
         Err(e) => return vec![Err(format!("{e}. GRUB will show an empty menu."))],
     };
@@ -363,10 +367,10 @@ fn validate_bls_entry(grub: &GrubContext, conf: &Path) -> Result<(), String> {
 
 // --- Root filesystem ---
 
-fn check_root_mountable(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
+fn check_root_mountable(root: &Path, blsdir: &Result<PathBuf, String>) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
-    let root_uuid = match extract_root_uuid(grub) {
+    let root_uuid = match extract_root_uuid(blsdir) {
         Some(uuid) => uuid,
         None => {
             results.push(Err(
@@ -475,7 +479,7 @@ fn check_file_contains(path: &Path, needle: &str, msg: &str) -> CheckResult {
 }
 
 fn check_blkid_uuid_fstype(uuid: &tools::BareUuid, expected: tools::FsType) -> CheckResult {
-    let fstype = tools::blkid_fstype(uuid)?;
+    let fstype = tools::blkid_fstype(&tools::blkid_device_for_uuid(uuid)?)?;
     if fstype == expected { Ok(()) } else {
         Err(format!("UUID={} has unexpected filesystem type", uuid.as_str()))
     }
@@ -532,9 +536,9 @@ pub fn print_rollback_scope(fstab: &str) {
 }
 
 /// The root= UUID of the first boot entry GRUB reads.
-fn extract_root_uuid(grub: &GrubContext) -> Option<tools::BareUuid> {
-    let entries_dir = grub.blsdir().ok()?;
-    for entry in fs::read_dir(&entries_dir).ok()?.flatten() {
+fn extract_root_uuid(blsdir: &Result<PathBuf, String>) -> Option<tools::BareUuid> {
+    let entries_dir = blsdir.as_ref().ok()?;
+    for entry in fs::read_dir(entries_dir).ok()?.flatten() {
         if entry.path().extension().is_some_and(|ext| ext == "conf") {
             let content = fs::read_to_string(entry.path()).ok()?;
             if let Some(options) = parse::bls_field(&content, "options") {
@@ -549,7 +553,6 @@ fn extract_root_uuid(grub: &GrubContext) -> Option<tools::BareUuid> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     fn hint(status: BootStatus) -> String {
         match status {
@@ -696,6 +699,10 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         GrubContext::new(starting_lookup_dir, "/root/boot/grub2".into())
     }
 
+    fn bls_entries(grub: &GrubContext) -> Vec<CheckResult> {
+        check_bls_entries(grub, &grub.blsdir())
+    }
+
     fn passes(results: &[CheckResult]) -> bool {
         !results.is_empty() && results.iter().all(|r| r.is_ok())
     }
@@ -713,7 +720,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let grub = btrfs_context(&top, false, "/root/boot/grub2");
 
         assert!(passes(&check_grub_config(&top, &grub)));
-        assert!(passes(&check_bls_entries(&grub)));
+        assert!(passes(&bls_entries(&grub)));
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -727,7 +734,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_root_subvol());
         let grub = btrfs_context(&top, false, "/root/boot/grub2");
 
-        let results = check_bls_entries(&grub);
+        let results = bls_entries(&grub);
         assert!(fails_with(&results, &format!("'/vmlinuz-{KVER}'")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
@@ -742,7 +749,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_root_subvol());
         let grub = btrfs_context(&top, true, "/boot/grub2");
 
-        assert!(passes(&check_bls_entries(&grub)));
+        assert!(passes(&bls_entries(&grub)));
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -752,7 +759,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
         let grub = btrfs_context(&top, true, "/boot/grub2");
 
-        let results = check_bls_entries(&grub);
+        let results = bls_entries(&grub);
         assert!(fails_with(&results, &format!("'/root/boot/vmlinuz-{KVER}'")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
@@ -778,7 +785,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         install_subvol(&top, "root", "", &entry_from_top_level());
         let grub = btrfs_context(&top, false, "/root/boot/grub2");
 
-        let results = check_bls_entries(&grub);
+        let results = bls_entries(&grub);
         assert!(fails_with(&results, "'/boot/loader/entries'"), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
@@ -789,7 +796,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         install_subvol(&top, "root", "", &entry_from_root_subvol());
         let grub = btrfs_context(&top, true, "/boot/grub2");
 
-        assert!(passes(&check_bls_entries(&grub)));
+        assert!(passes(&bls_entries(&grub)));
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -809,7 +816,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let grub = GrubContext::new(starting_lookup_dir, "/grub2".into());
 
         assert!(passes(&check_grub_config(&boot, &grub)));
-        assert!(passes(&check_bls_entries(&grub)));
+        assert!(passes(&bls_entries(&grub)));
         fs::remove_dir_all(&boot).unwrap();
     }
 
@@ -822,11 +829,11 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         install_subvol(&top, "snap1", BLSDIR_TOP_LEVEL, &entry_from_top_level());
         let grub = snapshot_context(&top, "snap1");
 
-        assert!(passes(&check_bls_entries(&grub)));
+        assert!(passes(&bls_entries(&grub)));
 
         // The live root still has the kernel; the snapshot does not.
         fs::remove_file(top.join(format!("snap1/boot/vmlinuz-{KVER}"))).unwrap();
-        let results = check_bls_entries(&grub);
+        let results = bls_entries(&grub);
         assert!(fails_with(&results, &format!("snap1/boot/vmlinuz-{KVER}")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
@@ -840,7 +847,7 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
 
         // The snapshot's entries name /vmlinuz-<ver>, which the top level
         // does not hold, although the live root's entries resolve.
-        let results = check_bls_entries(&grub);
+        let results = bls_entries(&grub);
         assert!(fails_with(&results, &format!("'/vmlinuz-{KVER}'")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
     }
@@ -871,8 +878,8 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let grub = GrubContext::new(starting_lookup_dir, "/grub2".into());
 
         assert!(passes(&check_grub_cfg(&grub, None)), "{:?}", check_grub_cfg(&grub, None));
-        assert!(passes(&check_bls_entries(&grub)), "{:?}", check_bls_entries(&grub));
-        assert_eq!(extract_root_uuid(&grub).map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+        assert_eq!(extract_root_uuid(&grub.blsdir()).map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
         fs::remove_dir_all(&scratch_dir).unwrap();
     }
 

@@ -171,15 +171,15 @@ impl GrubContext {
     /// temporary mount point if needed.
     pub fn from_system(root: &Path) -> Result<Self, GrubContextError> {
         let stub = read_esp_stub(&root.join(&P.esp_dir[1..]).join("grub.cfg"))?;
-        let fstype = boot_fstype(&stub)?;
+        let (device, fstype) = boot_device(&stub)?;
 
         let mount = if fstype == tools::FsType::Btrfs {
             if !tools::is_root() {
                 return Err(GrubContextError::MountNotPermitted);
             }
-            tools::mount_toplevel_ro(&stub.boot_uuid)?
+            tools::mount_toplevel_ro(&device)?
         } else {
-            tools::get_mount_point(&stub.boot_uuid.clone().into_device_spec())?
+            tools::get_mount_point(&device.into_device_spec())?
         };
 
         let starting_lookup_dir = StartingLookupDir::select(&fstype, stub.btrfs_relative, PathBuf::from(mount.path()),
@@ -196,12 +196,12 @@ impl GrubContext {
     /// temporary mount point if needed.
     pub fn for_snapshot(toplevel: &Path, exchange: &RenameExchange) -> Result<Self, GrubContextError> {
         let stub = read_esp_stub(&Path::new(P.esp_dir).join("grub.cfg"))?;
-        let fstype = boot_fstype(&stub)?;
+        let (device, fstype) = boot_device(&stub)?;
 
         let mount = if fstype == tools::FsType::Btrfs {
             None
         } else {
-            Some(tools::get_mount_point(&stub.boot_uuid.clone().into_device_spec())?)
+            Some(tools::get_mount_point(&device.into_device_spec())?)
         };
         let fs_root = mount.as_ref().map_or_else(|| toplevel.to_path_buf(), |m| PathBuf::from(m.path()));
 
@@ -252,11 +252,14 @@ impl GrubContext {
     }
 }
 
-/// The type of the filesystem the stub's search --fs-uuid names. GRUB's
-/// resolution depends on it, so an unknown type is an error, not a guess.
-fn boot_fstype(stub: &tools::EspStub) -> Result<tools::FsType, String> {
-    tools::blkid_fstype(&stub.boot_uuid).map_err(|e| format!(
-        "cannot determine the filesystem type of UUID={}: {e}", stub.boot_uuid.as_str()))
+/// The block device holding the filesystem the stub's search --fs-uuid
+/// names, and that filesystem's type. GRUB's resolution depends on the
+/// type, so an unknown type is an error, not a guess.
+fn boot_device(stub: &tools::EspStub) -> Result<(tools::DevicePath, tools::FsType), String> {
+    let unknown = |e| format!("cannot determine the filesystem type of UUID={}: {e}", stub.boot_uuid.as_str());
+    let device = tools::blkid_device_for_uuid(&stub.boot_uuid).map_err(unknown)?;
+    let fstype = tools::blkid_fstype(&device).map_err(unknown)?;
+    Ok((device, fstype))
 }
 
 /// Value of a variable in a GRUB environment block (grub-core/lib/envblk.c:
