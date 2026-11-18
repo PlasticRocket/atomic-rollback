@@ -225,6 +225,7 @@ fragments! {
     CheckRefusesBtrfsSubvolVariables,
     TemporaryMountsInUniqueRunDirectory,
     SnapshotRetentionByCreationGeneration,
+    PreTransactionDiskSpaceCheck,
 }
 
 impl Fragment {
@@ -512,6 +513,10 @@ impl Fragment {
             Self::SnapshotRetentionByCreationGeneration => Status::Unreleased {
                 section: Section::Changed,
                 text: "Snapshot retention removes the automatic snapshots created first, by Btrfs creation generation, instead of those with the lowest subvolume IDs, an order Btrfs does not promise. It never removes the default subvolume or the subvolume the running system is mounted from (between a `rollback` and the reboot, that is the old root under the snapshot's automatic name); such a snapshot still counts toward `MAX_SNAPSHOTS`, as snapper counts its default and active snapshots.",
+            },
+            Self::PreTransactionDiskSpaceCheck => Status::Unreleased {
+                section: Section::Fixed,
+                text: "An RPM transaction whose files do not fit beside the snapshot taken before it is refused before anything is written, with the amount it needs, the amount free, and how to free space. The snapshot keeps the old copy of every file the transaction replaces, which rpm's own disk space check counts as freed, and rpm counts each Btrfs subvolume apart, so such a transaction passed rpm's check and failed part way with `No space left on device`, leaving some packages upgraded and others not. The RPM plugin now adds up every file of every package the transaction installs that lands on the Btrfs filesystem holding `/`, in any of its subvolumes, rounded to whole blocks and with rpm's 5% margin as rpm counts, and credits nothing for replaced or removed files. Snapshots are never deleted to make room.",
             },
         }
     }
