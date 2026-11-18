@@ -436,20 +436,19 @@ pub fn parse_esp_stub(content: &str) -> Result<EspStub, String> {
     // '1' or 'y' (grub-core/fs/btrfs.c, grub_btrfs_mount). The stub runs
     // top to bottom, so the last assignment is the one configfile sees.
     let btrfs_relative = content.lines()
-        .filter_map(btrfs_relative_path_value)
+        .filter_map(|line| grub_assignment(line, "btrfs_relative_path"))
         .next_back()
         .is_some_and(|value| value.starts_with(['1', 'y']));
 
     Ok(EspStub { boot_uuid, grub_dir, btrfs_relative })
 }
 
-/// The value a GRUB script line assigns to btrfs_relative_path, either as
-/// "set btrfs_relative_path=<value>" or "btrfs_relative_path=<value>",
-/// with its quotes removed.
-fn btrfs_relative_path_value(line: &str) -> Option<&str> {
+/// The value a GRUB script line assigns to the variable name, either as
+/// "set <name>=<value>" or "<name>=<value>", with its quotes removed.
+pub fn grub_assignment<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let line = line.trim();
     let assignment = line.strip_prefix("set ").map_or(line, str::trim_start);
-    let value = assignment.strip_prefix("btrfs_relative_path=")?;
+    let value = assignment.strip_prefix(name)?.strip_prefix('=')?;
     Some(value.trim_matches(|c| c == '"' || c == '\''))
 }
 

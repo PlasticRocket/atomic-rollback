@@ -73,7 +73,7 @@ pub fn verify_bootable(root: &Path) -> BootStatus {
         ("EFI boot files", check_esp(root)),
         ("GRUB configuration", check_grub_config(root, &grub)),
         ("Kernel boot entry", check_bls_entries(&grub)),
-        ("Root filesystem", check_root_mountable(root)),
+        ("Root filesystem", check_root_mountable(root, &grub)),
         ("System mounts", check_fstab_mounts(root)),
     ])
 }
@@ -96,22 +96,10 @@ pub fn verify_snapshot_bootable(root: &Path) -> BootStatus {
     };
     println!("  GRUB resolves paths from {}", grub.base.describe());
 
-    let grub_cfg = grub.resolve(&grub.prefix_path("grub.cfg"));
-    let grub_checks = vec![
-        check_file_exists_nonempty(&grub_cfg).map_err(|_|
-            format!("{} does not exist. \
-                     GRUB will drop to a rescue shell on next boot. \
-                     The snapshot is missing its GRUB configuration.",
-                    grub_cfg.display())),
-        check_file_contains(&grub_cfg, "blscfg",
-            "Snapshot's GRUB configuration does not use Boot Loader Specification entries. \
-             Kernel boot entries will not appear in the GRUB menu."),
-    ];
-
     evaluate_checks(vec![
-        ("GRUB configuration", grub_checks),
+        ("GRUB configuration", check_snapshot_grub_config(&grub)),
         ("Kernel boot entry", check_bls_entries(&grub)),
-        ("Root filesystem", check_root_mountable(root)),
+        ("Root filesystem", check_root_mountable(root, &grub)),
         ("System mounts", check_fstab_mounts(root)),
     ])
 }
@@ -208,6 +196,21 @@ fn check_grub_config(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
     }
 
     results
+}
+
+/// The grub.cfg GRUB loads after rollback: the snapshot's on Btrfs, the
+/// live boot filesystem's otherwise.
+fn check_snapshot_grub_config(grub: &GrubContext) -> Vec<CheckResult> {
+    let grub_path = grub.prefix_path("grub.cfg");
+    let grub_cfg = grub.resolve(&grub_path);
+    vec![
+        check_file_exists_nonempty(&grub_cfg).map_err(|fact|
+            format!("After rollback, GRUB loads its configuration from '{grub_path}': {fact}. \
+                     GRUB will drop to a rescue shell on next boot.")),
+        check_file_contains(&grub_cfg, "blscfg",
+            "The GRUB configuration used after rollback does not use Boot Loader \
+             Specification entries. Kernel boot entries will not appear in the GRUB menu."),
+    ]
 }
 
 fn check_default_subvol_matches_root(mount_point: &str, root: &Path) -> CheckResult {
@@ -360,10 +363,10 @@ fn validate_bls_entry(grub: &GrubContext, conf: &Path) -> Result<(), String> {
 
 // --- Root filesystem ---
 
-fn check_root_mountable(root: &Path) -> Vec<CheckResult> {
+fn check_root_mountable(root: &Path, grub: &GrubContext) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
-    let root_uuid = match extract_root_uuid(root) {
+    let root_uuid = match extract_root_uuid(grub) {
         Some(uuid) => uuid,
         None => {
             results.push(Err(
@@ -528,8 +531,9 @@ pub fn print_rollback_scope(fstab: &str) {
     }
 }
 
-fn extract_root_uuid(root: &Path) -> Option<tools::BareUuid> {
-    let entries_dir = root.join(&P.bls_dir[1..]);
+/// The root= UUID of the first boot entry GRUB reads.
+fn extract_root_uuid(grub: &GrubContext) -> Option<tools::BareUuid> {
+    let entries_dir = grub.bls_dir().ok()?;
     for entry in fs::read_dir(&entries_dir).ok()?.flatten() {
         if entry.path().extension().is_some_and(|ext| ext == "conf") {
             let content = fs::read_to_string(entry.path()).ok()?;
@@ -821,6 +825,34 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         let results = check_bls_entries(&grub);
         assert!(fails_with(&results, &format!("'/vmlinuz-{KVER}'")), "{:?}", results);
         fs::remove_dir_all(&top).unwrap();
+    }
+
+    // A setup-only system: /boot is ext4, outside the root subvolume, so a
+    // snapshot holds an empty boot/ directory. After rollback GRUB still
+    // reads the live ext4 /boot, so the GRUB side of the snapshot check
+    // resolves there, and the root= UUID comes from those entries.
+    #[test]
+    fn setup_only_snapshot_check_reads_the_live_boot_partition() {
+        let scratch_dir = scratch("grub-setup-only-snapshot");
+        let boot = scratch_dir.join("boot");
+        put(&boot.join("grub2/grub.cfg"), "insmod blscfg\nblscfg\n");
+        put(&boot.join("grub2/grubenv"), &grubenv(""));
+        put(&boot.join(format!("vmlinuz-{KVER}")), "kernel");
+        put(&boot.join(format!("initramfs-{KVER}.img")), "initramfs");
+        put(&boot.join(format!("loader/entries/{KVER}.conf")), &entry_from_root_subvol());
+        let top = scratch_dir.join("top");
+        let snapshot = top.join("snap1");
+        fs::create_dir_all(snapshot.join("boot")).unwrap();
+        put(&snapshot.join("etc/fstab"), "UUID=3f2a9c41 / btrfs subvol=root 0 0\n");
+
+        let base = Base::after_rollback(&tools::FsType::Ext4, false, boot.clone(), &snapshot,
+            || panic!("the root subvolume's name matters only from the top level")).unwrap();
+        let grub = GrubContext::new(base, "/grub2".into());
+
+        assert!(passes(&check_snapshot_grub_config(&grub)), "{:?}", check_snapshot_grub_config(&grub));
+        assert!(passes(&check_bls_entries(&grub)), "{:?}", check_bls_entries(&grub));
+        assert_eq!(extract_root_uuid(&grub).map(|u| u.as_str().to_string()), Some("3f2a9c41".into()));
+        fs::remove_dir_all(&scratch_dir).unwrap();
     }
 
     // initrd may repeat, a value may list several files, and $variables

@@ -221,6 +221,8 @@ fragments! {
     Libdnf5ActionsPluginRemoved,
     LegacyRootPreUpdateRenamed,
     CheckResolvesPathsLikeGrub,
+    SnapshotCheckReadsSeparateBootPartition,
+    CheckRefusesEspSubvolumeOverride,
 }
 
 impl Fragment {
@@ -492,6 +494,14 @@ impl Fragment {
             Self::CheckResolvesPathsLikeGrub => Status::Unreleased {
                 section: Section::Fixed,
                 text: "`check` resolves the files GRUB reads (the ESP stub's prefix, `grub.cfg`, the BLS directory named in `grubenv`, and each entry's kernel and initramfs) as GRUB's Btrfs driver does, from the top-level subvolume unless the ESP stub sets `btrfs_relative_path` and from the default subvolume when it does, and names the mode in its output. It previously resolved them inside the subvolume mounted at `/`, so on a migrated system whose ESP stub Fedora 44 or later had replaced, it reported a valid boot chain while every menu entry failed with `file '/vmlinuz-...' not found`.",
+            },
+            Self::SnapshotCheckReadsSeparateBootPartition => Status::Unreleased {
+                section: Section::Fixed,
+                text: "On systems set up with `setup` only, `/boot` is a separate partition that rollback leaves unchanged, and the boot chain check before `rollback` now reads `grub.cfg`, the boot entries, and their kernels and initramfs there instead of inside the snapshot. The root filesystem checks still examine the snapshot.",
+            },
+            Self::CheckRefusesEspSubvolumeOverride => Status::Unreleased {
+                section: Section::Changed,
+                text: "`check` fails when the ESP `grub.cfg` sets `btrfs_subvol` or `btrfs_subvolid`, naming the variable. Neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.",
             },
         }
     }
