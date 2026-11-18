@@ -7,6 +7,7 @@ All notable changes to atomic-rollback are documented here.
 ### Changed
 
 - `check` fails when `btrfs_subvol` or `btrfs_subvolid` is set while `btrfs_relative_path` is, on a Btrfs boot filesystem, by the ESP `grub.cfg` or by the `grubenv` that `grub.cfg` loads, naming the variable and where it is set. GRUB reads them only then, neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.
+- Snapshot retention removes the automatic snapshots created first, by Btrfs creation generation, instead of those with the lowest subvolume IDs, an order Btrfs does not promise. It never removes the default subvolume or the subvolume the running system is mounted from (between a `rollback` and the reboot, that is the old root under the snapshot's automatic name); such a snapshot still counts toward `MAX_SNAPSHOTS`, as snapper counts its default and active snapshots.
 
 ### Fixed
 

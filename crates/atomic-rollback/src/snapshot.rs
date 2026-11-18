@@ -49,35 +49,64 @@ fn max_snapshots() -> usize {
     }
 }
 
-/// Evicts the oldest auto-named snapshots if count exceeds MAX_SNAPSHOTS.
-/// User-named snapshots are never touched. Failures are logged, not fatal.
+/// The automatic snapshots retention deletes, oldest first, by snapper's
+/// number cleanup (snapper client/cleanup.cc: NumberCleaner keeps the
+/// newest NUMBER_LIMIT snapshots and offers the rest, of which
+/// Cleaner::filter_undeletables spares the default and the active one).
+/// Newest and oldest are by creation generation, since btrfs promises no
+/// order of subvolume IDs. Only automatic snapshots are counted or
+/// deleted; subvolumes named in fstab are system subvolumes, not snapshots.
+/// `undeletable` holds the IDs of the default subvolume and the running
+/// root.
+fn retention_victims<'a>(
+    subvols: &'a [tools::SubvolOgen],
+    max: usize,
+    system: &[tools::SubvolName],
+    undeletable: &[u64],
+) -> Vec<&'a tools::SubvolOgen> {
+    let mut automatic: Vec<&tools::SubvolOgen> = subvols.iter()
+        .filter(|s| is_auto_name(&s.path))
+        .filter(|s| !system.iter().any(|p| p.as_str() == s.path))
+        .collect();
+    automatic.sort_by_key(|s| std::cmp::Reverse(s.ogen));
+    let mut victims: Vec<&tools::SubvolOgen> = automatic.into_iter()
+        .skip(max)
+        .filter(|s| !undeletable.contains(&s.id))
+        .collect();
+    victims.reverse();
+    victims
+}
+
+/// Deletes the oldest automatic snapshots beyond MAX_SNAPSHOTS
+/// (retention_victims). Failures are logged, not fatal.
 fn retain_auto_snapshots() {
     let max = max_snapshots();
     if max == 0 { return; }
 
-    let protected = match fstab_subvol_names() {
+    let system = match fstab_subvol_names() {
         Ok(p) => p,
         Err(e) => { eprintln!("Retention warning: {e}"); return; }
     };
-    let entries = match tools::btrfs_subvol_list("/") {
+    let subvols = match tools::btrfs_subvol_list_ogen("/") {
         Ok(e) => e,
         Err(e) => { eprintln!("Retention warning: {e}"); return; }
     };
+    let default = match tools::btrfs_subvol_get_default("/") {
+        Ok(d) => d.id(),
+        Err(e) => { eprintln!("Retention warning: {e}"); return; }
+    };
+    let running_root = match tools::btrfs_subvolume_id("/") {
+        Ok(id) => id,
+        Err(e) => { eprintln!("Retention warning: {e}"); return; }
+    };
 
-    let mut auto_entries: Vec<&tools::SubvolEntry> = entries.iter()
-        .filter(|e| is_auto_name(&e.path))
-        .filter(|e| !protected.iter().any(|p| p.as_str() == e.path))
-        .collect();
-
-    if auto_entries.len() <= max {
+    let victims = retention_victims(&subvols, max, &system, &[default, running_root]);
+    if victims.is_empty() {
         return;
     }
 
-    auto_entries.sort_by_key(|e| e.id);
-    let to_evict = auto_entries.len() - max;
-
     eprintln!("Keeping {max} automatic snapshots, removing oldest.");
-    for entry in auto_entries.iter().take(to_evict) {
+    for entry in victims {
         match delete(&entry.path) {
             Ok(..) => eprintln!("Snapshot '{}' with ID {} removed.", entry.path, entry.id),
             Err(e) => eprintln!("Warning: failed to remove '{}': {e}", entry.path),
@@ -376,6 +405,80 @@ UUID=abc /home btrfs subvol=home 0 0";
             super::format_legacy_timestamp("1999-01-01 00:00:00"),
             "1999-01-01_00-00-00");
         assert!(super::is_auto_name(&super::format_legacy_timestamp("2026-04-11 23:19:26")));
+    }
+
+    fn subvol(id: u64, ogen: u64, path: &str) -> tools::SubvolOgen {
+        tools::SubvolOgen { id, ogen, path: path.to_string() }
+    }
+
+    fn victim_ids(subvols: &[tools::SubvolOgen], max: usize, system: &[&str], undeletable: &[u64]) -> Vec<u64> {
+        let system: Vec<tools::SubvolName> = system.iter()
+            .map(|s| tools::SubvolName::new(s.to_string())).collect();
+        super::retention_victims(subvols, max, &system, undeletable)
+            .into_iter().map(|s| s.id).collect()
+    }
+
+    // IDs in the opposite order of creation: the oldest is the lowest
+    // ogen, whatever its ID.
+    #[test]
+    fn retention_deletes_the_lowest_creation_generation_first() {
+        let subvols = [
+            subvol(300, 10, "2026-01-01_00-00-00"),
+            subvol(290, 20, "2026-01-02_00-00-00"),
+            subvol(280, 30, "2026-01-03_00-00-00"),
+            subvol(270, 40, "2026-01-04_00-00-00"),
+        ];
+        assert_eq!(victim_ids(&subvols, 2, &[], &[]), vec![300, 290]);
+        assert_eq!(victim_ids(&subvols, 3, &[], &[]), vec![300]);
+        assert_eq!(victim_ids(&subvols, 4, &[], &[]), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn retention_never_counts_or_deletes_user_named_snapshots() {
+        let subvols = [
+            subvol(256, 9, "root"),
+            subvol(260, 11, "root.before-atomic-rollback"),
+            subvol(261, 12, "manual-safety-net"),
+            subvol(262, 13, "2026-01-01_00-00-00"),
+            subvol(263, 14, "2026-01-02_00-00-00"),
+        ];
+        assert_eq!(victim_ids(&subvols, 2, &["root"], &[]), Vec::<u64>::new());
+        assert_eq!(victim_ids(&subvols, 1, &["root"], &[]), vec![262]);
+    }
+
+    #[test]
+    fn retention_never_counts_or_deletes_fstab_subvolumes() {
+        let subvols = [
+            subvol(262, 13, "2026-01-01_00-00-00"),
+            subvol(263, 14, "2026-01-02_00-00-00"),
+        ];
+        assert_eq!(victim_ids(&subvols, 1, &["2026-01-01_00-00-00"], &[]), Vec::<u64>::new());
+    }
+
+    // The default subvolume and the running root are spared where they
+    // fall among the oldest, and no other snapshot is deleted instead.
+    #[test]
+    fn retention_spares_the_default_subvolume_and_the_running_root() {
+        let subvols = [
+            subvol(256, 9, "2026-01-01_00-00-00"),
+            subvol(262, 13, "2026-01-02_00-00-00"),
+            subvol(263, 14, "2026-01-03_00-00-00"),
+            subvol(264, 15, "2026-01-04_00-00-00"),
+        ];
+        assert_eq!(victim_ids(&subvols, 1, &[], &[256, 262]), vec![263]);
+    }
+
+    // As in snapper, an undeletable snapshot among the newest takes one of
+    // the kept places.
+    #[test]
+    fn retention_counts_an_undeletable_snapshot_among_the_kept() {
+        let subvols = [
+            subvol(262, 13, "2026-01-01_00-00-00"),
+            subvol(263, 14, "2026-01-02_00-00-00"),
+            subvol(264, 15, "2026-01-03_00-00-00"),
+            subvol(256, 16, "2026-01-04_00-00-00"),
+        ];
+        assert_eq!(victim_ids(&subvols, 2, &[], &[256]), vec![262, 263]);
     }
 
     #[test]

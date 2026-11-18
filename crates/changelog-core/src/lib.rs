@@ -224,6 +224,7 @@ fragments! {
     SnapshotCheckReadsSeparateBootPartition,
     CheckRefusesBtrfsSubvolVariables,
     TemporaryMountsInUniqueRunDirectory,
+    SnapshotRetentionByCreationGeneration,
 }
 
 impl Fragment {
@@ -507,6 +508,10 @@ impl Fragment {
             Self::TemporaryMountsInUniqueRunDirectory => Status::Unreleased {
                 section: Section::Security,
                 text: "The boot chain check run by `check`, `rollback`, `setup`, `migrate` and the kernel hook makes its temporary read-only mounts in a new directory created by `mkdtemp` under `/run`, which only root can write to. It previously mounted at a predictable path under `/tmp`, which any local user could create beforehand, for example as a symlink, to choose where root mounted and later unmounted a filesystem.",
+            },
+            Self::SnapshotRetentionByCreationGeneration => Status::Unreleased {
+                section: Section::Changed,
+                text: "Snapshot retention removes the automatic snapshots created first, by Btrfs creation generation, instead of those with the lowest subvolume IDs, an order Btrfs does not promise. It never removes the default subvolume or the subvolume the running system is mounted from (between a `rollback` and the reboot, that is the old root under the snapshot's automatic name); such a snapshot still counts toward `MAX_SNAPSHOTS`, as snapper counts its default and active snapshots.",
             },
         }
     }
