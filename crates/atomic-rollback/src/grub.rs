@@ -93,6 +93,39 @@ impl Base {
         })
     }
 
+    /// Selects GRUB's starting point as it will be once rollback has
+    /// swapped in the snapshot at snapshot_root. fs_root is where the root
+    /// of the filesystem the ESP stub names is mounted; on Btrfs that is
+    /// the top-level subvolume, and snapshot_root lies below it.
+    /// root_subvol yields the name fstab mounts as /, which the snapshot
+    /// takes in the swap; it is called only when GRUB starts at the top
+    /// level, where paths name subvolumes.
+    pub fn after_rollback(
+        fstype: &tools::FsType,
+        btrfs_relative: bool,
+        fs_root: PathBuf,
+        snapshot_root: &Path,
+        root_subvol: impl FnOnce() -> Result<tools::SubvolName, String>,
+    ) -> Result<Self, String> {
+        Ok(match fstype {
+            // After the swap, rollback sets the snapshot as the default subvolume.
+            tools::FsType::Btrfs if btrfs_relative => Base::BtrfsDefaultSubvol(snapshot_root.to_path_buf()),
+            tools::FsType::Btrfs => {
+                let snapshot = snapshot_root.strip_prefix(&fs_root).map_err(|_| format!(
+                    "snapshot {} is not under the top-level subvolume mount {}",
+                    snapshot_root.display(), fs_root.display()))?;
+                let swap = PendingSwap {
+                    root: root_subvol()?,
+                    snapshot: tools::SubvolName::new(snapshot.to_string_lossy().into_owned()),
+                };
+                Base::BtrfsTopLevel { toplevel: fs_root, swap: Some(swap) }
+            }
+            // A separate boot filesystem is outside the snapshot, and
+            // rollback leaves it as it is.
+            _ => Base::FilesystemRoot(fs_root),
+        })
+    }
+
     /// Names the starting point for check's output.
     pub fn describe(&self) -> &'static str {
         match self {
@@ -133,10 +166,31 @@ fn read_esp_stub(path: &Path) -> Result<tools::EspStub, GrubContextError> {
         },
         _ => GrubContextError::Other(format!("cannot read ESP grub.cfg: {e}")),
     })?;
+    reject_subvol_override(&content)?;
     Ok(tools::parse_esp_stub(&content)?)
 }
 
+/// Variables that point GRUB's Btrfs driver at a named subvolume
+/// (grub-core/fs/btrfs.c, btrfs_handle_subvol). Neither Fedora's
+/// gen_grub_cfgstub nor migrate writes them.
+const SUBVOL_OVERRIDES: [&str; 2] = ["btrfs_subvol", "btrfs_subvolid"];
+
+/// Refuses a stub that sets a subvolume override: check does not model
+/// where GRUB resolves paths under one.
+fn reject_subvol_override(content: &str) -> Result<(), String> {
+    match SUBVOL_OVERRIDES.into_iter()
+        .find(|name| content.lines().any(|line| tools::grub_assignment(line, name).is_some()))
+    {
+        Some(name) => Err(format!(
+            "ESP grub.cfg sets {name}, which neither Fedora nor atomic-rollback writes. \
+             check cannot tell which subvolume GRUB resolves paths from")),
+        None => Ok(()),
+    }
+}
+
 impl GrubContext {
+    /// A context over directories already in place, with nothing mounted.
+    #[cfg(test)]
     pub fn new(base: Base, prefix: String) -> Self {
         Self { base, prefix, _mount: None }
     }
@@ -170,21 +224,24 @@ impl GrubContext {
     /// ESP config from the live system (the ESP is vfat, not in the
     /// snapshot). snapshot_root is the snapshot's directory under the
     /// top-level subvolume, which rollback has mounted at TOPLEVEL_MOUNT.
+    /// A boot filesystem other than Btrfs is outside the snapshot, so its
+    /// live mount point is used, probe-mounting it if needed.
     pub fn for_snapshot(snapshot_root: &Path) -> Result<Self, GrubContextError> {
         let stub = read_esp_stub(&Path::new(P.esp_dir).join("grub.cfg"))?;
         let fstype = boot_fstype(&stub)?;
 
-        let base = match fstype {
-            tools::FsType::Btrfs if !stub.btrfs_relative => Base::BtrfsTopLevel {
-                toplevel: PathBuf::from(TOPLEVEL_MOUNT),
-                swap: Some(pending_swap(snapshot_root)?),
-            },
-            // After the swap, rollback sets the snapshot as the default subvolume.
-            tools::FsType::Btrfs => Base::BtrfsDefaultSubvol(snapshot_root.to_path_buf()),
-            _ => Base::FilesystemRoot(snapshot_root.to_path_buf()),
+        let mount = if fstype == tools::FsType::Btrfs {
+            None
+        } else {
+            Some(tools::get_mount_point(&stub.boot_uuid.clone().into_device_spec())?)
         };
+        let fs_root = mount.as_ref()
+            .map_or_else(|| PathBuf::from(TOPLEVEL_MOUNT), |m| PathBuf::from(m.path()));
 
-        Ok(Self::new(base, stub.grub_dir))
+        let base = Base::after_rollback(&fstype, stub.btrfs_relative, fs_root, snapshot_root,
+            live_root_subvol)?;
+
+        Ok(Self { base, prefix: stub.grub_dir, _mount: mount })
     }
 
     pub fn resolve(&self, grub_path: &str) -> PathBuf {
@@ -236,18 +293,12 @@ fn boot_fstype(stub: &tools::EspStub) -> Result<tools::FsType, String> {
         "cannot determine the filesystem type of UUID={}: {e}", stub.boot_uuid.as_str()))
 }
 
-/// The swap rollback performs: the snapshot, a directory under
-/// TOPLEVEL_MOUNT, trades names with the subvolume fstab mounts as /.
-fn pending_swap(snapshot_root: &Path) -> Result<PendingSwap, String> {
-    let snapshot = snapshot_root.strip_prefix(TOPLEVEL_MOUNT).map_err(|_| format!(
-        "snapshot {} is not under the top-level subvolume mount {TOPLEVEL_MOUNT}",
-        snapshot_root.display()))?;
+/// The subvolume the live fstab mounts as /, whose name rollback gives
+/// the snapshot.
+fn live_root_subvol() -> Result<tools::SubvolName, String> {
     let fstab = fs::read_to_string("/etc/fstab")
         .map_err(|e| format!("Cannot read /etc/fstab: {e}"))?;
-    Ok(PendingSwap {
-        root: tools::root_subvol_name(&fstab)?,
-        snapshot: tools::SubvolName::new(snapshot.to_string_lossy().into_owned()),
-    })
+    tools::root_subvol_name(&fstab)
 }
 
 /// Value of a variable in a GRUB environment block (grub-core/lib/envblk.c:
@@ -397,6 +448,76 @@ configfile $prefix/grub.cfg
         };
         assert_eq!(base.resolve("/root/boot/vmlinuz-6.19.9"),
             Path::new("/top/2025-01-02_03-04-05/boot/vmlinuz-6.19.9"));
+    }
+
+    fn live_root_is_root() -> Result<SubvolName, String> { Ok(SubvolName::new("root".into())) }
+
+    fn live_root_unread() -> Result<SubvolName, String> {
+        panic!("the root subvolume's name matters only from the top level")
+    }
+
+    #[test]
+    fn after_rollback_from_top_level_swaps_in_the_snapshot() {
+        let base = Base::after_rollback(&FsType::Btrfs, false, top(), Path::new("/top/snap1"),
+            live_root_is_root).unwrap();
+        assert_eq!(base.resolve("/root/boot/vmlinuz-6.19.9"), Path::new("/top/snap1/boot/vmlinuz-6.19.9"));
+        assert_eq!(base.resolve("/home/user"), Path::new("/top/home/user"));
+    }
+
+    #[test]
+    fn after_rollback_refuses_snapshot_outside_the_top_level() {
+        let base = Base::after_rollback(&FsType::Btrfs, false, top(), Path::new("/elsewhere/snap1"),
+            live_root_is_root);
+        assert!(base.is_err());
+    }
+
+    #[test]
+    fn after_rollback_from_default_subvol_resolves_inside_the_snapshot() {
+        let base = Base::after_rollback(&FsType::Btrfs, true, top(), Path::new("/top/snap1"),
+            live_root_unread).unwrap();
+        assert_eq!(base.resolve("/vmlinuz-6.19.9"), Path::new("/top/snap1/vmlinuz-6.19.9"));
+    }
+
+    // /boot on its own filesystem is outside the snapshot: rollback leaves
+    // it as it is, and GRUB reads it after the swap as before.
+    #[test]
+    fn after_rollback_off_btrfs_resolves_on_the_live_boot_filesystem() {
+        let base = Base::after_rollback(&FsType::Ext4, false, PathBuf::from("/boot"),
+            Path::new("/top/snap1"), live_root_unread).unwrap();
+        assert_eq!(base.resolve("/vmlinuz-6.19.9"), Path::new("/boot/vmlinuz-6.19.9"));
+        assert_eq!(base.resolve("/grub2/grub.cfg"), Path::new("/boot/grub2/grub.cfg"));
+    }
+
+    // --- subvolume overrides in the stub ---
+
+    fn read_stub(name: &str, content: &str) -> Result<tools::EspStub, GrubContextError> {
+        let path = std::env::temp_dir().join(format!("atomic-rollback-test-stub-{name}.cfg"));
+        fs::write(&path, content).unwrap();
+        let stub = read_esp_stub(&path);
+        fs::remove_file(&path).unwrap();
+        stub
+    }
+
+    fn refused_naming(stub: Result<tools::EspStub, GrubContextError>, variable: &str) -> bool {
+        matches!(stub, Err(GrubContextError::Other(msg)) if msg.contains(&format!("sets {variable},")))
+    }
+
+    #[test]
+    fn stub_setting_btrfs_subvol_is_refused() {
+        let stub = STUB_MIGRATED.replacen("search", "set btrfs_subvol=\"@/.snapshots/1/snapshot\"\nsearch", 1);
+        assert!(refused_naming(read_stub("subvol", &stub), "btrfs_subvol"));
+    }
+
+    #[test]
+    fn stub_setting_btrfs_subvolid_is_refused() {
+        let stub = STUB_FEDORA.replacen("search", "btrfs_subvolid=256\nsearch", 1);
+        assert!(refused_naming(read_stub("subvolid", &stub), "btrfs_subvolid"));
+    }
+
+    #[test]
+    fn stubs_fedora_and_migrate_write_are_read() {
+        assert!(read_stub("fedora", STUB_FEDORA).is_ok());
+        assert!(read_stub("migrated", STUB_MIGRATED).is_ok());
     }
 
     // --- grubenv ---
