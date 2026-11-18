@@ -159,10 +159,15 @@ pub const LOADING_COMMANDS: [&str; 13] = [
 ];
 
 /// Commands that set no variable, whatever their arguments name: tests,
-/// output, exporting or saving variables, loading modules and checking a
-/// password (commands/test.c, echo.c, loadenv.c, password_pbkdf2.c;
-/// kern/corecmd.c, insmod; normal/main.c, export).
-const SETS_NOTHING: [&str; 7] = ["[", "test", "echo", "export", "save_env", "insmod", "password_pbkdf2"];
+/// output, exporting or saving variables, loading modules, checking a
+/// password, loading a font or a background image, and choosing a terminal
+/// (commands/test.c, echo.c, loadenv.c, password_pbkdf2.c, terminal.c;
+/// kern/corecmd.c, insmod; normal/main.c, export; font/font_cmd.c;
+/// term/gfxterm_background.c).
+const SETS_NOTHING: [&str; 11] = [
+    "[", "test", "echo", "export", "save_env", "insmod", "password_pbkdf2",
+    "loadfont", "background_image", "terminal_input", "terminal_output",
+];
 
 /// Keywords that begin a compound command or one of its parts, after which
 /// the next words form a command (parser.y).

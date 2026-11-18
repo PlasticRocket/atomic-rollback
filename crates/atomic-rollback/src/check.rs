@@ -2071,6 +2071,27 @@ menuentry 'Windows Boot Manager (on /dev/nvme0n1p1)' --class windows --class os 
         }
     }
 
+    // 00_header writes these for a theme on a graphical terminal
+    // (util/grub.d/00_header.in:183-226 and 262-310); loading a font or a
+    // background image and choosing a terminal set no variable
+    // (grub-core/font/font_cmd.c, term/gfxterm_background.c,
+    // commands/terminal.c).
+    #[test]
+    fn grub_cfg_loading_a_theme_before_blscfg_is_followed() {
+        let top = scratch("phase-script-theme");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/grub2/grub.cfg"), &format!("{LOAD_GRUBENV}\
+            if loadfont unicode ; then\n  set gfxmode=auto\n  insmod gfxterm\nfi\n\
+            terminal_input console\nterminal_output gfxterm\ninsmod gfxmenu\n\
+            loadfont ($root)/usr/share/grub/themes/starfield/dejavu_10.pf2\n\
+            background_image -m stretch ($root)/usr/share/grub/themes/starfield/starfield.png\n\
+            set theme=($root)/usr/share/grub/themes/starfield/theme.txt\nexport theme\n\
+            {SEARCH_ROOT}insmod blscfg\nblscfg\n"));
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX));
+        assert!(grub.as_ref().is_ok_and(|grub| passes(&bls_entries(grub))), "{:?}", grub.as_ref().err());
+        fs::remove_dir_all(&top).unwrap();
+    }
+
     // A command whose variable name, or whose command name, is the value of
     // a variable can set any variable (script/execute.c, grub_script_execute_cmdline).
     #[test]
