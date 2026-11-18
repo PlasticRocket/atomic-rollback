@@ -890,7 +890,8 @@ mod tests {
     }
 
     // GRUB's Btrfs driver tests only the value's first character for '1'
-    // or 'y' (grub-core/fs/btrfs.c, grub_btrfs_mount).
+    // or 'y' (Fedora's grub2 2.12 patches, grub-core/fs/btrfs.c,
+    // grub_btrfs_mount and find_path).
     #[test]
     fn esp_stub_btrfs_relative_follows_grub_value_rule() {
         assert!(stub_with("set btrfs_relative_path=\"yes\""));
