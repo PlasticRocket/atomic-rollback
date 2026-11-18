@@ -6,13 +6,30 @@ If a bad update breaks your system, one command restores the previous state. The
 
 ## Requirements
 
-- Fedora 43 or later
+- Fedora 43 or later (full boot migration: Fedora 43 for now, see the known issue below)
 - Btrfs root filesystem (Fedora's default since Fedora 33)
 - UEFI boot
 - Traditional Fedora desktop (Workstation, KDE, etc.), not Silverblue, Kinoite, or other atomic desktops (they have their own rollback mechanism)
 - Secure Boot compatible. No signed binaries are modified. All modified files (grub.cfg, initramfs, grubenv) are in GRUB's skip-verification list.
 
 Running outside these requirements is running outside what the tool has been verified against. `atomic-rollback check` will tell you if your system is compatible.
+
+## Known issue: Fedora 44 and later with full boot migration
+
+Starting with Fedora 44, every GRUB package update replaces `/boot/efi/EFI/fedora/grub.cfg`
+with Fedora's default version. On a system where `atomic-rollback migrate` moved `/boot` onto
+Btrfs, that default looks for the kernels in the wrong place, and every menu entry fails with
+`file '/vmlinuz-...' not found`. Fedora 43 left this file alone, so the problem first appears
+with Fedora 44, including on the upgrade from 43.
+
+- Systems set up with `atomic-rollback setup` only are not affected.
+- If you used `migrate` and are on Fedora 43, hold off on upgrading until a fixed release is out.
+- If your machine already stops at that error: at the GRUB menu press `c`, type
+  `set btrfs_relative_path=1`, press Enter, then press Esc and choose your entry. This is needed
+  on each boot until the fix is released.
+
+`atomic-rollback check` does not detect this yet. Fixes for both are in progress, and Fedora 44
+and 45 builds will follow them.
 
 ## Install
 
