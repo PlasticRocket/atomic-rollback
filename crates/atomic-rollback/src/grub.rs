@@ -71,6 +71,10 @@ pub enum LookupFailure {
     NotARegularFile,
     /// The lookup met more symbolic links than GRUB follows.
     SymlinkLoop,
+    /// Linux refused to read a directory or link on the way, with this
+    /// error. GRUB reads the disk itself, so check cannot tell what it
+    /// finds.
+    CannotRead(String),
 }
 
 impl LookupFailure {
@@ -81,6 +85,7 @@ impl LookupFailure {
             LookupFailure::NotADirectory => format!("'{grub_path}': not a directory"),
             LookupFailure::NotARegularFile => format!("'{grub_path}': not a regular file"),
             LookupFailure::SymlinkLoop => format!("'{grub_path}': too deep nesting of symlinks"),
+            LookupFailure::CannotRead(error) => format!("cannot verify '{grub_path}': {error}"),
         }
     }
 }
@@ -98,6 +103,62 @@ pub struct LookupError {
 impl std::fmt::Display for LookupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}; GRUB starts the lookup at {}", self.failure.message(&self.grub_path), self.starting_lookup_dir)
+    }
+}
+
+/// What check finds when it does not confirm that GRUB reaches a file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Finding {
+    /// GRUB does not get past this point: a fact about the boot chain.
+    Fails(String),
+    /// check could not read what it needs to tell, so the boot chain may
+    /// still be valid.
+    CannotVerify(String),
+}
+
+impl Finding {
+    /// The same finding with its message rewritten.
+    pub fn map(self, f: impl FnOnce(String) -> String) -> Self {
+        match self {
+            Finding::Fails(message) => Finding::Fails(f(message)),
+            Finding::CannotVerify(message) => Finding::CannotVerify(f(message)),
+        }
+    }
+
+    /// The same finding, with the message of a failure rewritten; a finding
+    /// check cannot verify keeps its own message.
+    pub fn map_fails(self, f: impl FnOnce(String) -> String) -> Self {
+        match self {
+            Finding::Fails(message) => Finding::Fails(f(message)),
+            unverified => unverified,
+        }
+    }
+}
+
+impl From<String> for Finding {
+    fn from(message: String) -> Self { Finding::Fails(message) }
+}
+
+impl Finding {
+    pub fn message(&self) -> &str {
+        match self {
+            Finding::Fails(message) | Finding::CannotVerify(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for Finding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<LookupError> for Finding {
+    fn from(e: LookupError) -> Self {
+        match e.failure {
+            LookupFailure::CannotRead(_) => Finding::CannotVerify(e.to_string()),
+            _ => Finding::Fails(e.to_string()),
+        }
     }
 }
 
@@ -224,8 +285,9 @@ impl StartingLookupDir {
     /// follows it, an absolute target from the starting lookup directory
     /// and a relative one from the link's directory. is_subvolume_root
     /// tells whether a Linux directory is the root of a Btrfs subvolume,
-    /// which on Btrfs is its own parent.
-    fn lookup(&self, grub_path: &str, is_subvolume_root: impl Fn(&Path) -> bool)
+    /// which on Btrfs is its own parent. A Linux error other than a missing
+    /// entry is no fact about GRUB, so it ends the lookup as CannotRead.
+    fn lookup(&self, grub_path: &str, is_subvolume_root: impl Fn(&Path) -> io::Result<bool>)
         -> Result<(PathBuf, NodeKind), LookupFailure>
     {
         let btrfs = !matches!(self, Self::FilesystemRoot(_));
@@ -250,19 +312,23 @@ impl StartingLookupDir {
                 // root (fshelp.c, go_up_a_level). Btrfs reads the
                 // directory's parent from its inode ref, and a subvolume's
                 // root directory is its own parent (btrfs.c, find_path).
-                if !(btrfs && is_subvolume_root(&self.linux_path(&below))) {
+                if !(btrfs && is_subvolume_root(&self.linux_path(&below)).map_err(cannot_read)?) {
                     below.pop();
                 }
             } else if name != "." {
                 let next = below.join(&name);
                 let linux_path = self.linux_path(&next);
-                let meta = fs::symlink_metadata(&linux_path).map_err(|_| LookupFailure::FileNotFound)?;
+                let meta = fs::symlink_metadata(&linux_path).map_err(|e| match e.raw_os_error() {
+                    // No such entry, or a name longer than any entry can have.
+                    Some(libc::ENOENT | libc::ENAMETOOLONG) => LookupFailure::FileNotFound,
+                    _ => cannot_read(e),
+                })?;
                 if meta.file_type().is_symlink() {
                     links += 1;
                     if links == self.symlink_limit() {
                         return Err(LookupFailure::SymlinkLoop);
                     }
-                    let target = fs::read_link(&linux_path).map_err(|_| LookupFailure::FileNotFound)?;
+                    let target = fs::read_link(&linux_path).map_err(cannot_read)?;
                     let target = target.into_os_string().into_vec();
                     if target.first() == Some(&b'/') {
                         below = PathBuf::new();
@@ -437,10 +503,14 @@ impl GrubContext {
     /// blsdir variable, which grub.cfg loads from $prefix/grubenv
     /// (util/grub.d/00_header.in), or BLS_CONFIG_PATH when it is unset, then
     /// BOOT_BLS_CONFIG_PATH if listing that fails.
-    pub fn blsdir(&self) -> Result<BlsDir, String> {
-        // A grubenv GRUB cannot read loads nothing, as when it is absent.
-        let grubenv = self.find_file(&self.grub_dir_file("grubenv")).ok()
-            .and_then(|path| fs::read_to_string(path).ok());
+    pub fn blsdir(&self) -> Result<BlsDir, Finding> {
+        // A grubenv GRUB cannot open loads nothing, as when it is absent.
+        let grubenv = match self.find_file(&self.grub_dir_file("grubenv")) {
+            Ok(path) => Some(fs::read_to_string(path).map_err(|e| Finding::CannotVerify(format!(
+                "cannot verify '{}': {e}", self.grub_dir_file("grubenv"))))?),
+            Err(e) if matches!(e.failure, LookupFailure::CannotRead(_)) => return Err(e.into()),
+            Err(_) => None,
+        };
         let blsdir = grubenv.as_deref()
             .and_then(|env| grubenv_value(env, "blsdir"))
             .unwrap_or(BLS_CONFIG_PATH);
@@ -449,12 +519,19 @@ impl GrubContext {
         for dir in [blsdir, BOOT_BLS_CONFIG_PATH] {
             match self.find_dir(dir) {
                 Ok(linux) => return Ok(BlsDir { grub_path: dir.to_string(), linux }),
+                // Whether GRUB lists this directory or falls back is unknown.
+                Err(e) if matches!(e.failure, LookupFailure::CannotRead(_)) => return Err(e.into()),
                 Err(e) => tried.push(e.failure.message(dir)),
             }
         }
-        Err(format!("GRUB finds no boot entry directory: {}; GRUB starts the lookup at {}",
-            tried.join(", then "), self.starting_lookup_dir.describe()))
+        Err(Finding::Fails(format!("GRUB finds no boot entry directory: {}; GRUB starts the lookup at {}",
+            tried.join(", then "), self.starting_lookup_dir.describe())))
     }
+}
+
+/// The lookup's failure for a Linux error that says nothing about GRUB.
+fn cannot_read(e: io::Error) -> LookupFailure {
+    LookupFailure::CannotRead(e.to_string())
 }
 
 /// The block device holding the filesystem the stub's search --fs-uuid
@@ -854,7 +931,7 @@ configfile $prefix/grub.cfg
         put(&top.join("root/vmlinuz"));
         put(&top.join("vmlinuz"));
         let root_subvol = top.join("root");
-        let is_subvolume_root = |dir: &Path| dir == root_subvol.as_path();
+        let is_subvolume_root = |dir: &Path| Ok(dir == root_subvol.as_path());
         let btrfs = StartingLookupDir::BtrfsTopLevel { toplevel: top.clone(), exchange: None };
         let fshelp = StartingLookupDir::FilesystemRoot(top.clone());
 
@@ -893,6 +970,46 @@ configfile $prefix/grub.cfg
 
     fn exchange_to_at(top: &Path, snapshot: &str) -> StartingLookupDir {
         StartingLookupDir::BtrfsTopLevel { toplevel: top.to_path_buf(), exchange: Some(exchange_of_root_and(snapshot)) }
+    }
+
+    // --- what Linux will not let check read ---
+
+    /// Takes every permission from dir for the test process, and gives
+    /// them back on drop. None when the process reads it anyway (root).
+    struct Locked(PathBuf);
+
+    impl Locked {
+        fn new(dir: &Path, probe: &str) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+            let locked = Locked(dir.to_path_buf());
+            match fs::symlink_metadata(dir.join(probe)) {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Some(locked),
+                _ => None,
+            }
+        }
+    }
+
+    impl Drop for Locked {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn a_directory_linux_will_not_read_is_not_a_missing_file() {
+        let top = scratch("unreadable");
+        put(&top.join("root/boot/vmlinuz"));
+        let Some(_locked) = Locked::new(&top.join("root/boot"), "vmlinuz") else {
+            eprintln!("skipped: this process reads directories without permission");
+            return;
+        };
+
+        let found = failure(&top_level(&top), "/root/boot/vmlinuz");
+        assert!(matches!(&found, Some(LookupFailure::CannotRead(e)) if e.contains("ermission denied")), "{found:?}");
+        drop(_locked);
+        fs::remove_dir_all(&top).unwrap();
     }
 
     // --- grubenv ---
