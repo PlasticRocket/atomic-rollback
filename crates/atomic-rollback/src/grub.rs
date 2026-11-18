@@ -131,6 +131,9 @@ pub enum Finding {
     /// check could not read what it needs to tell, so the boot chain may
     /// still be valid.
     CannotVerify(String),
+    /// check does not evaluate what GRUB does at this point, so the boot
+    /// chain may still be valid.
+    NotEvaluated(String),
 }
 
 impl Finding {
@@ -139,6 +142,7 @@ impl Finding {
         match self {
             Finding::Fails(message) => Finding::Fails(f(message)),
             Finding::CannotVerify(message) => Finding::CannotVerify(f(message)),
+            Finding::NotEvaluated(message) => Finding::NotEvaluated(f(message)),
         }
     }
 
@@ -159,7 +163,7 @@ impl From<String> for Finding {
 impl Finding {
     pub fn message(&self) -> &str {
         match self {
-            Finding::Fails(message) | Finding::CannotVerify(message) => message,
+            Finding::Fails(message) | Finding::CannotVerify(message) | Finding::NotEvaluated(message) => message,
         }
     }
 }
@@ -173,7 +177,8 @@ impl std::fmt::Display for Finding {
 impl From<LookupError> for Finding {
     fn from(e: LookupError) -> Self {
         match e.failure {
-            LookupFailure::CannotRead(_) | LookupFailure::BlockList => Finding::CannotVerify(e.to_string()),
+            LookupFailure::CannotRead(_) => Finding::CannotVerify(e.to_string()),
+            LookupFailure::BlockList => Finding::NotEvaluated(e.to_string()),
             _ => Finding::Fails(e.to_string()),
         }
     }
@@ -1481,7 +1486,7 @@ fn read_if_found(start: &StartingLookupDir, grub_path: &str) -> Result<Option<Ve
             .map_err(|e| GrubContextError::CannotVerify(format!("cannot verify '{grub_path}': {e}"))),
         Err(e) => match Finding::from(e) {
             Finding::Fails(_) => Ok(None),
-            Finding::CannotVerify(reason) => Err(GrubContextError::CannotVerify(reason)),
+            unverified => Err(GrubContextError::CannotVerify(unverified.message().to_string())),
         },
     }
 }

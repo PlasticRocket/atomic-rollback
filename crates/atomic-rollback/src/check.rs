@@ -49,12 +49,23 @@ impl From<Vec<CheckResult>> for Group {
 fn evaluate_checks(checks: Vec<(&str, Group)>) -> BootStatus {
     let mut all_failures = Vec::new();
     let mut all_unverified = Vec::new();
+    let (mut unread, mut unevaluated) = (false, false);
     let mut warned = false;
     for (name, group) in &checks {
         let failures: Vec<&String> = group.results.iter()
             .filter_map(|r| match r { Err(Finding::Fails(f)) => Some(f), _ => None }).collect();
         let unverified: Vec<&String> = group.results.iter()
-            .filter_map(|r| match r { Err(Finding::CannotVerify(f)) => Some(f), _ => None }).collect();
+            .filter_map(|r| match r {
+                Err(Finding::CannotVerify(f)) => {
+                    unread = true;
+                    Some(f)
+                }
+                Err(Finding::NotEvaluated(f)) => {
+                    unevaluated = true;
+                    Some(f)
+                }
+                _ => None,
+            }).collect();
         if !failures.is_empty() {
             println!("  FAIL  {name}");
         } else if !unverified.is_empty() {
@@ -83,11 +94,16 @@ fn evaluate_checks(checks: Vec<(&str, Group)>) -> BootStatus {
     if !all_failures.is_empty() {
         BootStatus::Fail(all_failures)
     } else if !all_unverified.is_empty() {
-        BootStatus::Inaccessible {
-            reason: all_unverified.join("; "),
-            hint: "check could not read a file GRUB reads, so the boot chain may still be valid. \
-                   Fix the error above and run check again.".into(),
+        let mut hint = Vec::new();
+        if unread {
+            hint.push("check could not read a file GRUB reads, so the boot chain may still be valid. \
+                       Fix the error above and run check again.");
         }
+        if unevaluated {
+            hint.push("check does not evaluate what GRUB does at the point named above, \
+                       so the boot chain may still be valid.");
+        }
+        BootStatus::Inaccessible { reason: all_unverified.join("; "), hint: hint.join(" ") }
     } else if warned {
         BootStatus::Warn
     } else {
@@ -283,7 +299,7 @@ fn check_grub_cfg(grub: &GrubContext, remedy: Option<&str>) -> Vec<CheckResult> 
             Ok(false) => Err(format!("GRUB configuration does not use Boot Loader Specification entries: \
                                       '{grub_path}' runs no blscfg command. \
                                       Kernel boot entries will not appear in the GRUB menu.{remedy}").into()),
-            Err(why) => Err(Finding::CannotVerify(why)),
+            Err(why) => Err(Finding::NotEvaluated(why)),
         },
     ]
 }
@@ -444,7 +460,7 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Gr
     let verdict = |results: Vec<CheckResult>, counted: Vec<String>| Group { results, counted, warnings: warnings.clone() };
 
     if picks.contains(&menu::Pick::Added) {
-        return verdict(vec![Err(Finding::CannotVerify(format!(
+        return verdict(vec![Err(Finding::NotEvaluated(format!(
             "GRUB may boot by default an entry grub.cfg adds after the boot entries, which check does not verify: \
              {chosen}.")))], vec![]);
     }
@@ -463,14 +479,21 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Gr
     let detail = findings.iter().map(|finding| finding.message()).collect::<Vec<_>>().join(" ");
     if findings.len() == picked.len() && findings.iter().all(|finding| matches!(finding, Finding::Fails(_))) {
         if let Some(fallback) = &config.fallback {
-            return verdict(vec![Err(Finding::CannotVerify(format!(
+            return verdict(vec![Err(Finding::NotEvaluated(format!(
                 "{booted}: {chosen}. {detail} GRUB then tries the entries fallback names ({fallback}), \
                  which check does not follow.")))], vec![]);
         }
         return verdict(vec![Err(Finding::Fails(format!(
             "{booted}: {chosen}. {detail}")))], vec![]);
     }
-    verdict(vec![Err(Finding::CannotVerify(format!("{booted}: {chosen}. {detail}")))], vec![])
+    // A pick check cannot read is unverified; otherwise picks that do and do
+    // not resolve leave it unable to evaluate which GRUB boots.
+    let message = format!("{booted}: {chosen}. {detail}");
+    if findings.iter().any(|finding| matches!(finding, Finding::CannotVerify(_))) {
+        verdict(vec![Err(Finding::CannotVerify(message))], vec![])
+    } else {
+        verdict(vec![Err(Finding::NotEvaluated(message))], vec![])
+    }
 }
 
 /// The files in blsdir whose names blscfg reads as boot entries, each as
@@ -484,7 +507,7 @@ fn bls_entry_files(blsdir: &BlsDir) -> Result<Vec<(String, String)>, Finding> {
         if !is_bls_entry_name(name.as_bytes()) {
             continue;
         }
-        let name = name.into_string().map_err(|name| Finding::CannotVerify(format!(
+        let name = name.into_string().map_err(|name| Finding::NotEvaluated(format!(
             "cannot verify the boot entry {name:?} in '{}': its name is not UTF-8, which check does not look up",
             blsdir.grub_path)))?;
         let conf = blsdir.entry(&name);
@@ -515,13 +538,13 @@ fn blscfg_entries(grub: &GrubContext, blsdir: &BlsDir) -> Result<Vec<BlsEntry>, 
         let content = match read_grub_file(&grub.at_blscfg, &conf) {
             Ok(content) => Ok(content),
             Err(Finding::Fails(_)) => continue,
-            Err(Finding::CannotVerify(e)) => Err(e),
+            Err(unread) => Err(unread.message().to_string()),
         };
         entries.push(BlsEntry { name, conf, content });
     }
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     let file = |name: &str| blsdir.entry(&format!("{name}.conf"));
-    let order = menu::blscfg_order(&names).map_err(|unknown| Finding::CannotVerify(match unknown {
+    let order = menu::blscfg_order(&names).map_err(|unknown| Finding::NotEvaluated(match unknown {
         menu::UnknownOrder::SameVersion(a, b) => format!(
             "cannot verify the menu: blscfg compares '{}' and '{}' as the same version and keeps the one \
              GRUB reads first, in an order check does not read", file(&a), file(&b)),
@@ -1254,7 +1277,7 @@ fi
         install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
         put(&top.join("root/boot/loader/entries/6.19.09-200.fc45.x86_64.conf"), &entry_from_top_level());
         let results = bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX));
-        assert!(results.iter().any(|r| matches!(r, Err(Finding::CannotVerify(e))
+        assert!(results.iter().any(|r| matches!(r, Err(Finding::NotEvaluated(e))
             if e.contains(KVER) && e.contains("6.19.09-200.fc45.x86_64"))), "{results:?}");
         fs::remove_dir_all(&top).unwrap();
     }
@@ -1779,6 +1802,22 @@ fi
     fn a_default_naming_an_entry_grub_cfg_adds_cannot_be_verified() {
         let (top, grub) = two_kernels("default-firmware", "uefi-firmware", "");
         assert!(cannot_verify(kernel_entry_status(&grub), "uefi-firmware"));
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // The closing line of a boot chain check cannot verify says what it
+    // could not do: here evaluate a default user.cfg sets, not read a file.
+    #[test]
+    fn a_default_check_cannot_evaluate_is_not_reported_as_an_unread_file() {
+        let (top, _) = two_kernels("default-hint", "${saved_entry}", &format!("saved_entry={KVER}\n"));
+        put(&top.join("root/boot/grub2/user.cfg"), "set default=$chosen_by_user\n");
+        let grub = context_from_stub(&top, &esp_stub(false, STUB_TOP_LEVEL_PREFIX)).unwrap();
+        match kernel_entry_status(&grub) {
+            BootStatus::Inaccessible { hint, .. } => {
+                assert!(!hint.contains("could not read") && hint.contains("evaluate"), "{hint}");
+            }
+            _ => panic!("not reported as unverified"),
+        }
         fs::remove_dir_all(&top).unwrap();
     }
 
