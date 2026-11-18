@@ -6,7 +6,7 @@ All notable changes to atomic-rollback are documented here.
 
 ### Changed
 
-- `check` fails when the ESP `grub.cfg` sets `btrfs_subvol` or `btrfs_subvolid`, naming the variable. Neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.
+- `check` fails when the ESP `grub.cfg` sets `btrfs_subvol` or `btrfs_subvolid` together with `btrfs_relative_path` on a Btrfs boot filesystem, naming the variable. GRUB reads them only then, neither Fedora nor atomic-rollback writes them, and `check` does not model which subvolume GRUB then resolves paths from.
 
 ### Fixed
 
