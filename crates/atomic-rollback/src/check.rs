@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::grub::{self, BlsDir, Finding, StartingLookupDir, GrubContext, GrubContextError};
+use crate::menu;
 use crate::parse;
 use crate::platform::FEDORA as P;
 use crate::swap::RenameExchange;
@@ -313,8 +314,8 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Ve
         Err(finding) => return vec![Err(finding.clone().map_fails(|e| format!("{e}. GRUB will show an empty menu.")))],
     };
 
-    let confs = match bls_entry_paths(blsdir) {
-        Ok(confs) => confs,
+    let entries = match blscfg_entries(grub, blsdir) {
+        Ok(entries) => entries,
         Err(finding) => return vec![Err(finding)],
     };
 
@@ -322,18 +323,27 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Ve
     let mut valid = 0;
     let mut failures: Vec<String> = Vec::new();
     let mut unverified: Vec<String> = Vec::new();
-    for conf in &confs {
-        let content = match read_grub_file(&grub.at_blscfg, conf) {
+    let mut left_out: Vec<String> = Vec::new();
+    for entry in &entries {
+        let content = match &entry.content {
             Ok(content) => content,
-            // blscfg skips a file it cannot open (Fedora's grub2 2.12
-            // patches, grub-core/commands/blscfg.c, read_entry).
-            Err(Finding::Fails(_)) => continue,
-            Err(Finding::CannotVerify(e)) => {
-                unverified.push(e);
+            Err(e) => {
+                unverified.push(e.clone());
                 continue;
             }
         };
-        match validate_bls_entry(grub, conf, &content) {
+        // create_entry leaves an entry without linux out of the menu
+        // (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c).
+        let Some(linux) = parse::bls_field(content, "linux") else {
+            left_out.push(format!("'{}', which has no linux line", entry.conf));
+            continue;
+        };
+        if menu::bls_menu_id(&entry.name).is_none() {
+            return vec![Err(format!(
+                "GRUB never shows its menu: blscfg's create_entry loops forever stripping \".conf\" from \
+                 the name of '{}', whose first \".conf\" is not its last. Rename the entry.", entry.conf).into())];
+        }
+        match validate_bls_entry(grub, &entry.conf, content, linux) {
             Ok(()) => valid += 1,
             Err(Finding::Fails(e)) => failures.push(e),
             Err(Finding::CannotVerify(e)) => unverified.push(e),
@@ -343,8 +353,11 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Ve
     let total = valid + failures.len() + unverified.len();
 
     if total == 0 {
+        let left_out = if left_out.is_empty() { String::new() } else {
+            format!(" blscfg leaves out {}.", left_out.join("; "))
+        };
         return vec![Err(format!(
-            "No boot entries found in '{}'. \
+            "No boot entries found in '{}'.{left_out} \
              GRUB will show an empty menu with no kernels to boot. \
              Reinstall the kernel: sudo dnf reinstall kernel-core",
             blsdir.grub_path).into())];
@@ -379,12 +392,12 @@ fn check_bls_entries(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Ve
     results
 }
 
-/// The GRUB paths of the files in blsdir whose names blscfg reads as boot
-/// entries.
-fn bls_entry_paths(blsdir: &BlsDir) -> Result<Vec<String>, Finding> {
+/// The files in blsdir whose names blscfg reads as boot entries, each as
+/// its name less ".conf" and its GRUB path.
+fn bls_entry_files(blsdir: &BlsDir) -> Result<Vec<(String, String)>, Finding> {
     let unverified = |e: std::io::Error| Finding::CannotVerify(format!(
         "cannot verify the boot entries in '{}': {e}", blsdir.grub_path));
-    let mut confs = Vec::new();
+    let mut files = Vec::new();
     for entry in fs::read_dir(&blsdir.linux).map_err(unverified)? {
         let name = entry.map_err(unverified)?.file_name();
         if !is_bls_entry_name(name.as_bytes()) {
@@ -393,9 +406,56 @@ fn bls_entry_paths(blsdir: &BlsDir) -> Result<Vec<String>, Finding> {
         let name = name.into_string().map_err(|name| Finding::CannotVerify(format!(
             "cannot verify the boot entry {name:?} in '{}': its name is not UTF-8, which check does not look up",
             blsdir.grub_path)))?;
-        confs.push(blsdir.entry(&name));
+        let conf = blsdir.entry(&name);
+        files.push((name[..name.len() - BLS_ENTRY_SUFFIX.len()].to_string(), conf));
     }
-    Ok(confs)
+    Ok(files)
+}
+
+/// A file blscfg reads as a boot entry.
+struct BlsEntry {
+    /// Its file name less ".conf", by which blscfg orders it and
+    /// create_entry names it.
+    name: String,
+    /// Its GRUB path.
+    conf: String,
+    /// What GRUB reads in it, or why check cannot read it.
+    content: Result<String, String>,
+}
+
+/// The files blscfg reads as boot entries from blsdir, in the order it
+/// lists them: newest first by bls_cmp, as bls_add_entry inserts them
+/// (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c). blscfg skips
+/// a file it cannot open (read_entry). Where the order depends on the
+/// order GRUB reads the directory in, check cannot verify the menu.
+fn blscfg_entries(grub: &GrubContext, blsdir: &BlsDir) -> Result<Vec<BlsEntry>, Finding> {
+    let mut entries = Vec::new();
+    for (name, conf) in bls_entry_files(blsdir)? {
+        let content = match read_grub_file(&grub.at_blscfg, &conf) {
+            Ok(content) => Ok(content),
+            Err(Finding::Fails(_)) => continue,
+            Err(Finding::CannotVerify(e)) => Err(e),
+        };
+        entries.push(BlsEntry { name, conf, content });
+    }
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    let file = |name: &str| blsdir.entry(&format!("{name}.conf"));
+    let order = menu::blscfg_order(&names).map_err(|unknown| Finding::CannotVerify(match unknown {
+        menu::UnknownOrder::SameVersion(a, b) => format!(
+            "cannot verify the menu: blscfg compares '{}' and '{}' as the same version and keeps the one \
+             GRUB reads first, in an order check does not read", file(&a), file(&b)),
+        menu::UnknownOrder::Unordered(a, b) => format!(
+            "cannot verify the menu: blscfg's comparison does not order '{}' and '{}' as it orders the \
+             other entries, so their order depends on the order GRUB reads them in, which check does not read",
+            file(&a), file(&b)),
+    }))?;
+    let mut rank = vec![0; order.len()];
+    for (position, &index) in order.iter().enumerate() {
+        rank[index] = position;
+    }
+    let mut ranked: Vec<(usize, BlsEntry)> = rank.into_iter().zip(entries).collect();
+    ranked.sort_by_key(|&(position, _)| position);
+    Ok(ranked.into_iter().map(|(_, entry)| entry).collect())
 }
 
 /// Whether blscfg reads the file of this name in the boot entry directory:
@@ -403,19 +463,18 @@ fn bls_entry_paths(blsdir: &BlsDir) -> Result<Vec<String>, Finding> {
 /// end in ".conf" (Fedora's grub2 2.12 patches,
 /// grub-core/commands/blscfg.c, read_entry).
 fn is_bls_entry_name(name: &[u8]) -> bool {
-    const BLS_ENTRY_SUFFIX: &[u8] = b".conf";
-    name.first() != Some(&b'.') && name.len() > BLS_ENTRY_SUFFIX.len() && name.ends_with(BLS_ENTRY_SUFFIX)
+    name.first() != Some(&b'.') && name.len() > BLS_ENTRY_SUFFIX.len() && name.ends_with(BLS_ENTRY_SUFFIX.as_bytes())
 }
+
+/// The suffix of the names blscfg reads as boot entries (read_entry).
+const BLS_ENTRY_SUFFIX: &str = ".conf";
 
 // BLS fields may contain GRUB variables after the file path:
 //   initrd /initramfs-6.19.9.img $tuned_initrd
 // Only the first token is a file path. The rest is GRUB's concern.
-// conf is the entry's GRUB path, and content what GRUB reads there.
-fn validate_bls_entry(grub: &GrubContext, conf: &str, content: &str) -> CheckResult {
-    let linux = parse::bls_field(content, "linux")
-        .ok_or_else(|| format!(
-            "Boot entry '{conf}' has no 'linux' field. \
-             GRUB does not know which kernel to load."))?;
+// conf is the entry's GRUB path, content what GRUB reads there, and linux
+// its linux value.
+fn validate_bls_entry(grub: &GrubContext, conf: &str, content: &str, linux: &str) -> CheckResult {
     let options = parse::bls_field(content, "options")
         .ok_or_else(|| format!(
             "Boot entry '{conf}' has no 'options' field. \
@@ -635,7 +694,7 @@ fn extract_root_uuid(grub: &GrubContext, blsdir: &Result<BlsDir, Finding>) -> Re
         Err(Finding::Fails(_)) => return Ok(None),
         Err(unverified) => return Err(unverified.clone()),
     };
-    for conf in bls_entry_paths(blsdir)? {
+    for (_, conf) in bls_entry_files(blsdir)? {
         let content = match read_grub_file(&grub.at_blscfg, &conf) {
             Ok(content) => content,
             // blscfg skips a file it cannot open.
@@ -854,7 +913,8 @@ fi
     }
 
     fn validate(grub: &GrubContext, conf: &str) -> CheckResult {
-        validate_bls_entry(grub, conf, &read_grub_file(&grub.at_blscfg, conf)?)
+        let content = read_grub_file(&grub.at_blscfg, conf)?;
+        validate_bls_entry(grub, conf, &content, parse::bls_field(&content, "linux").unwrap())
     }
 
     fn passes(results: &[CheckResult]) -> bool {
@@ -1082,6 +1142,52 @@ fi
 
         let results = bls_entries(&grub);
         assert!(fails_with(&results, "No boot entries found"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // --- the entries blscfg adds to the menu ---
+
+    // create_entry leaves an entry without a linux line out of the menu
+    // (Fedora's grub2 2.12 patches, grub-core/commands/blscfg.c,
+    // create_entry): it is no broken menu entry.
+    #[test]
+    fn an_entry_without_linux_is_left_out_of_the_menu() {
+        let top = scratch("menu-no-linux");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/loader/entries/notes.conf"), "title Notes\noptions root=UUID=3f2a9c41\n");
+        let grub = btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX);
+        assert!(passes(&bls_entries(&grub)), "{:?}", bls_entries(&grub));
+
+        fs::remove_file(top.join(format!("root/boot/loader/entries/{KVER}.conf"))).unwrap();
+        let results = bls_entries(&grub);
+        assert!(fails_with(&results, "'/root/boot/loader/entries/notes.conf', which has no linux line"), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // bls_add_entry drops an entry that compares as the same version as one
+    // already listed (blscfg.c, bls_add_entry), keeping whichever GRUB read
+    // first, in an order check does not read.
+    #[test]
+    fn entries_of_the_same_version_cannot_be_verified() {
+        let top = scratch("menu-same-version");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/loader/entries/6.19.09-200.fc45.x86_64.conf"), &entry_from_top_level());
+        let results = bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX));
+        assert!(results.iter().any(|r| matches!(r, Err(Finding::CannotVerify(e))
+            if e.contains(KVER) && e.contains("6.19.09-200.fc45.x86_64"))), "{results:?}");
+        fs::remove_dir_all(&top).unwrap();
+    }
+
+    // create_entry's loop that strips ".conf" never ends for a name, less
+    // its final ".conf", whose first ".conf" is not at its end (blscfg.c,
+    // create_entry), so GRUB never shows the menu.
+    #[test]
+    fn an_entry_whose_id_create_entry_cannot_strip_fails() {
+        let top = scratch("menu-loop");
+        install_subvol(&top, "root", BLSDIR_TOP_LEVEL, &entry_from_top_level());
+        put(&top.join("root/boot/loader/entries/x.confd-1.conf"), &entry_from_top_level());
+        let results = bls_entries(&btrfs_context(&top, false, STUB_TOP_LEVEL_PREFIX));
+        assert!(fails_with(&results, "x.confd-1.conf"), "{results:?}");
         fs::remove_dir_all(&top).unwrap();
     }
 

@@ -6,6 +6,7 @@ mod consts;
 mod diskspace;
 mod grub;
 mod kernel_hook;
+mod menu;
 mod migrate;
 mod parse;
 mod platform;

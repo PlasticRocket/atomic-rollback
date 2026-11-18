@@ -1059,7 +1059,7 @@ pub fn grub_strtoull(s: &[u8], p: &mut usize, base: u32) -> Option<u64> {
 }
 
 /// The characters grub_isspace accepts (grub-core/kern/misc.c).
-fn is_grub_space(c: u8) -> bool {
+pub fn is_grub_space(c: u8) -> bool {
     matches!(c, b'\n' | b'\r' | b' ' | b'\t')
 }
 
