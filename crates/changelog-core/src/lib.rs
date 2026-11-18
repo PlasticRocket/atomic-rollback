@@ -494,11 +494,11 @@ impl Fragment {
             },
             Self::CheckResolvesPathsLikeGrub => Status::Unreleased {
                 section: Section::Fixed,
-                text: "`check` resolves the files GRUB reads (the ESP stub's prefix, `grub.cfg`, the BLS directory named in `grubenv`, and each entry's kernel and initramfs) as GRUB's Btrfs driver does, from the top-level subvolume unless the ESP stub sets `btrfs_relative_path` and from the default subvolume when it does, and names the mode in its output. It previously resolved them inside the subvolume mounted at `/`, so on a migrated system whose ESP stub Fedora 44 or later had replaced, it reported a valid boot chain while every menu entry failed with `file '/vmlinuz-...' not found`.",
+                text: "The boot chain check run by `check`, `rollback`, each step of `setup` and `migrate`, and the kernel hook looks up the files GRUB reads (the ESP stub's prefix, `grub.cfg`, the BLS directory named in `grubenv`, and each boot entry's kernel and initramfs) as GRUB's filesystem code does: on Btrfs from the top-level subvolume, or from the default subvolume when the ESP stub sets `btrfs_relative_path`, following symbolic links as GRUB follows them, and it names each missing file by its GRUB path. It previously looked them up inside the subvolume mounted at `/`, so on a migrated system whose ESP stub Fedora 44 or later had replaced, it reported a valid boot chain while every menu entry failed with `` file `/vmlinuz-...' not found ``; on such a system `check` now reports those entries and `rollback` refuses.",
             },
             Self::SnapshotCheckReadsSeparateBootPartition => Status::Unreleased {
                 section: Section::Fixed,
-                text: "On systems set up with `setup` only, `/boot` is a separate partition that rollback leaves unchanged, and the boot chain check before `rollback` now reads `grub.cfg`, the boot entries, and their kernels and initramfs there instead of inside the snapshot. The root filesystem checks still examine the snapshot.",
+                text: "In 0.4.0, `rollback` refused every rollback on a system set up without `migrate`, whose `/boot` is a separate partition, with `rollback aborted: boot chain invalid for snapshot`: its boot chain check looked for `grub.cfg` and the boot entries inside the snapshot, whose `/boot` is empty. The check now reads `grub.cfg`, the boot entries, and their kernels and initramfs on the live `/boot` partition, which rollback leaves unchanged, and still examines the snapshot for the root filesystem.",
             },
             Self::CheckRefusesBtrfsSubvolVariables => Status::Unreleased {
                 section: Section::Changed,
@@ -506,7 +506,7 @@ impl Fragment {
             },
             Self::TemporaryMountsInUniqueRunDirectory => Status::Unreleased {
                 section: Section::Security,
-                text: "The boot chain check run by `check`, `rollback`, `migrate` and the kernel hook makes its temporary read-only mounts in a new directory created by `mkdtemp` under `/run`, which only root can write to. It previously mounted at a predictable path under `/tmp`, which any local user could create beforehand, for example as a symlink, to choose where root mounted and later unmounted a filesystem.",
+                text: "The boot chain check run by `check`, `rollback`, `setup`, `migrate` and the kernel hook makes its temporary read-only mounts in a new directory created by `mkdtemp` under `/run`, which only root can write to. It previously mounted at a predictable path under `/tmp`, which any local user could create beforehand, for example as a symlink, to choose where root mounted and later unmounted a filesystem.",
             },
         }
     }
