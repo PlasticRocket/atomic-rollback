@@ -1017,6 +1017,46 @@ UUID=abc /opt btrfs subvol=@opt 0 0";
         fs::remove_dir_all(&top).unwrap();
     }
 
+    // --- grubenv, read as GRUB's load_env reads it ---
+
+    /// The boot entries of the root subvolume, from the top level, whose
+    /// grubenv is content exactly.
+    fn bls_entries_with_grubenv(name: &str, content: &str) -> Vec<CheckResult> {
+        let top = scratch(name);
+        install_subvol(&top, "root", "", &entry_from_top_level());
+        put(&top.join("root/boot/grub2/grubenv"), content);
+        let results = bls_entries(&btrfs_context(&top, false, "/root/boot/grub2"));
+        fs::remove_dir_all(&top).unwrap();
+        results
+    }
+
+    // load_env applies each assignment in turn, so the last one holds
+    // (grub-core/lib/envblk.c, grub_envblk_iterate).
+    #[test]
+    fn grubenv_last_assignment_holds() {
+        let results = bls_entries_with_grubenv("grubenv-last",
+            &grubenv("blsdir=/elsewhere\nblsdir=/root/boot/loader/entries\n"));
+        assert!(passes(&results), "{results:?}");
+    }
+
+    // A backslash makes the next character part of the value
+    // (grub-core/lib/envblk.c, grub_envblk_iterate).
+    #[test]
+    fn grubenv_value_is_unescaped() {
+        let results = bls_entries_with_grubenv("grubenv-escape",
+            &grubenv("blsdir=/root/boot/loader/entr\\ies\n"));
+        assert!(passes(&results), "{results:?}");
+    }
+
+    // load_env refuses a block that does not start with the signature
+    // (grub-core/lib/envblk.c, grub_envblk_open), so blsdir stays unset.
+    #[test]
+    fn grubenv_without_its_signature_sets_nothing() {
+        let results = bls_entries_with_grubenv("grubenv-signature",
+            &format!("blsdir=/root/boot/loader/entries\n{}", "#".repeat(256)));
+        assert!(fails_with(&results, "GRUB finds no boot entry directory"), "{results:?}");
+    }
+
     // --- refusals: each check fails on a seeded defect ---
 
     // The live root keeps its grub.cfg; the snapshot, whose prefix GRUB
